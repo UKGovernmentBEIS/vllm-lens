@@ -1,0 +1,45 @@
+name: Checks
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '.devcontainer/**'
+      - '.github/**'
+      - '.vscode/**'
+      - '.gitignore'
+      - 'README.md'
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - '.devcontainer/**'
+      - '.github/**'
+      - '.vscode/**'
+      - '.gitignore'
+      - 'README.md'
+  workflow_call:
+    inputs:
+      dummy:
+        type: string
+        required: false
+
+jobs:
+  checks:
+    name: Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+      - name: Set up Python
+        run: uv python install
+      - name: Install dependencies
+        run: uv sync
+      - name: Ruff lint
+        run: uv run ruff check
+      - name: Ruff format
+        run: uv run ruff format --check
+      - name: Pyright
+        run: uv run pyright

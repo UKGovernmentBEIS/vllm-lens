@@ -1,0 +1,16 @@
+{
+    "recommendations": [
+        "anthropic.claude-code",
+        "charliermarsh.ruff",
+        "davidanson.vscode-markdownlint",
+        "donjayamanne.githistory",
+        "elagil.pre-commit-helper",
+        "littlefoxteam.vscode-python-test-adapter",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-toolsai.jupyter",
+        "tamasfe.even-better-toml",
+        "ukaisi.inspect-ai",
+        "johnpapa.vscode-peacock",
+    ]
+}

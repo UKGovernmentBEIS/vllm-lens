@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment variables
+.env
+
+# Logs
+logs/
+scratch/
+
+# Core dump
+**/core
+
+# Scratch files
+**/scratch.ipynb
+
+# Container images (built from containers/*.def)
+*.sif
+benchmarks.json

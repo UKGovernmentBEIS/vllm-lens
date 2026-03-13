@@ -1,0 +1,29 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  checks:
+    name: Run checks
+    uses: ./.github/workflows/checks.yaml
+
+  release:
+    name: Release to PyPI
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+      - name: Set up Python
+        run: uv python install
+      - name: Set version from tag
+        run: sed -i "s/version=\".*\"/version=\"${GITHUB_REF_NAME#v}\"/" pyproject.toml
+      - name: Build
+        run: uv build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

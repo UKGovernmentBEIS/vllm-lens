@@ -1,0 +1,89 @@
+[project]
+    classifiers=[
+        "Development Status :: 3 - Alpha",
+        "Intended Audience :: Science/Research",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    ]
+    dependencies=[
+        "datasets>=4.0.0",
+        "pydantic>=2.0",
+        "vllm>=0.16.0",
+        "zstandard>=0.23.0",
+    ]
+    description="vLLM plugin for interacting with activations during inference"
+    license="MIT"
+    name="vllm-lens"
+    readme="README.md"
+    requires-python=">=3.12"
+    version="1.0.0"
+
+[build-system]
+    build-backend="hatchling.build"
+    requires=["hatchling"]
+
+[tool.hatch.build.targets.wheel]
+    packages=["vllm_lens"]
+
+[tool.uv]
+    override-dependencies=["aiobotocore>=3.0.0", "transformers>=5.3.0"]
+    [tool.uv.sources]
+        sifter={git="https://github.com/UKGovernmentBEIS/sifter.git"}
+        torch=[
+            {index="pytorch-cu126", marker="sys_platform == 'linux' or sys_platform == 'win32'"},
+        ]
+        torchvision=[
+            {index="pytorch-cu126", marker="sys_platform == 'linux' or sys_platform == 'win32'"},
+        ]
+
+    [[tool.uv.index]]
+        explicit=true
+        name="pytorch-cu126"
+        url="https://download.pytorch.org/whl/cu126"
+
+[dependency-groups]
+    dev=[
+        "datasets>=4.6.0",
+        "inspect-ai>=0.3.183",
+        "ipykernel>=7.2.0",
+        "ipywidgets>=8.1.8",
+        "jaxtyping>=0.3.9",
+        "jinja2>=3.1.6",
+        "peft>=0.18.1",
+        "pre-commit>=4.5.1",
+        "pyright>=1.1.408",
+        "pytest-asyncio>=1.3.0",
+        "pytest>=9.0.2",
+        "python-dotenv>=1.2.1",
+        "ray[serve]>=2.54.0",
+        "ruff>=0.15.3",
+        "sifter",
+        "syrupy>=5.1.0",
+        "torch>=2.9.1",
+        "tqdm>=4.67.3",
+        "transformers>=5.3.0",
+        "typer>=0.24.1",
+    ]
+
+[tool.pytest.ini_options]
+    asyncio_default_test_loop_scope="module"
+    asyncio_mode="auto"
+    filterwarnings=[
+        "ignore::DeprecationWarning:importlib._bootstrap",
+        "ignore:This process.*is multi-threaded.*use of fork:DeprecationWarning",
+    ]
+
+[tool.pyright]
+    include=["vllm_lens"]
+    reportMissingModuleSource=false
+    reportMissingTypeStubs=false
+    stubPath="typestubs"
+    useLibraryCodeForTypes=false
+
+[tool.ruff.lint]
+    ignore=["F722", "F821"]
+
+    [project.entry-points."vllm.general_plugins"]
+        activations="vllm_lens._activations_plugin:register"
+
+    [project.entry-points.inspect_ai]
+        vllm_lens="vllm_lens._inspect_entry"
