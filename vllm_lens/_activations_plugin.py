@@ -149,8 +149,8 @@ async def _patched_generate(
     try:
         from vllm.v1.engine import EngineCoreRequest
 
-        if isinstance(prompt, EngineCoreRequest) and prompt.sampling_params is not None:
-            effective_params = prompt.sampling_params
+        if isinstance(prompt, EngineCoreRequest) and prompt.sampling_params is not None:  # type: ignore[reportAttributeAccessIssue]
+            effective_params = prompt.sampling_params  # type: ignore[reportAttributeAccessIssue]
     except ImportError:
         pass
 

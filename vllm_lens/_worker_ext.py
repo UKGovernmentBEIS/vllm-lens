@@ -173,7 +173,7 @@ def _hook_inner(
     # Hybrid models (e.g. Qwen3-Next with GatedDeltaNet) have multiple
     # attention metadata entries — some (like GDNAttentionMetadata) lack
     # query_start_loc.  Find one that has it.
-    query_start_loc: Int[torch.Tensor, "num_reqs_plus1"] | None = None
+    query_start_loc: Int[torch.Tensor, "num_reqs_plus1"] | None = None  # type: ignore[reportUndefinedVariable]
     for _meta in attn_metadata.values():
         if hasattr(_meta, "query_start_loc"):
             query_start_loc = getattr(_meta, "query_start_loc")
@@ -236,7 +236,7 @@ def _hook_inner(
     # --- Phase 3: capture activations (rank 0 only) -----------------
     if getattr(extension, "_should_capture", True):
         capture_src = modified_output if modified_output is not None else output
-        hidden_states: Float[torch.Tensor, "total_tokens hidden_dim"]
+        hidden_states: Float[torch.Tensor, "total_tokens hidden_dim"]  # type: ignore[reportUndefinedVariable]
         if isinstance(capture_src, tuple):
             hidden_states = capture_src[0] + capture_src[1]
         else:
@@ -263,7 +263,7 @@ def _hook_inner(
             start = query_start_loc[i].item()
             end = query_start_loc[i + 1].item()
             # Blocking .cpu() benchmarked faster than non_blocking + event sync
-            activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[
+            activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
                 start:end
             ].cpu()
 
@@ -322,7 +322,7 @@ class HiddenStatesExtension:
     # internal_req_id → { layer_idx → [tensor, ...] }
     _captured_states: dict[
         str,
-        dict[int, list[Float[torch.Tensor, "seq_len hidden_dim"]]],
+        dict[int, list[Float[torch.Tensor, "seq_len hidden_dim"]]],  # type: ignore[reportUndefinedVariable]
     ] = {}
     _hooks_installed: bool = False
 
@@ -447,10 +447,10 @@ class HiddenStatesExtension:
             if req_id.startswith(prefix):
                 layer_dict = self._captured_states.pop(req_id)
                 sorted_indices = sorted(layer_dict.keys())
-                per_layer: list[Float[torch.Tensor, "total_pos hidden_dim"]] = [
+                per_layer: list[Float[torch.Tensor, "total_pos hidden_dim"]] = [  # type: ignore[reportUndefinedVariable]
                     torch.cat(layer_dict[idx], dim=0) for idx in sorted_indices
                 ]
-                stacked: Float[torch.Tensor, "n_layers total_pos hidden_dim"] = (
+                stacked: Float[torch.Tensor, "n_layers total_pos hidden_dim"] = (  # type: ignore[reportUndefinedVariable]
                     torch.stack(per_layer, dim=0)
                 )
                 return _ZSTD_COMPRESSOR.compress(

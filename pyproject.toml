@@ -72,13 +72,14 @@
 
 [tool.pyright]
     include=["vllm_lens"]
+    reportMissingImports=false
     reportMissingModuleSource=false
     reportMissingTypeStubs=false
     stubPath="typestubs"
     useLibraryCodeForTypes=false
 
 [tool.ruff.lint]
-    ignore=["F722", "F821"]
+    ignore=["E402", "F722", "F821"]
 
     [project.entry-points."vllm.general_plugins"]
         activations="vllm_lens._activations_plugin:register"
