@@ -24,4 +24,7 @@ scratch/
 
 # Container images (built from containers/*.def)
 *.sif
+
+# Other
 benchmarks.json
+.claude/settings.json
