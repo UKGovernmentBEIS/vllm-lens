@@ -1441,15 +1441,6 @@ wheels = [
 ]
 
 [[package]]
-name = "humanize"
-version = "4.15.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/ba/66/a3921783d54be8a6870ac4ccffcd15c4dc0dd7fcce51c6d63b8c63935276/humanize-4.15.0.tar.gz", hash = "sha256:1dd098483eb1c7ee8e32eb2e99ad1910baefa4b75c3aff3a82f4d78688993b10", size = 83599, upload-time = "2025-12-20T20:16:13.19Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/c5/7b/bca5613a0c3b542420cf92bd5e5fb8ebd5435ce1011a091f66bb7693285e/humanize-4.15.0-py3-none-any.whl", hash = "sha256:b1186eb9f5a9749cd9cb8565aee77919dd7c8d076161cf44d70e59e3301e1769", size = 132203, upload-time = "2025-12-20T20:16:11.67Z" },
-]
-
-[[package]]
 name = "identify"
 version = "2.6.17"
 source = { registry = "https://pypi.org/simple" }
@@ -4767,19 +4758,6 @@ wheels = [
 ]
 
 [[package]]
-name = "sifter"
-version = "0.1.0"
-source = { git = "https://github.com/UKGovernmentBEIS/sifter.git#058753e179b7f95199f2b7b2711eae333a835e09" }
-dependencies = [
-    { name = "boto3" },
-    { name = "humanize" },
-    { name = "pydantic-settings" },
-    { name = "pyyaml" },
-    { name = "rich" },
-    { name = "typer" },
-]
-
-[[package]]
 name = "six"
 version = "1.17.0"
 source = { registry = "https://pypi.org/simple" }
@@ -5499,7 +5477,6 @@ dev = [
     { name = "python-dotenv" },
     { name = "ray", extra = ["serve"] },
     { name = "ruff" },
-    { name = "sifter" },
     { name = "syrupy" },
     { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
     { name = "torch", version = "2.10.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
@@ -5532,7 +5509,6 @@ dev = [
     { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "ray", extras = ["serve"], specifier = ">=2.54.0" },
     { name = "ruff", specifier = ">=0.15.3" },
-    { name = "sifter", git = "https://github.com/UKGovernmentBEIS/sifter.git" },
     { name = "syrupy", specifier = ">=5.1.0" },
     { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=2.9.1" },
     { name = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = ">=2.9.1", index = "https://download.pytorch.org/whl/cu126" },
