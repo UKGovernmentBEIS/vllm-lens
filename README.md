@@ -1,6 +1,6 @@
 # vLLM-lens
 
-vLLM-Lens is designed to enable top-down interpretability (e.g., probes, steering, activation oracles). It is designed to offer high performance, supporting tensor parallelism & pipeline parallelism (across GPUs and nodes) out of the box. It's also designed so you can apply all these techniques concurrently (in the same dynamic batch) - removing the need to switch between model instances.
+vLLM-Lens enables top-down interpretability (e.g., probes, steering, activation oracles). It offers high performance, supporting tensor parallelism & pipeline parallelism (across GPUs and nodes) out of the box. You can also apply all these techniques concurrently (in the same dynamic batch) - removing the need to switch between model instances.
 
 Note this performance comes at the expense of flexibility - for example, you would need to edit the source to add additional custom hooks (though it should be easy enough for coding agents to do that). For more flexibility out of the box, consider [nnsight](https://nnsight.net/) or [TransformerLens](https://transformerlensorg.github.io/TransformerLens/).
 
