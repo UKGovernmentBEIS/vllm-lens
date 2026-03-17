@@ -1,10 +1,10 @@
 # vLLM-lens
 
-Extract residual-stream activations and apply steering vectors (including activation oracles) to any vLLM model during inference. Typically hundreds of times faster than HF Transformers, with the ability to generate text, extract activations, and run activation oracles in the same dynamic batch.
+vLLM-Lens is designed to enable top-down interpretability (e.g., probes, steering, activation oracles). It is designed to offer high performance, supporting tensor parallelism & pipeline parallelism (across GPUs and nodes) out of the box. It's also designed so you can apply all these techniques concurrently (in the same dynamic batch) - removing the need to switch between model instances.
 
-Auto-registers as both a [vLLM general plugin](https://docs.vllm.ai/en/latest/design/plugin_system.html) and an [Inspect](https://inspect.aisi.org.uk/) model provider on install. Interact with model internals per-call via `SamplingParams.extra_args` (vLLM) or `GenerateConfig.extra_body` (Inspect).
+Note this performance comes at the expense of flexibility - for example, you would need to edit the source to add additional custom hooks (though it should be easy enough for coding agents to do that). For more flexibility out of the box, consider [nnsight](https://nnsight.net/) or [TransformerLens](https://transformerlensorg.github.io/TransformerLens/).
 
-Supports async, sync, and serve modes with `mp` and `ray` distributed backends for multi-node tensor parallelism. In offline modes, activations are returned directly on `output.activations`. In serve mode (`vllm serve`), they are serialised in the HTTP response and decoded with `decode_activations()`.
+The module auto-registers as a [vLLM general plugin](https://docs.vllm.ai/en/latest/design/plugin_system.html) and an [Inspect](https://inspect.aisi.org.uk/) model provider on install. Interact with model internals per-call via `SamplingParams.extra_args` (vLLM) or `GenerateConfig.extra_body` (Inspect).
 
 ## Install
 
@@ -14,11 +14,11 @@ uv add vllm-lens
 
 ## Examples
 
-These examples use the Inspect integration. See the [`examples/`](examples/) folder for offline and online vLLM usage.
+These examples use the Inspect integration. See the [`examples/`](examples/) folder for offline and online direct vLLM usage.
 
 ### Inspect AI provider
 
-An [Inspect AI](https://inspect.ai-safety-institute.org.uk/) model provider registered as `vllm-lens`. Extends the built-in vLLM provider to serialize `torch.Tensor` steering vectors for HTTP transport and decode base64-encoded activations from responses into `ModelOutput.metadata["activations"]`. Also supports LoRA adaptors.
+An [Inspect AI](https://inspect.ai-safety-institute.org.uk/) model provider is auto-registered as `vllm-lens`, when you install this package. This model provider extends the built-in vLLM provider to serialize `torch.Tensor` steering vectors for HTTP transport and decode base64-encoded activations from responses into `ModelOutput.metadata["activations"]`. It also supports LoRA adaptors.
 
 Usage is the same as the [default vLLM provider](https://inspect.aisi.org.uk/providers.html#vllm) but with the `vllm-lens` prefix (e.g. `vllm-lens/meta-llama/Llama-3.1-1B`).
 
@@ -75,4 +75,4 @@ Ships a vLLM worker extension that adds hooks to the model in the underlying wor
 
 ## Credits
 
-Developed by Alan Cooney, with credit going to Sid Black for the orignal vLLM worker extension idea.
+Developed by Alan Cooney, with credit going to Sid Black for the original vLLM worker extension idea.
