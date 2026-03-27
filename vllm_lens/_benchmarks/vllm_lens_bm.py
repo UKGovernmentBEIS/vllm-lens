@@ -40,13 +40,15 @@ def load_model(
     return LLM(**kwargs)
 
 
-def extract_activations(llm: LLM, prompts: list[str], layer: int) -> None:
+def extract_activations(
+    llm: LLM, prompts: list[str], layer: int, max_new_tokens: int
+) -> list:
     sampling_params = SamplingParams(
         temperature=0.0,
-        max_tokens=1024,
+        max_tokens=max_new_tokens,
         extra_args={"output_residual_stream": [layer]},
     )
-    llm.generate(prompts, sampling_params)
+    return llm.generate(prompts, sampling_params)
 
 
 @app.command()
@@ -71,8 +73,14 @@ def main(
     startup_time = time.perf_counter() - t0
 
     t1 = time.perf_counter()
-    extract_activations(llm, prompts, cfg.layer)
+    outputs = extract_activations(llm, prompts, cfg.layer, cfg.max_new_tokens)
     run_time = time.perf_counter() - t1
+
+    # Compute activation shape metadata (after timing).
+    acts = [out.activations["residual_stream"] for out in outputs]
+    n_activation_vectors = len(acts)
+    average_len = sum(a.shape[1] for a in acts) / len(acts)
+    d_model = acts[0].shape[-1]
 
     result = BenchmarkResult(
         lib_name=cfg.lib_name or LIB_NAME,
@@ -82,6 +90,9 @@ def main(
         run_time=run_time,
         tensor_parallelism=cfg.tensor_parallelism,
         pipeline_parallelism=cfg.pipeline_parallelism,
+        n_activation_vectors=n_activation_vectors,
+        average_len=average_len,
+        d_model=d_model,
     )
     out_path = result.save()
     typer.echo(f"{result}  → {out_path}")

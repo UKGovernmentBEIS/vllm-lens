@@ -1,46 +1,76 @@
-"""TransformerLens activation extraction benchmark."""
+"""Native HuggingFace Transformers activation extraction benchmark."""
 
 import time
 from typing import Annotated
 
 import torch
 import typer
-from transformer_lens import HookedTransformer
 from datasets import load_dataset
 from dotenv import load_dotenv
 from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils.types import BenchmarkConfig, BenchmarkResult
 
 app = typer.Typer()
 
 
-def load_model(model: str) -> HookedTransformer:
-    return HookedTransformer.from_pretrained(model, dtype=torch.bfloat16)
+def _resolve_layer(
+    model: torch.nn.Module, layer_prefix: str, layer_idx: int
+) -> torch.nn.Module:
+    """Traverse dotted layer_prefix to reach the target decoder layer."""
+    module = model
+    for attr in layer_prefix.split("."):
+        module = getattr(module, attr)
+    return module[layer_idx]
+
+
+def load_model(model_name: str) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=torch.bfloat16, device_map="auto"
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return model, tokenizer
 
 
 def extract_activations(
-    model: HookedTransformer,
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
     prompts: list[str],
+    layer_prefix: str,
     layer: int,
     batch_size: int,
     max_new_tokens: int,
 ) -> list[torch.Tensor]:
-    hook_name = f"blocks.{layer}.hook_resid_post"
+    target_layer = _resolve_layer(model, layer_prefix, layer)
     n_batches = (len(prompts) + batch_size - 1) // batch_size
     model.eval()
     all_acts: list[torch.Tensor] = []
+
     for i in tqdm(
-        range(0, len(prompts), batch_size), total=n_batches, desc="transformer-lens"
+        range(0, len(prompts), batch_size), total=n_batches, desc="hf-transformers"
     ):
-        tokens = model.to_tokens(prompts[i : i + batch_size], prepend_bos=True)
+        batch = prompts[i : i + batch_size]
+        tokens = tokenizer(batch, return_tensors="pt", padding=True).to(model.device)
+
         with torch.no_grad():
             # Pass 1: generate full sequences
             full_tokens = model.generate(
-                tokens, max_new_tokens=max_new_tokens, verbose=False
+                **tokens, max_new_tokens=max_new_tokens, do_sample=False
             )
+
             # Pass 2: extract activations over the complete sequences
-            _, cache = model.run_with_cache(full_tokens, names_filter=hook_name)
-            all_acts.append(cache[hook_name].cpu())
+            captured: list[torch.Tensor] = []
+
+            def hook_fn(module, input, output):
+                hidden = output[0] if isinstance(output, tuple) else output
+                captured.append(hidden.detach())
+
+            handle = target_layer.register_forward_hook(hook_fn)
+            model(full_tokens)
+            handle.remove()
+            all_acts.extend(c.cpu() for c in captured)
     return all_acts
 
 
@@ -48,7 +78,7 @@ def extract_activations(
 def main(
     config_file: Annotated[str, typer.Option(help="Path to JSON BenchmarkConfig file")],
 ) -> None:
-    """Benchmark TransformerLens activation extraction."""
+    """Benchmark native HuggingFace Transformers activation extraction."""
     from pathlib import Path
 
     load_dotenv()
@@ -56,14 +86,14 @@ def main(
 
     if cfg.tensor_parallelism > 1 or cfg.pipeline_parallelism > 1:
         raise typer.BadParameter(
-            f"TransformerLens does not support parallelism (got tp={cfg.tensor_parallelism}, pp={cfg.pipeline_parallelism})"
+            f"HF Transformers does not support parallelism (got tp={cfg.tensor_parallelism}, pp={cfg.pipeline_parallelism})"
         )
 
     ds = load_dataset(cfg.dataset, split="train")
     prompts = [row["instruction"] for row in ds.select(range(cfg.samples))]
 
     t0 = time.perf_counter()
-    tl = load_model(cfg.model)
+    model, tokenizer = load_model(cfg.model)
     startup_time = time.perf_counter() - t0
 
     t1 = time.perf_counter()
@@ -71,7 +101,13 @@ def main(
         try:
             torch.cuda.empty_cache()
             all_acts = extract_activations(
-                tl, prompts, cfg.layer, batch_size, cfg.max_new_tokens
+                model,
+                tokenizer,
+                prompts,
+                cfg.layer_prefix,
+                cfg.layer,
+                batch_size,
+                cfg.max_new_tokens,
             )
             break
         except torch.cuda.OutOfMemoryError:
@@ -92,7 +128,7 @@ def main(
     d_model = all_acts[0].shape[-1]
 
     result = BenchmarkResult(
-        lib_name="TransformerLens",
+        lib_name="HF-Transformers",
         model=cfg.model,
         n_samples=cfg.samples,
         startup_time=startup_time,

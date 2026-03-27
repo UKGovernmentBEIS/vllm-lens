@@ -88,7 +88,8 @@ export RAY_CGRAPH_get_timeout=900
 RAY_PORT=6378
 export RAY_ADDRESS="$HEAD_IP:$RAY_PORT"
 EXPECTED_NODES=$SLURM_NNODES
-EXPECTED_GPUS=$(( EXPECTED_NODES * 4 ))
+GPUS_PER_NODE=${SLURM_GPUS_PER_NODE:-4}
+EXPECTED_GPUS=$(( EXPECTED_NODES * GPUS_PER_NODE ))
 
 # ── Increase file descriptor limit ───────────────────────────────────
 ulimit -n 65536 2>/dev/null || ulimit -n 16384 2>/dev/null || true
@@ -138,6 +139,8 @@ exec singularity exec --nv --pid --contain \\
     --env TORCH_EXTENSIONS_DIR="/tmp/.torch_ext" \\
     --env TORCH_HOME="/tmp/.torch" \\
     --env TORCHINDUCTOR_CACHE_DIR="/tmp/.torchinductor" \\
+    --env SSL_CERT_FILE="/var/lib/ca-certificates/ca-bundle.pem" \\
+    --env REQUESTS_CA_BUNDLE="/var/lib/ca-certificates/ca-bundle.pem" \\
     "$CONTAINER" \\
     bash -c '
         source /host/adapt.sh
@@ -166,7 +169,7 @@ trap cleanup_job EXIT TERM INT
 for WORKER in $WORKER_NODES; do
     WORKER_IP=$(dig +short "$WORKER")
     echo "Starting Ray worker $WORKER ($WORKER_IP)..."
-    srun --nodelist "$WORKER" --nodes=1 --gpus=4 \
+    srun --nodelist "$WORKER" --nodes=1 --gpus=$GPUS_PER_NODE \
         --ntasks-per-node=1 "$SRUN_EXEC" \
         bash -c "export VLLM_HOST_IP=$WORKER_IP RAY_raylet_start_wait_time_s=$RAY_raylet_start_wait_time_s; \
         ray start --block \
@@ -184,13 +187,16 @@ fi
 # The user script is responsible for starting Ray head and any application
 # logic. It runs in the foreground; when it exits, the job is done.
 echo "Running user script on $HEAD_NODE ($HEAD_IP)..."
-srun --nodelist "$HEAD_NODE" --nodes=1 --gpus=4 \
+srun --nodelist "$HEAD_NODE" --nodes=1 --gpus=$GPUS_PER_NODE \
     --ntasks-per-node=1 "$SRUN_EXEC" \
     bash -c "
         export VLLM_HOST_IP=$HEAD_IP RAY_raylet_start_wait_time_s=$RAY_raylet_start_wait_time_s
+        # Install to Lustre scratch (RAM-backed /tmp is too small for large dep trees)
+        export PYTHONUSERBASE=$JOB_TMP/pip_user
+        export PATH=\$PYTHONUSERBASE/bin:\$PATH
         if [ -n \"${PACKAGES:-}\" ]; then
             # shellcheck disable=SC2086
-            pip install $PACKAGES
+            pip install --cache-dir $JOB_TMP/pip_cache $PACKAGES
         fi
         cd $WORK_DIR
         python $USER_SCRIPT --config-file $CONFIG_FILE

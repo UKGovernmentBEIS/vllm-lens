@@ -31,3 +31,4 @@ vllm_lens/_benchmarks/logs/
 
 # Other
 .claude/settings.json
+.claude/scheduled_tasks.lock

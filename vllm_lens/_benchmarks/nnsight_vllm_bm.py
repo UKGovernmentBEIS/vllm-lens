@@ -47,13 +47,17 @@ def extract_activations(
     prompts: list[str],
     layer: int,
     layer_prefix: str,
-) -> None:
+    max_new_tokens: int,
+) -> list:
     # Batch all prompts in ONE trace context so vLLM continuous-batches internally.
     target_layer = _resolve_layer(nns, layer_prefix, layer)
+    saved = []
     with nns.trace() as tracer:
         for prompt in prompts:
-            with tracer.invoke(prompt, temperature=0.0, max_tokens=1024):
-                target_layer.output[0].save()
+            with tracer.invoke(prompt, temperature=0.0, max_tokens=max_new_tokens):
+                s = target_layer.output[0].save()
+                saved.append(s)
+    return [s.value.cpu() for s in saved]
 
 
 @app.command()
@@ -79,8 +83,15 @@ def main(
     startup_time = time.perf_counter() - t0
 
     t1 = time.perf_counter()
-    extract_activations(nns, prompts, cfg.layer, cfg.layer_prefix)
+    acts = extract_activations(
+        nns, prompts, cfg.layer, cfg.layer_prefix, cfg.max_new_tokens
+    )
     run_time = time.perf_counter() - t1
+
+    # Compute activation shape metadata (after timing).
+    n_activation_vectors = len(acts)
+    average_len = sum(a.shape[-2] for a in acts) / len(acts)
+    d_model = acts[0].shape[-1]
 
     result = BenchmarkResult(
         lib_name=cfg.lib_name or LIB_NAME,
@@ -89,6 +100,9 @@ def main(
         startup_time=startup_time,
         run_time=run_time,
         tensor_parallelism=cfg.tensor_parallelism,
+        n_activation_vectors=n_activation_vectors,
+        average_len=average_len,
+        d_model=d_model,
     )
     out_path = result.save()
     typer.echo(f"{result}  → {out_path}")

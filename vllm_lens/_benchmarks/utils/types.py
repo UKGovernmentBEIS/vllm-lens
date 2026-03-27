@@ -25,12 +25,12 @@ class BenchmarkRun(BaseModel):
     # ── Fields that flow into BenchmarkConfig for the script ──
     tensor_parallelism: int = 1
     pipeline_parallelism: int = 1
-    batch_size: int | None = None
     distributed_executor_backend: str | None = None
     trust_remote_code: bool = False
     layer_prefix: str = "model.decoder.layers"
     use_ray: bool = False
     lib_name: str = ""
+    max_new_tokens: int = 1024
 
 
 class BenchmarkConfig(BaseModel):
@@ -43,12 +43,12 @@ class BenchmarkConfig(BaseModel):
     dataset: str = "tatsu-lab/alpaca"
     tensor_parallelism: int = 1
     pipeline_parallelism: int = 1
-    batch_size: int | None = None
     distributed_executor_backend: str | None = None
     trust_remote_code: bool = False
     layer_prefix: str = "model.decoder.layers"
     lib_name: str = ""
     use_ray: bool = False
+    max_new_tokens: int = 1024
 
 
 class Benchmark(BaseModel):
@@ -81,6 +81,9 @@ class BenchmarkResult(Benchmark):
 
     startup_time: float
     run_time: float
+    n_activation_vectors: int | None = None
+    average_len: float | None = None
+    d_model: int | None = None
 
     def results_filename(self) -> Path:
         """Return the full output path for this result."""

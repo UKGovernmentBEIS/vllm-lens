@@ -73,20 +73,18 @@ BENCHMARKS: list[BenchmarkRun] = [
         packages=["python-dotenv", "datasets", "nnsight"],
     ),
     BenchmarkRun(
-        name="nnterp",
-        script="nnterp_bm.py",
-        n_gpus=1,
-        batch_size=16,
-        container_name="vllm-0.18.0",
-        packages=["python-dotenv", "nnsight", "tqdm"],
-    ),
-    BenchmarkRun(
         name="transformer-lens",
         script="transformer_lens_bm.py",
         n_gpus=1,
-        batch_size=16,
         container_name="vllm-0.18.0",
         packages=["python-dotenv", "transformer-lens", "tqdm"],
+    ),
+    BenchmarkRun(
+        name="hf-transformers",
+        script="hf_transformers_bm.py",
+        n_gpus=1,
+        container_name="vllm-0.18.0",
+        packages=["python-dotenv", "datasets", "tqdm"],
     ),
     BenchmarkRun(
         name="nnsight-vllm-llama405b-tp16",
@@ -124,8 +122,9 @@ BENCHMARKS: list[BenchmarkRun] = [
         tensor_parallelism=4,
         pipeline_parallelism=4,
         distributed_executor_backend="ray",
+        use_ray=True,
         lib_name="vllm-lens-llama405b-pp4tp4",
-        packages=["python-dotenv"],
+        packages=["python-dotenv", "ray"],
     ),
 ]
 
@@ -144,12 +143,12 @@ def _build_config(
         dataset=dataset,
         tensor_parallelism=bench.tensor_parallelism,
         pipeline_parallelism=bench.pipeline_parallelism,
-        batch_size=bench.batch_size,
         distributed_executor_backend=bench.distributed_executor_backend,
         trust_remote_code=bench.trust_remote_code,
         layer_prefix=bench.layer_prefix,
         lib_name=bench.lib_name or bench.name,
         use_ray=bench.use_ray,
+        max_new_tokens=bench.max_new_tokens,
     )
 
 
@@ -220,7 +219,7 @@ def main(
     """Submit activation-extraction benchmarks as Slurm jobs."""
     load_dotenv()
     LOGS_DIR.mkdir(exist_ok=True)
-    pre_download_datasets([dataset])
+    pre_download_datasets([{"path": dataset, "split": "train"}])
 
     selected = [
         b for b in BENCHMARKS if benchmarks is None or b.name in (benchmarks or [])
