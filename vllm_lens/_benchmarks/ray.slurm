@@ -163,9 +163,81 @@ cleanup_job() {
 }
 trap cleanup_job EXIT TERM INT
 
+# ── Write benchmark config to a file (avoids shell-quoting issues) ────
+CONFIG_FILE="$JOB_TMP/benchmark_config.json"
+if [ -n "${BENCHMARK_CONFIG:-}" ]; then
+    printf '%s' "$BENCHMARK_CONFIG" > "$CONFIG_FILE"
+fi
+
+# ── Start Ray head + user script on head node (background srun) ──────
+# Head and user script share one srun so Slurm doesn't double-allocate GPUs.
+# Started FIRST so the GCS is up before workers try to connect.
+READY_FILE="$JOB_TMP/ray_head_ready"
+echo "Starting Ray head + user script on $HEAD_NODE ($HEAD_IP)..."
+srun --nodelist "$HEAD_NODE" --nodes=1 --gpus=$GPUS_PER_NODE \
+    --ntasks-per-node=1 "$SRUN_EXEC" \
+    bash -c "
+        export VLLM_HOST_IP=$HEAD_IP RAY_raylet_start_wait_time_s=$RAY_raylet_start_wait_time_s
+
+        # ── Start Ray head as a daemon ──
+        ray start --head --port=$RAY_PORT --node-ip-address=$HEAD_IP \
+            --num-gpus=$GPUS_PER_NODE --disable-usage-stats
+        echo 'Ray head started on $HEAD_IP:$RAY_PORT'
+
+        # ── Signal readiness to outer script ──
+        touch $READY_FILE
+
+        # ── Wait for all worker nodes to register ──
+        echo 'Waiting for $EXPECTED_NODES nodes ($EXPECTED_GPUS GPUs) to register...'
+        DEADLINE=\$((SECONDS + 300))
+        while [ \$SECONDS -lt \$DEADLINE ]; do
+            N_GPUS=\$(python3 -c 'import ray; ray.init(address=\"auto\", ignore_reinit_error=True); print(int(ray.cluster_resources().get(\"GPU\", 0)))' 2>/dev/null || echo 0)
+            if [ \"\$N_GPUS\" -ge $EXPECTED_GPUS ]; then
+                echo \"Ray cluster ready: \$N_GPUS GPUs across $EXPECTED_NODES nodes\"
+                break
+            fi
+            echo \"  GPUs registered: \$N_GPUS / $EXPECTED_GPUS\"
+            sleep 10
+        done
+
+        if [ \"\$N_GPUS\" -lt $EXPECTED_GPUS ]; then
+            echo 'ERROR: Timed out waiting for Ray cluster (got \$N_GPUS/$EXPECTED_GPUS GPUs)'
+            ray stop
+            exit 1
+        fi
+
+        # ── Install packages ──
+        export PYTHONUSERBASE=$JOB_TMP/pip_user
+        export PATH=\$PYTHONUSERBASE/bin:\$PATH
+        if [ -n \"${PACKAGES:-}\" ]; then
+            # shellcheck disable=SC2086
+            pip install --cache-dir $JOB_TMP/pip_cache $PACKAGES
+        fi
+
+        # ── Run user script ──
+        cd $WORK_DIR
+        python $USER_SCRIPT --config-file $CONFIG_FILE
+    " &
+HEAD_PID=$!
+
+# ── Wait for Ray head to accept connections ──────────────────────────
+echo "Waiting for Ray head to become ready..."
+DEADLINE=$((SECONDS + 120))
+while [ $SECONDS -lt $DEADLINE ]; do
+    if [ -f "$READY_FILE" ]; then
+        echo "Ray head is accepting connections on $HEAD_IP:$RAY_PORT"
+        break
+    fi
+    sleep 2
+done
+if [ ! -f "$READY_FILE" ]; then
+    echo "ERROR: Ray head did not start within 120 seconds"
+    kill $HEAD_PID 2>/dev/null || true
+    exit 1
+fi
+
 # ── Start Ray worker nodes (staggered to avoid GCS overload) ─────────
-# Workers use `ray start --block` which retries until the head is reachable,
-# so they are started before the user script (which starts Ray head).
+# Workers connect to the now-running head.
 for WORKER in $WORKER_NODES; do
     WORKER_IP=$(dig +short "$WORKER")
     echo "Starting Ray worker $WORKER ($WORKER_IP)..."
@@ -174,30 +246,8 @@ for WORKER in $WORKER_NODES; do
         bash -c "export VLLM_HOST_IP=$WORKER_IP RAY_raylet_start_wait_time_s=$RAY_raylet_start_wait_time_s; \
         ray start --block \
         --address=$HEAD_IP:$RAY_PORT --node-ip-address=$WORKER_IP" &
-    sleep 10  # stagger worker starts to avoid GCS registration storm
+    sleep 5  # stagger worker starts to avoid GCS registration storm
 done
 
-# ── Write benchmark config to a file (avoids shell-quoting issues) ────
-CONFIG_FILE="$JOB_TMP/benchmark_config.json"
-if [ -n "${BENCHMARK_CONFIG:-}" ]; then
-    printf '%s' "$BENCHMARK_CONFIG" > "$CONFIG_FILE"
-fi
-
-# ── Run user script on head node (inside container) ──────────────────
-# The user script is responsible for starting Ray head and any application
-# logic. It runs in the foreground; when it exits, the job is done.
-echo "Running user script on $HEAD_NODE ($HEAD_IP)..."
-srun --nodelist "$HEAD_NODE" --nodes=1 --gpus=$GPUS_PER_NODE \
-    --ntasks-per-node=1 "$SRUN_EXEC" \
-    bash -c "
-        export VLLM_HOST_IP=$HEAD_IP RAY_raylet_start_wait_time_s=$RAY_raylet_start_wait_time_s
-        # Install to Lustre scratch (RAM-backed /tmp is too small for large dep trees)
-        export PYTHONUSERBASE=$JOB_TMP/pip_user
-        export PATH=\$PYTHONUSERBASE/bin:\$PATH
-        if [ -n \"${PACKAGES:-}\" ]; then
-            # shellcheck disable=SC2086
-            pip install --cache-dir $JOB_TMP/pip_cache $PACKAGES
-        fi
-        cd $WORK_DIR
-        python $USER_SCRIPT --config-file $CONFIG_FILE
-    "
+# ── Wait for head srun (user script) to finish ──────────────────────
+wait $HEAD_PID

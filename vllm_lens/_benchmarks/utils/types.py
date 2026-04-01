@@ -19,7 +19,7 @@ class BenchmarkRun(BaseModel):
     packages: list[str] = []
     model: str = "facebook/opt-30b"
     n_nodes: int = 1
-    time: str = "04:00:00"
+    time: str = "02:00:00"
     container_name: str = "vllm-lens-0.18.0"
     container_env: str = ""
     # ── Fields that flow into BenchmarkConfig for the script ──

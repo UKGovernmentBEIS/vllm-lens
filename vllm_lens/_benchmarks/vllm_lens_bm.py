@@ -31,8 +31,6 @@ def load_model(
         pipeline_parallel_size=pipeline_parallelism,
         gpu_memory_utilization=0.90,
     )
-    if pipeline_parallelism == 1:
-        kwargs["quantization"] = "fp8"
     if distributed_executor_backend:
         kwargs["distributed_executor_backend"] = distributed_executor_backend
     if trust_remote_code:
