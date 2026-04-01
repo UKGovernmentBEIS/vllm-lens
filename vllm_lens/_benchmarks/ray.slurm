@@ -189,7 +189,7 @@ srun --nodelist "$HEAD_NODE" --nodes=1 --gpus=$GPUS_PER_NODE \
 
         # ── Wait for all worker nodes to register ──
         echo 'Waiting for $EXPECTED_NODES nodes ($EXPECTED_GPUS GPUs) to register...'
-        DEADLINE=\$((SECONDS + 300))
+        DEADLINE=\$((SECONDS + 1200))
         while [ \$SECONDS -lt \$DEADLINE ]; do
             N_GPUS=\$(python3 -c 'import ray; ray.init(address=\"auto\", ignore_reinit_error=True); print(int(ray.cluster_resources().get(\"GPU\", 0)))' 2>/dev/null || echo 0)
             if [ \"\$N_GPUS\" -ge $EXPECTED_GPUS ]; then
@@ -238,12 +238,17 @@ fi
 
 # ── Start Ray worker nodes (staggered to avoid GCS overload) ─────────
 # Workers connect to the now-running head.
+# Install packages on each worker before starting Ray so that libraries
+# like nnsight are available when Ray spawns actors on remote nodes.
 for WORKER in $WORKER_NODES; do
     WORKER_IP=$(dig +short "$WORKER")
     echo "Starting Ray worker $WORKER ($WORKER_IP)..."
     srun --nodelist "$WORKER" --nodes=1 --gpus=$GPUS_PER_NODE \
         --ntasks-per-node=1 "$SRUN_EXEC" \
         bash -c "export VLLM_HOST_IP=$WORKER_IP RAY_raylet_start_wait_time_s=$RAY_raylet_start_wait_time_s; \
+        export PYTHONUSERBASE=$JOB_TMP/pip_user; \
+        export PATH=\$PYTHONUSERBASE/bin:\$PATH; \
+        pip install --quiet --cache-dir $JOB_TMP/pip_cache ${PACKAGES:-} 2>/dev/null; \
         ray start --block \
         --address=$HEAD_IP:$RAY_PORT --node-ip-address=$WORKER_IP" &
     sleep 5  # stagger worker starts to avoid GCS registration storm

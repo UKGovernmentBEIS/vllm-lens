@@ -49,17 +49,23 @@ def extract_activations(
     layer_prefix: str,
     max_new_tokens: int,
 ) -> list:
-    # Use list().save() — an nnsight-managed list at trace scope — so the graph
-    # tracks appends properly across the vLLM engine subprocess boundary.
-    # A plain Python list doesn't work because tracer.invoke() body runs in
-    # the engine subprocess.
+    # Use tracer.all() to capture activations at every generation step.
+    # tracer.all() applies the intervention recursively across all iterations
+    # without a Python-level for-loop, which is faster than tracer.iter[:].
+    # See: https://nnsight.net/features/4_multiple_token/
     target_layer = _resolve_layer(nns, layer_prefix, layer)
     with nns.trace() as tracer:
         activations = list().save()
         for prompt in prompts:
             with tracer.invoke(prompt, temperature=1.0, max_tokens=max_new_tokens):
-                activations.append(target_layer.output[0].cpu())
-    return [a for a in activations]
+                prompt_acts = list().save()
+                with tracer.all():
+                    prompt_acts.append(target_layer.output[0].cpu())
+                activations.append(prompt_acts)
+    # Each prompt_acts is a list of [d_model] tensors — stack into [seq_len, d_model]
+    import torch
+
+    return [torch.stack(list(pa)) for pa in activations]
 
 
 @app.command()
@@ -91,14 +97,10 @@ def main(
     run_time = time.perf_counter() - t1
 
     # Compute activation shape metadata (after timing).
+    # Each activation has shape [seq_len, d_model] from stacked per-step tensors.
     n_activation_vectors = len(acts)
+    average_len = sum(a.shape[0] for a in acts) / len(acts)
     d_model = acts[0].shape[-1]
-    # nnsight + vLLM returns last-token hidden state per prompt (shape [d_model]).
-    # If shape has a sequence dimension, compute average_len; otherwise it's 1.
-    if acts[0].ndim >= 2:
-        average_len = sum(a.shape[-2] for a in acts) / len(acts)
-    else:
-        average_len = 1.0
 
     result = BenchmarkResult(
         lib_name=cfg.lib_name or LIB_NAME,
