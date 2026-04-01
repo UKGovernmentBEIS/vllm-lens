@@ -56,9 +56,7 @@ def extract_activations(
 
         with torch.no_grad():
             # Pass 1: generate full sequences
-            full_tokens = model.generate(
-                **tokens, max_new_tokens=max_new_tokens, do_sample=False
-            )
+            full_tokens = model.generate(**tokens, max_new_tokens=max_new_tokens)
 
             # Pass 2: extract activations over the complete sequences
             captured: list[torch.Tensor] = []
@@ -97,7 +95,8 @@ def main(
     startup_time = time.perf_counter() - t0
 
     t1 = time.perf_counter()
-    for batch_size in (512, 256, 128, 64, 32, 16, 8, 4, 2):
+    # Search through batch sizes to make sure we have the max we can get away with without OOM
+    for batch_size in (128, 64, 32, 16, 8, 4, 2):
         try:
             torch.cuda.empty_cache()
             all_acts = extract_activations(
@@ -117,6 +116,7 @@ def main(
                 f"OOM at batch_size={batch_size}, retrying with {batch_size // 2}"
             )
             torch.cuda.empty_cache()
+            # Reset startup counter (as previous batch size OOM'd and we're starting again)
             t1 = time.perf_counter()
     run_time = time.perf_counter() - t1
 

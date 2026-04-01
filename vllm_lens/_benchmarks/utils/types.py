@@ -22,6 +22,7 @@ class BenchmarkRun(BaseModel):
     time: str = "02:00:00"
     container_name: str = "vllm-lens-0.18.0"
     container_env: str = ""
+    exclusive: bool = False
     # ── Fields that flow into BenchmarkConfig for the script ──
     tensor_parallelism: int = 1
     pipeline_parallelism: int = 1
@@ -31,6 +32,7 @@ class BenchmarkRun(BaseModel):
     use_ray: bool = False
     lib_name: str = ""
     max_new_tokens: int = 1024
+    enforce_eager: bool = False
 
 
 class BenchmarkConfig(BaseModel):
@@ -49,6 +51,7 @@ class BenchmarkConfig(BaseModel):
     lib_name: str = ""
     use_ray: bool = False
     max_new_tokens: int = 1024
+    enforce_eager: bool = False
 
 
 class Benchmark(BaseModel):

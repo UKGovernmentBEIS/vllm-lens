@@ -49,15 +49,17 @@ def extract_activations(
     layer_prefix: str,
     max_new_tokens: int,
 ) -> list:
-    # Batch all prompts in ONE trace context so vLLM continuous-batches internally.
+    # Use list().save() — an nnsight-managed list at trace scope — so the graph
+    # tracks appends properly across the vLLM engine subprocess boundary.
+    # A plain Python list doesn't work because tracer.invoke() body runs in
+    # the engine subprocess.
     target_layer = _resolve_layer(nns, layer_prefix, layer)
-    saved = []
     with nns.trace() as tracer:
+        activations = list().save()
         for prompt in prompts:
-            with tracer.invoke(prompt, temperature=0.0, max_tokens=max_new_tokens):
-                s = target_layer.output[0].save()
-                saved.append(s)
-    return [s.value.cpu() for s in saved]
+            with tracer.invoke(prompt, temperature=1.0, max_tokens=max_new_tokens):
+                activations.append(target_layer.output[0].cpu())
+    return [a for a in activations]
 
 
 @app.command()
@@ -90,8 +92,13 @@ def main(
 
     # Compute activation shape metadata (after timing).
     n_activation_vectors = len(acts)
-    average_len = sum(a.shape[-2] for a in acts) / len(acts)
     d_model = acts[0].shape[-1]
+    # nnsight + vLLM returns last-token hidden state per prompt (shape [d_model]).
+    # If shape has a sequence dimension, compute average_len; otherwise it's 1.
+    if acts[0].ndim >= 2:
+        average_len = sum(a.shape[-2] for a in acts) / len(acts)
+    else:
+        average_len = 1.0
 
     result = BenchmarkResult(
         lib_name=cfg.lib_name or LIB_NAME,
