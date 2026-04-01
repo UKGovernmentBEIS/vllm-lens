@@ -1,6 +1,7 @@
 """TransformerLens activation extraction benchmark."""
 
 import time
+from pathlib import Path
 from typing import Annotated
 
 import torch
@@ -117,7 +118,6 @@ def main(
     config_file: Annotated[str, typer.Option(help="Path to JSON BenchmarkConfig file")],
 ) -> None:
     """Benchmark TransformerLens activation extraction."""
-    from pathlib import Path
 
     load_dotenv()
     cfg = BenchmarkConfig.model_validate_json(Path(config_file).read_text())

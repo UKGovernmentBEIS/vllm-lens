@@ -5,11 +5,12 @@ from functools import reduce
 from pathlib import Path
 from typing import Annotated
 
+import ray
+import torch
 import typer
 from datasets import load_dataset
 from dotenv import load_dotenv
 from nnsight.modeling.vllm import VLLM
-
 from utils.types import BenchmarkConfig, BenchmarkResult
 
 LIB_NAME = "nnsight-vllm"
@@ -63,7 +64,6 @@ def extract_activations(
                     prompt_acts.append(target_layer.output[0].cpu())
                 activations.append(prompt_acts)
     # Each prompt_acts is a list of [d_model] tensors — stack into [seq_len, d_model]
-    import torch
 
     return [torch.stack(list(pa)) for pa in activations]
 
@@ -77,8 +77,6 @@ def main(
     cfg = BenchmarkConfig.model_validate_json(Path(config_file).read_text())
 
     if cfg.use_ray:
-        import ray
-
         ray.init(address="auto")
 
     ds = load_dataset(cfg.dataset, split="train")
