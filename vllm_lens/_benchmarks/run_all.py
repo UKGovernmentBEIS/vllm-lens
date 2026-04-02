@@ -44,6 +44,7 @@ BENCHMARKS: list[BenchmarkRun] = [
         tensor_parallelism=1,
         pipeline_parallelism=1,
         lib_name="vllm-lens",
+        container_env="HF_HUB_OFFLINE=1",
         packages=["python-dotenv"],
     ),
     BenchmarkRun(
@@ -53,6 +54,7 @@ BENCHMARKS: list[BenchmarkRun] = [
         tensor_parallelism=4,
         pipeline_parallelism=1,
         lib_name="vllm-lens-tp4",
+        container_env="HF_HUB_OFFLINE=1",
         packages=["python-dotenv"],
     ),
     BenchmarkRun(
@@ -63,6 +65,7 @@ BENCHMARKS: list[BenchmarkRun] = [
         pipeline_parallelism=1,
         enforce_eager=True,
         container_name="vllm-0.18.0",
+        container_env="HF_HUB_OFFLINE=1",
         packages=["python-dotenv", "datasets"],
     ),
     BenchmarkRun(
@@ -73,6 +76,7 @@ BENCHMARKS: list[BenchmarkRun] = [
         pipeline_parallelism=1,
         enforce_eager=True,
         container_name="vllm-0.18.0",
+        container_env="HF_HUB_OFFLINE=1",
         packages=["python-dotenv", "datasets"],
     ),
     BenchmarkRun(
@@ -81,6 +85,7 @@ BENCHMARKS: list[BenchmarkRun] = [
         n_gpus=1,
         tensor_parallelism=1,
         container_name="vllm-0.15.1",
+        container_env="HF_HUB_OFFLINE=1",
         packages=["python-dotenv", "datasets", "nnsight"],
     ),
     BenchmarkRun(
@@ -90,6 +95,7 @@ BENCHMARKS: list[BenchmarkRun] = [
         tensor_parallelism=4,
         lib_name="nnsight-vllm-tp4",
         container_name="vllm-0.15.1",
+        container_env="HF_HUB_OFFLINE=1",
         packages=["python-dotenv", "datasets", "nnsight"],
     ),
     BenchmarkRun(
@@ -99,6 +105,7 @@ BENCHMARKS: list[BenchmarkRun] = [
         time="04:00:00",
         exclusive=True,
         container_name="vllm-0.18.0",
+        container_env="HF_HUB_OFFLINE=1",
         packages=["python-dotenv", "transformer-lens", "tqdm"],
     ),
     BenchmarkRun(
@@ -107,6 +114,7 @@ BENCHMARKS: list[BenchmarkRun] = [
         n_gpus=1,
         exclusive=True,
         container_name="vllm-0.18.0",
+        container_env="HF_HUB_OFFLINE=1",
         packages=["python-dotenv", "datasets", "tqdm"],
     ),
     BenchmarkRun(
@@ -121,6 +129,7 @@ BENCHMARKS: list[BenchmarkRun] = [
         layer_prefix="model.layers",
         lib_name="nnsight-vllm-llama405b-tp16",
         container_name="vllm-0.15.1",
+        container_env="HF_HUB_OFFLINE=1",
         packages=["python-dotenv", "datasets", "nnsight", "ray"],
     ),
     BenchmarkRun(
@@ -136,6 +145,7 @@ BENCHMARKS: list[BenchmarkRun] = [
         use_ray=True,
         layer_prefix="model.layers",
         lib_name="vllm-lens-llama405b-tp16",
+        container_env="HF_HUB_OFFLINE=1",
         packages=["python-dotenv", "ray"],
     ),
     BenchmarkRun(
@@ -169,7 +179,7 @@ BENCHMARKS: list[BenchmarkRun] = [
         trust_remote_code=True,
         layer_prefix="model.layers",
         lib_name="vllm-lens-glm5-tp16",
-        container_env="DG_JIT_CACHE_DIR=/tmp/deepgemm_jit",
+        container_env="HF_HUB_OFFLINE=1;DG_JIT_CACHE_DIR=/tmp/deepgemm_jit",
         packages=["python-dotenv", "ray"],
     ),
     BenchmarkRun(
@@ -188,7 +198,7 @@ BENCHMARKS: list[BenchmarkRun] = [
         layer_prefix="model.layers",
         lib_name="pure-vllm-glm5-tp16",
         container_name="vllm-0.18.0",
-        container_env="HF_HUB_OFFLINE=1 DG_JIT_CACHE_DIR=/tmp/deepgemm_jit",
+        container_env="HF_HUB_OFFLINE=1;DG_JIT_CACHE_DIR=/tmp/deepgemm_jit",
         packages=["python-dotenv", "datasets", "ray"],
     ),
 ]

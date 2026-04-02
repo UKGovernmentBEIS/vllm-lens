@@ -57,6 +57,17 @@ if [ "${DEBUG_MODE:-0}" = "1" ]; then
     echo "[DEBUG] Debug mode enabled — NCCL flight recorder to $DEBUG_LOG_DIR"
 fi
 
+# ── Load .env file ───────────────────────────────────────────────────
+# Export variables from the project .env so all nodes (head + workers)
+# get HF_HUB_CACHE, HF_HUB_OFFLINE, etc. inside the container.
+ENV_FILE="${WORK_DIR}/../../.env"
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
+
 # ── Per-model container environment variables ────────────────────────
 # Singularity passes through host env by default, so exporting here
 # makes these available inside the container without --env flags.
@@ -83,8 +94,9 @@ HEAD_IP=$(dig +short "$HEAD_NODE")
 # ── Ray configuration ─────────────────────────────────────────────────
 # Give workers more time to register with GCS (default is too short for
 # multi-node on Slingshot).
-export RAY_raylet_start_wait_time_s=120
+export RAY_raylet_start_wait_time_s=300
 export RAY_CGRAPH_get_timeout=900
+export RAY_BACKEND_LOG_LEVEL=debug
 RAY_PORT=6378
 export RAY_ADDRESS="$HEAD_IP:$RAY_PORT"
 EXPECTED_NODES=$SLURM_NNODES
@@ -169,6 +181,24 @@ if [ -n "${BENCHMARK_CONFIG:-}" ]; then
     printf '%s' "$BENCHMARK_CONFIG" > "$CONFIG_FILE"
 fi
 
+# ── Install packages on ALL nodes simultaneously ─────────────────────
+# Run pip install across every node in one srun before Ray starts.
+# This ensures packages (nnsight, ray, etc.) are available to all Ray
+# actors regardless of which node they spawn on.
+export PYTHONUSERBASE="$JOB_TMP/pip_user"
+export PATH="$PYTHONUSERBASE/bin:$PATH"
+if [ -n "${PACKAGES:-}" ]; then
+    echo "Installing packages on all $SLURM_NNODES nodes: $PACKAGES"
+    # Use --gpus=0 so this step doesn't conflict with GPU allocations.
+    # Packages are installed to shared Lustre ($JOB_TMP/pip_user) so only
+    # one node needs to run pip; the rest see the result immediately.
+    srun --nodelist "$HEAD_NODE" --nodes=1 --ntasks-per-node=1 --gpus=0 \
+        "$SRUN_EXEC" \
+        bash -c "export PYTHONUSERBASE=$JOB_TMP/pip_user; \
+        pip install --cache-dir $JOB_TMP/pip_cache $PACKAGES"
+    echo "Package installation complete."
+fi
+
 # ── Start Ray head + user script on head node (background srun) ──────
 # Head and user script share one srun so Slurm doesn't double-allocate GPUs.
 # Started FIRST so the GCS is up before workers try to connect.
@@ -206,14 +236,6 @@ srun --nodelist "$HEAD_NODE" --nodes=1 --gpus=$GPUS_PER_NODE \
             exit 1
         fi
 
-        # ── Install packages ──
-        export PYTHONUSERBASE=$JOB_TMP/pip_user
-        export PATH=\$PYTHONUSERBASE/bin:\$PATH
-        if [ -n \"${PACKAGES:-}\" ]; then
-            # shellcheck disable=SC2086
-            pip install --cache-dir $JOB_TMP/pip_cache $PACKAGES
-        fi
-
         # ── Run user script ──
         cd $WORK_DIR
         python $USER_SCRIPT --config-file $CONFIG_FILE
@@ -237,9 +259,9 @@ if [ ! -f "$READY_FILE" ]; then
 fi
 
 # ── Start Ray worker nodes (staggered to avoid GCS overload) ─────────
-# Workers connect to the now-running head.
-# Install packages on each worker before starting Ray so that libraries
-# like nnsight are available when Ray spawns actors on remote nodes.
+# Packages are already installed on all nodes. Workers just start Ray.
+# Wait 10s before first worker to let head GCS fully stabilize.
+sleep 10
 for WORKER in $WORKER_NODES; do
     WORKER_IP=$(dig +short "$WORKER")
     echo "Starting Ray worker $WORKER ($WORKER_IP)..."
@@ -248,7 +270,6 @@ for WORKER in $WORKER_NODES; do
         bash -c "export VLLM_HOST_IP=$WORKER_IP RAY_raylet_start_wait_time_s=$RAY_raylet_start_wait_time_s; \
         export PYTHONUSERBASE=$JOB_TMP/pip_user; \
         export PATH=\$PYTHONUSERBASE/bin:\$PATH; \
-        pip install --quiet --cache-dir $JOB_TMP/pip_cache ${PACKAGES:-} 2>/dev/null; \
         ray start --block \
         --address=$HEAD_IP:$RAY_PORT --node-ip-address=$WORKER_IP" &
     sleep 5  # stagger worker starts to avoid GCS registration storm

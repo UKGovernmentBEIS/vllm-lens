@@ -43,6 +43,9 @@ def _resolve_layer(nns, layer_prefix: str, layer: int):
     return parent[layer]
 
 
+CHUNK_SIZE = 100  # prompts per trace to avoid msgspec 4GB encode limit
+
+
 def extract_activations(
     nns,
     prompts: list[str],
@@ -50,22 +53,24 @@ def extract_activations(
     layer_prefix: str,
     max_new_tokens: int,
 ) -> list:
-    # Use tracer.all() to capture activations at every generation step.
-    # tracer.all() applies the intervention recursively across all iterations
-    # without a Python-level for-loop, which is faster than tracer.iter[:].
-    # See: https://nnsight.net/features/4_multiple_token/
+    # Process prompts in chunks to avoid exceeding msgspec's 4GB encoding
+    # limit when accumulated activations get too large.
+    # Each chunk runs a separate nns.trace() with tracer.all() to capture
+    # activations at every generation step.
+    # See: https://nnsight.net/notebooks/features/vllm_support/
     target_layer = _resolve_layer(nns, layer_prefix, layer)
-    with nns.trace() as tracer:
-        activations = list().save()
-        for prompt in prompts:
-            with tracer.invoke(prompt, temperature=1.0, max_tokens=max_new_tokens):
-                prompt_acts = list().save()
-                with tracer.all():
-                    prompt_acts.append(target_layer.output[0].cpu())
-                activations.append(prompt_acts)
-    # Each prompt_acts is a list of [d_model] tensors — stack into [seq_len, d_model]
-
-    return [torch.stack(list(pa)) for pa in activations]
+    all_acts = []
+    for start in range(0, len(prompts), CHUNK_SIZE):
+        chunk = prompts[start : start + CHUNK_SIZE]
+        with nns.trace(temperature=1.0, max_tokens=max_new_tokens) as tracer:
+            activations = [list() for _ in range(len(chunk))].save()
+            for i, prompt in enumerate(chunk):
+                with tracer.invoke(prompt):
+                    with tracer.all():
+                        activations[i].append(target_layer.output[0].cpu())
+        # Each activations[i] is a list of [d_model] tensors — stack into [seq_len, d_model]
+        all_acts.extend(torch.stack(list(pa)) for pa in activations)
+    return all_acts
 
 
 @app.command()
