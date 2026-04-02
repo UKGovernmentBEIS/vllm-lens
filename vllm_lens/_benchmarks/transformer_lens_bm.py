@@ -31,6 +31,7 @@ def log_gpu() -> None:
 
 
 def load_model(model: str) -> HookedTransformer:
+    log(f"Loading model {model}...")
     return HookedTransformer.from_pretrained(model, dtype=torch.bfloat16)
 
 
@@ -46,69 +47,31 @@ def extract_activations(
     model.eval()
     all_acts: list[torch.Tensor] = []
 
-    log(
-        f"Starting extraction: {len(prompts)} prompts, batch_size={batch_size}, "
-        f"n_batches={n_batches}, max_new_tokens={max_new_tokens}"
-    )
-    log_gpu()
-
     for batch_idx, i in enumerate(range(0, len(prompts), batch_size)):
         batch_prompts = prompts[i : i + batch_size]
-        log(
-            f"\n--- Batch {batch_idx + 1}/{n_batches} ({len(batch_prompts)} prompts) ---"
-        )
-
-        log("  Tokenizing...")
+        log(f"Batch {batch_idx + 1}/{n_batches}")
         tokens = model.to_tokens(batch_prompts, prepend_bos=True)
-        log(f"  Token shape: {tokens.shape}")
-        log_gpu()
 
         with torch.no_grad():
             # Pass 1: generate full sequences
             log(f"  Generating (max_new_tokens={max_new_tokens})...")
-            t_gen = time.perf_counter()
-            try:
-                full_tokens = model.generate(
-                    tokens,
-                    max_new_tokens=max_new_tokens,
-                    temperature=1.0,
-                    verbose=False,
-                )
-            except torch.cuda.OutOfMemoryError:
-                log("  CUDA OOM during generate()!")
-                log_gpu()
-                raise
-            except Exception as e:
-                log(f"  ERROR during generate(): {type(e).__name__}: {e}")
-                raise
-            gen_time = time.perf_counter() - t_gen
-            log(
-                f"  Generate done in {gen_time:.1f}s, output shape: {full_tokens.shape}"
+            full_tokens = model.generate(
+                tokens,
+                max_new_tokens=max_new_tokens,
+                temperature=1.0,
+                verbose=False,
             )
+            log(f"  Generate done, output shape: {full_tokens.shape}")
             log_gpu()
 
             # Pass 2: extract activations over the complete sequences
-            log(f"  Running run_with_cache (hook={hook_name})...")
-            t_cache = time.perf_counter()
-            try:
-                _, cache = model.run_with_cache(full_tokens, names_filter=hook_name)
-            except torch.cuda.OutOfMemoryError:
-                log("  CUDA OOM during run_with_cache()!")
-                log_gpu()
-                raise
-            except Exception as e:
-                log(f"  ERROR during run_with_cache(): {type(e).__name__}: {e}")
-                raise
-            cache_time = time.perf_counter() - t_cache
+            log("  Running run_with_cache...")
+            _, cache = model.run_with_cache(full_tokens, names_filter=hook_name)
             act = cache[hook_name]
-            log(f"  Cache done in {cache_time:.1f}s, activation shape: {act.shape}")
-            log_gpu()
-
-            log("  Moving to CPU...")
+            log(f"  Cache done, activation shape: {act.shape}")
             all_acts.append(act.cpu())
             del cache, act, full_tokens
             torch.cuda.empty_cache()
-            log_gpu()
 
     return all_acts
 
@@ -130,9 +93,6 @@ def main(
     ds = load_dataset(cfg.dataset, split="train")
     prompts = [row["instruction"] for row in ds.select(range(cfg.samples))]
 
-    log(f"Model: {cfg.model}, samples: {cfg.samples}, layer: {cfg.layer}")
-    log(f"max_new_tokens: {cfg.max_new_tokens}")
-
     t0 = time.perf_counter()
     tl = load_model(cfg.model)
     startup_time = time.perf_counter() - t0
@@ -143,7 +103,6 @@ def main(
     for batch_size in (8,):
         try:
             torch.cuda.empty_cache()
-            log(f"\nTrying batch_size={batch_size}")
             all_acts = extract_activations(
                 tl, prompts, cfg.layer, batch_size, cfg.max_new_tokens
             )

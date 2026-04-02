@@ -33,6 +33,7 @@ class BenchmarkRun(BaseModel):
     lib_name: str = ""
     max_new_tokens: int = 1024
     enforce_eager: bool = False
+    batch_size: int | None = None
 
 
 class BenchmarkConfig(BaseModel):
@@ -52,6 +53,7 @@ class BenchmarkConfig(BaseModel):
     use_ray: bool = False
     max_new_tokens: int = 1024
     enforce_eager: bool = False
+    batch_size: int | None = None
 
 
 class Benchmark(BaseModel):

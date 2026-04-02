@@ -84,6 +84,7 @@ BENCHMARKS: list[BenchmarkRun] = [
         script="nnsight_vllm_bm.py",
         n_gpus=1,
         tensor_parallelism=1,
+        batch_size=512,
         container_name="vllm-0.15.1",
         container_env="HF_HUB_OFFLINE=1",
         packages=["python-dotenv", "datasets", "nnsight"],
@@ -93,6 +94,7 @@ BENCHMARKS: list[BenchmarkRun] = [
         script="nnsight_vllm_bm.py",
         n_gpus=4,
         tensor_parallelism=4,
+        batch_size=64,
         lib_name="nnsight-vllm-tp4",
         container_name="vllm-0.15.1",
         container_env="HF_HUB_OFFLINE=1",
@@ -225,6 +227,7 @@ def _build_config(
         use_ray=bench.use_ray,
         max_new_tokens=bench.max_new_tokens,
         enforce_eager=bench.enforce_eager,
+        batch_size=bench.batch_size,
     )
 
 

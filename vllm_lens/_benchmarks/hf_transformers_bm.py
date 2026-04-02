@@ -57,7 +57,9 @@ def extract_activations(
 
         with torch.no_grad():
             # Pass 1: generate full sequences
-            full_tokens = model.generate(**tokens, max_new_tokens=max_new_tokens)
+            full_tokens = model.generate(
+                **tokens, max_new_tokens=max_new_tokens, temperature=1.0, do_sample=True
+            )
 
             # Pass 2: extract activations over the complete sequences
             captured: list[torch.Tensor] = []

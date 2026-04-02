@@ -218,6 +218,7 @@ srun --nodelist "$HEAD_NODE" --nodes=1 --gpus=$GPUS_PER_NODE \
         touch $READY_FILE
 
         # ── Wait for all worker nodes to register ──
+        # Signal file used by outer script to trigger worker restarts.
         echo 'Waiting for $EXPECTED_NODES nodes ($EXPECTED_GPUS GPUs) to register...'
         DEADLINE=\$((SECONDS + 1200))
         while [ \$SECONDS -lt \$DEADLINE ]; do
@@ -227,6 +228,28 @@ srun --nodelist "$HEAD_NODE" --nodes=1 --gpus=$GPUS_PER_NODE \
                 break
             fi
             echo \"  GPUs registered: \$N_GPUS / $EXPECTED_GPUS\"
+            # If stuck (same count for 60s+), signal outer script to retry workers
+            if [ -f $JOB_TMP/worker_retry_needed ]; then
+                rm -f $JOB_TMP/worker_retry_needed
+            fi
+            if [ \"\$N_GPUS\" -gt 0 ] && [ \"\$N_GPUS\" -lt $EXPECTED_GPUS ]; then
+                STUCK_COUNT=\${STUCK_COUNT:-0}
+                LAST_GPUS=\${LAST_GPUS:-0}
+                if [ \"\$N_GPUS\" -eq \"\$LAST_GPUS\" ]; then
+                    STUCK_COUNT=\$((STUCK_COUNT + 1))
+                else
+                    STUCK_COUNT=0
+                fi
+                LAST_GPUS=\$N_GPUS
+                # After 6 checks (60s) with no progress, request worker retry
+                if [ \$STUCK_COUNT -ge 6 ]; then
+                    echo \"  Stuck at \$N_GPUS GPUs for 60s — requesting worker retry\"
+                    touch $JOB_TMP/worker_retry_request
+                    STUCK_COUNT=0
+                    # Wait for outer script to complete retry
+                    sleep 30
+                fi
+            fi
             sleep 10
         done
 
@@ -258,11 +281,10 @@ if [ ! -f "$READY_FILE" ]; then
     exit 1
 fi
 
-# ── Start Ray worker nodes (staggered to avoid GCS overload) ─────────
-# Packages are already installed on all nodes. Workers just start Ray.
-# Wait 10s before first worker to let head GCS fully stabilize.
-sleep 10
-for WORKER in $WORKER_NODES; do
+# ── Function to launch a Ray worker on a given node ──────────────────
+launch_worker() {
+    local WORKER=$1
+    local WORKER_IP
     WORKER_IP=$(dig +short "$WORKER")
     echo "Starting Ray worker $WORKER ($WORKER_IP)..."
     srun --nodelist "$WORKER" --nodes=1 --gpus=$GPUS_PER_NODE \
@@ -272,7 +294,50 @@ for WORKER in $WORKER_NODES; do
         export PATH=\$PYTHONUSERBASE/bin:\$PATH; \
         ray start --block \
         --address=$HEAD_IP:$RAY_PORT --node-ip-address=$WORKER_IP" &
+}
+
+# ── Start Ray worker nodes (staggered to avoid GCS overload) ─────────
+# Packages are already installed on all nodes. Workers just start Ray.
+# Wait 10s before first worker to let head GCS fully stabilize.
+sleep 10
+for WORKER in $WORKER_NODES; do
+    launch_worker "$WORKER"
     sleep 5  # stagger worker starts to avoid GCS registration storm
+done
+
+# ── Monitor for worker retry requests from head ─────────────────────
+# The head node detects when GPU count is stuck and signals us via a
+# file. We find which workers' srun processes have exited (failed
+# raylet) and restart them.
+MAX_RETRIES=5
+RETRY_COUNT=0
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    # Wait for either head to finish or a retry request
+    while true; do
+        if [ -f "$JOB_TMP/worker_retry_request" ]; then
+            break
+        fi
+        # Check if head is done (no retry needed)
+        if ! kill -0 $HEAD_PID 2>/dev/null; then
+            break 2  # head finished, exit retry loop
+        fi
+        sleep 5
+    done
+
+    rm -f "$JOB_TMP/worker_retry_request"
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    echo "Worker retry $RETRY_COUNT/$MAX_RETRIES — checking for failed workers..."
+
+    # Restart workers whose background srun has exited (failed raylet).
+    # `jobs -l` shows background pids; compare with running srun pids.
+    for WORKER in $WORKER_NODES; do
+        # Check if any srun for this worker is still running
+        if ! pgrep -f "srun.*--nodelist $WORKER.*ray start" > /dev/null 2>&1; then
+            echo "  Worker $WORKER srun exited — restarting..."
+            launch_worker "$WORKER"
+            sleep 2
+        fi
+    done
 done
 
 # ── Wait for head srun (user script) to finish ──────────────────────
