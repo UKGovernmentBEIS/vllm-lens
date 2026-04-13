@@ -123,6 +123,15 @@ BENCHMARKS: list[BenchmarkRun] = [
         container_env="HF_HUB_OFFLINE=1",
         packages=["python-dotenv", "datasets", "tqdm"],
     ),
+    BenchmarkRun(
+        name="nnsight-transformers",
+        script="nnsight_transformers_bm.py",
+        n_gpus=1,
+        exclusive=True,
+        container_name="vllm-0.18.0",
+        container_env="HF_HUB_OFFLINE=1",
+        packages=["python-dotenv", "datasets", "nnsight", "tqdm"],
+    ),
     # BenchmarkRun(
     #     name="nnsight-vllm-llama405b-tp16",
     #     script="nnsight_vllm_bm.py",
