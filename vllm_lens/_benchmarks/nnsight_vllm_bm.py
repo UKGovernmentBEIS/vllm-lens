@@ -43,6 +43,10 @@ def _resolve_layer(nns, layer_prefix: str, layer: int):
     return parent[layer]
 
 
+_TRACE_BATCH_SIZE = 100
+"""Max prompts per nnsight trace to stay under msgpack's 4 GB serialization limit."""
+
+
 def extract_activations(
     nns,
     prompts: list[str],
@@ -54,19 +58,24 @@ def extract_activations(
     # tracer.all() applies the intervention recursively across all iterations
     # without a Python-level for-loop, which is faster than tracer.iter[:].
     # See: https://nnsight.net/features/4_multiple_token/
+    #
+    # Process in batches to avoid exceeding the 4 GB msgpack serialization
+    # limit in vLLM's EngineCore output socket (msgspec.EncodeError).
     target_layer = _resolve_layer(nns, layer_prefix, layer)
-    # Single saved list at trace scope — per-invoke proxies stored in
-    # external Python containers don't survive trace execution.
-    with nns.trace() as tracer:
-        all_acts = list().save()
-        for prompt in prompts:
-            with tracer.invoke(prompt, temperature=1.0, max_tokens=max_new_tokens):
-                with tracer.all():
-                    all_acts.append(target_layer.output[0].cpu())
-    # all_acts is flat: one tensor per generation step across all prompts.
+    collected: list[torch.Tensor] = []
+    for batch_start in range(0, len(prompts), _TRACE_BATCH_SIZE):
+        batch = prompts[batch_start : batch_start + _TRACE_BATCH_SIZE]
+        with nns.trace() as tracer:
+            all_acts = list().save()
+            for prompt in batch:
+                with tracer.invoke(prompt, temperature=1.0, max_tokens=max_new_tokens):
+                    with tracer.all():
+                        all_acts.append(target_layer.output[0].cpu())
+        collected.extend(list(all_acts))
+    # collected is flat: one tensor per generation step across all prompts.
     # Stack into a single [total_steps, d_model] tensor, then wrap in a list
     # so the consumer (len / shape) still works.
-    return [torch.stack(list(all_acts))]
+    return [torch.stack(collected)]
 
 
 @app.command()
