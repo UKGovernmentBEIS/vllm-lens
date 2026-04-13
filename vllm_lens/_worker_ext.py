@@ -419,6 +419,7 @@ class HiddenStatesExtension:
         for req_id in list(self._captured_states):
             if req_id.startswith(prefix):
                 del self._captured_states[req_id]
+                logger.debug("Cleared leaked activations for %s", req_id)
 
     def get_captured_states(self, external_req_id: str) -> bytes | None:
         """Retrieve captured activations for a specific request.
@@ -461,3 +462,7 @@ class HiddenStatesExtension:
                     )
                 )
         return None
+
+    def _debug_captured_states_count(self) -> int:
+        """Return the number of entries in _captured_states (for testing)."""
+        return len(self._captured_states)
