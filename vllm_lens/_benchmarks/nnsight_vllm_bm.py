@@ -66,7 +66,7 @@ def extract_activations(
     for batch_start in range(0, len(prompts), _TRACE_BATCH_SIZE):
         batch = prompts[batch_start : batch_start + _TRACE_BATCH_SIZE]
         with nns.trace() as tracer:
-            all_acts = list().save()
+            all_acts = list().save()  # type: ignore[attr-defined]
             for prompt in batch:
                 with tracer.invoke(prompt, temperature=1.0, max_tokens=max_new_tokens):
                     with tracer.all():

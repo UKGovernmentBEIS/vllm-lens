@@ -100,6 +100,8 @@ def main(
     log_gpu()
 
     t1 = time.perf_counter()
+    all_acts: list[torch.Tensor] = []
+    batch_size = 8
     for batch_size in (8,):
         try:
             torch.cuda.empty_cache()

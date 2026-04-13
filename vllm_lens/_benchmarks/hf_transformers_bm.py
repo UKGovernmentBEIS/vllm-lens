@@ -19,10 +19,10 @@ def _resolve_layer(
     model: torch.nn.Module, layer_prefix: str, layer_idx: int
 ) -> torch.nn.Module:
     """Traverse dotted layer_prefix to reach the target decoder layer."""
-    module = model
+    module: torch.nn.Module = model
     for attr in layer_prefix.split("."):
         module = getattr(module, attr)
-    return module[layer_idx]
+    return module[layer_idx]  # type: ignore[index]
 
 
 def load_model(model_name: str) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
@@ -98,6 +98,8 @@ def main(
 
     t1 = time.perf_counter()
     # Search through batch sizes to make sure we have the max we can get away with without OOM
+    all_acts: list[torch.Tensor] = []
+    batch_size = 2
     for batch_size in (128, 64, 32, 16, 8, 4, 2):
         try:
             torch.cuda.empty_cache()

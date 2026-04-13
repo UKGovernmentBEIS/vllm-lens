@@ -35,7 +35,7 @@ def _resolve_container(container_name: str) -> str:
     last_dash = container_name.rfind("-")
     prefix = container_name[: last_dash + 1]
     version = container_name[last_dash + 1 :]
-    return sifter.find_latest_container(prefix=prefix, version=version)
+    return sifter.find_latest_container(prefix=prefix, version=version)  # type: ignore[attr-defined]
 
 
 # ─── Per-benchmark configuration ──────────────────────────────────────────────

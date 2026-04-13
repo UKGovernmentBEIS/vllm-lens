@@ -41,7 +41,7 @@ async def _get_activations(
     async for output in engine.generate(prompt, sampling_params, request_id=request_id):
         final = output
     assert final is not None
-    return final.activations["residual_stream"]
+    return final.activations["residual_stream"]  # type: ignore[attr-defined]
 
 
 async def test_concurrent_vs_sequential(vllm_model):

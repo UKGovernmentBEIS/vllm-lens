@@ -2,7 +2,7 @@
 
 import time
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from datasets import load_dataset
@@ -23,7 +23,7 @@ def load_model(
     distributed_executor_backend: str | None = None,
     trust_remote_code: bool = False,
 ) -> LLM:
-    kwargs = dict(
+    kwargs: dict[str, Any] = dict(
         model=model,
         dtype="auto",
         max_model_len=2048,
