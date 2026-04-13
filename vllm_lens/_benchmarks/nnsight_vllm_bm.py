@@ -57,7 +57,7 @@ def extract_activations(
     # See: https://nnsight.net/features/4_multiple_token/
     target_layer = _resolve_layer(nns, layer_prefix, layer)
     all_acts = []
-    for idx, prompt in enumerate(prompts):
+    for prompt in prompts:
         with nns.trace(prompt, temperature=1.0, max_tokens=max_new_tokens) as tracer:
             acts = list().save()
             for step in tracer.iter[:max_new_tokens]:
@@ -66,45 +66,6 @@ def extract_activations(
         steps = list(acts)
         act = torch.stack(steps)
         all_acts.append(act)
-        # Log every 50 prompts
-        if idx % 50 == 0 or idx == len(prompts) - 1:
-            total_bytes = sum(a.nelement() * a.element_size() for a in all_acts)
-            import os
-            import psutil
-
-            proc = psutil.Process(os.getpid())
-            rss_gb = proc.memory_info().rss / 1e9
-            node_mem = psutil.virtual_memory()
-            try:
-                import subprocess as _sp
-
-                gpu_out = (
-                    _sp.check_output(
-                        [
-                            "nvidia-smi",
-                            "--query-gpu=memory.used,memory.total",
-                            "--format=csv,noheader,nounits",
-                        ],
-                        text=True,
-                    )
-                    .strip()
-                    .split("\n")
-                )
-                gpu_info = "; ".join(
-                    f"GPU{i}={u.strip()}/{t.strip()}MiB"
-                    for i, (u, t) in enumerate(l.split(",") for l in gpu_out)
-                )
-            except Exception:
-                gpu_info = "N/A"
-            print(
-                f"  Prompt {idx}/{len(prompts)}: {len(steps)} steps, "
-                f"shape={act.shape}, "
-                f"total_accumulated={total_bytes / 1e6:.1f}MB, "
-                f"RSS={rss_gb:.1f}GB, "
-                f"node_RAM={node_mem.used / 1e9:.1f}/{node_mem.total / 1e9:.1f}GB, "
-                f"{gpu_info}",
-                flush=True,
-            )
     return all_acts
 
 

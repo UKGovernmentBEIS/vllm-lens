@@ -8,7 +8,7 @@ import pytest
 import torch
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 
-from .conftest import LAYER_IDX, MODEL_NAME, PROMPTS
+from .conftest import LAYER_IDX, PROMPTS
 
 TEST_PROMPTS = PROMPTS[:5]
 
