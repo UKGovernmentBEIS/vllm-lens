@@ -5,7 +5,7 @@ from typing import Annotated
 
 import sifter
 import typer
-from aisi_isambard_containers import pre_download_datasets, pre_download_models
+from isambard_container_tools._helpers.pre_download import pre_download_datasets, pre_download_models
 from dotenv import load_dotenv
 from utils.types import BenchmarkConfig, BenchmarkRun
 
