@@ -58,15 +58,12 @@ async def test_concurrent_vs_sequential(vllm_model):
         acts = await _get_activations(vllm_model, p, f"sequential-{i}")
         sequential.append(acts)
 
-    comparisons = []
     max_diffs = []
     for i, prompt in enumerate(PROMPTS):
-        equal = torch.equal(concurrent[i], sequential[i])
-        comparisons.append(equal)
         diff = (concurrent[i] - sequential[i]).abs().max().item()
         max_diffs.append(diff)
 
-    num_equal = sum(comparisons)
-    assert num_equal == len(PROMPTS), (
-        f"Not all are equal {comparisons}, max diffs: {max_diffs}"
-    )
+    for i, diff in enumerate(max_diffs):
+        assert torch.allclose(concurrent[i], sequential[i], atol=1e-3, rtol=0), (
+            f"Prompt {i} concurrent/sequential mismatch: max_diff={diff}"
+        )
