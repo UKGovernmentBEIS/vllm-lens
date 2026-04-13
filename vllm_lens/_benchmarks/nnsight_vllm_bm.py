@@ -43,33 +43,68 @@ def _resolve_layer(nns, layer_prefix: str, layer: int):
     return parent[layer]
 
 
-CHUNK_SIZE = 100  # prompts per trace to avoid msgspec 4GB encode limit
-
-
 def extract_activations(
     nns,
     prompts: list[str],
     layer: int,
     layer_prefix: str,
     max_new_tokens: int,
+    batch_size: int,
 ) -> list:
-    # Process prompts in chunks to avoid exceeding msgspec's 4GB encoding
-    # limit when accumulated activations get too large.
-    # Each chunk runs a separate nns.trace() with tracer.all() to capture
-    # activations at every generation step.
-    # See: https://nnsight.net/notebooks/features/vllm_support/
+    # Use tracer.iter[:max_new_tokens] (bounded) to capture activations at
+    # every generation step. Bounded iter avoids the UnboundLocalError that
+    # occurs with unbounded iter[:].
+    # See: https://nnsight.net/features/4_multiple_token/
     target_layer = _resolve_layer(nns, layer_prefix, layer)
     all_acts = []
-    for start in range(0, len(prompts), CHUNK_SIZE):
-        chunk = prompts[start : start + CHUNK_SIZE]
-        with nns.trace(temperature=1.0, max_tokens=max_new_tokens) as tracer:
-            activations = [list() for _ in range(len(chunk))].save()
-            for i, prompt in enumerate(chunk):
-                with tracer.invoke(prompt):
-                    with tracer.all():
-                        activations[i].append(target_layer.output[0].cpu())
-        # Each activations[i] is a list of [d_model] tensors — stack into [seq_len, d_model]
-        all_acts.extend(torch.stack(list(pa)) for pa in activations)
+    for idx, prompt in enumerate(prompts):
+        with nns.trace(prompt, temperature=1.0, max_tokens=max_new_tokens) as tracer:
+            acts = list().save()
+            for step in tracer.iter[:max_new_tokens]:
+                acts.append(target_layer.output[0].cpu())
+        # Stack per-step tensors into [seq_len, d_model].
+        steps = list(acts)
+        act = torch.stack(steps)
+        all_acts.append(act)
+        # Log every 50 prompts
+        if idx % 50 == 0 or idx == len(prompts) - 1:
+            total_bytes = sum(a.nelement() * a.element_size() for a in all_acts)
+            import os
+            import psutil
+
+            proc = psutil.Process(os.getpid())
+            rss_gb = proc.memory_info().rss / 1e9
+            node_mem = psutil.virtual_memory()
+            try:
+                import subprocess as _sp
+
+                gpu_out = (
+                    _sp.check_output(
+                        [
+                            "nvidia-smi",
+                            "--query-gpu=memory.used,memory.total",
+                            "--format=csv,noheader,nounits",
+                        ],
+                        text=True,
+                    )
+                    .strip()
+                    .split("\n")
+                )
+                gpu_info = "; ".join(
+                    f"GPU{i}={u.strip()}/{t.strip()}MiB"
+                    for i, (u, t) in enumerate(l.split(",") for l in gpu_out)
+                )
+            except Exception:
+                gpu_info = "N/A"
+            print(
+                f"  Prompt {idx}/{len(prompts)}: {len(steps)} steps, "
+                f"shape={act.shape}, "
+                f"total_accumulated={total_bytes / 1e6:.1f}MB, "
+                f"RSS={rss_gb:.1f}GB, "
+                f"node_RAM={node_mem.used / 1e9:.1f}/{node_mem.total / 1e9:.1f}GB, "
+                f"{gpu_info}",
+                flush=True,
+            )
     return all_acts
 
 
@@ -94,8 +129,9 @@ def main(
     startup_time = time.perf_counter() - t0
 
     t1 = time.perf_counter()
+    batch_size = cfg.batch_size or len(prompts)
     acts = extract_activations(
-        nns, prompts, cfg.layer, cfg.layer_prefix, cfg.max_new_tokens
+        nns, prompts, cfg.layer, cfg.layer_prefix, cfg.max_new_tokens, batch_size
     )
     run_time = time.perf_counter() - t1
 
@@ -112,6 +148,7 @@ def main(
         startup_time=startup_time,
         run_time=run_time,
         tensor_parallelism=cfg.tensor_parallelism,
+        batch_size=batch_size,
         n_activation_vectors=n_activation_vectors,
         average_len=average_len,
         d_model=d_model,
