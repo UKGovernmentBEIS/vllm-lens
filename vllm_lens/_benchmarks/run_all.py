@@ -5,8 +5,11 @@ from typing import Annotated
 
 import sifter
 import typer
-from isambard_container_tools._helpers.pre_download import pre_download_datasets, pre_download_models
 from dotenv import load_dotenv
+from isambard_container_tools._helpers.pre_download import (
+    pre_download_datasets,
+    pre_download_models,
+)
 from utils.types import BenchmarkConfig, BenchmarkRun
 
 _HERE_resolved = Path(__file__).parent
@@ -95,10 +98,25 @@ BENCHMARKS: list[BenchmarkRun] = [
         n_gpus=4,
         tensor_parallelism=4,
         batch_size=64,
+        use_ray=True,
         lib_name="nnsight-vllm-tp4",
         container_name="vllm-0.15.1",
         container_env="HF_HUB_OFFLINE=1",
-        packages=["python-dotenv", "datasets", "nnsight"],
+        packages=["python-dotenv", "datasets", "nnsight", "ray"],
+    ),
+    # TP4 NNsight OOMs with 1 node
+    BenchmarkRun(
+        name="nnsight-vllm-tp4-2-nodes",
+        script="nnsight_vllm_bm.py",
+        n_gpus=2,
+        tensor_parallelism=4,
+        n_nodes=2,
+        batch_size=64,
+        use_ray=True,
+        lib_name="nnsight-vllm-tp4",
+        container_name="vllm-0.15.1",
+        container_env="HF_HUB_OFFLINE=1",
+        packages=["python-dotenv", "datasets", "nnsight", "ray"],
     ),
     BenchmarkRun(
         name="transformer-lens",

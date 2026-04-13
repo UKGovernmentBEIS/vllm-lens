@@ -55,17 +55,18 @@ def extract_activations(
     # without a Python-level for-loop, which is faster than tracer.iter[:].
     # See: https://nnsight.net/features/4_multiple_token/
     target_layer = _resolve_layer(nns, layer_prefix, layer)
+    # Single saved list at trace scope — per-invoke proxies stored in
+    # external Python containers don't survive trace execution.
     with nns.trace() as tracer:
-        activations = list().save()
+        all_acts = list().save()
         for prompt in prompts:
             with tracer.invoke(prompt, temperature=1.0, max_tokens=max_new_tokens):
-                prompt_acts = list().save()
                 with tracer.all():
-                    prompt_acts.append(target_layer.output[0].cpu())
-                activations.append(prompt_acts)
-    # Each prompt_acts is a list of [d_model] tensors — stack into [seq_len, d_model]
-
-    return [torch.stack(list(pa)) for pa in activations]
+                    all_acts.append(target_layer.output[0].cpu())
+    # all_acts is flat: one tensor per generation step across all prompts.
+    # Stack into a single [total_steps, d_model] tensor, then wrap in a list
+    # so the consumer (len / shape) still works.
+    return [torch.stack(list(all_acts))]
 
 
 @app.command()
