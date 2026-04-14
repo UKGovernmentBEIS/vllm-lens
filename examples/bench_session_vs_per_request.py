@@ -157,7 +157,9 @@ def main():
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--n-prompts", type=int, default=50)
     parser.add_argument("--layer", type=int, default=15,
-                        help="Layer index to capture, or -1 for all 32 layers")
+                        help="Layer index to capture")
+    parser.add_argument("--all-layers", action="store_true",
+                        help="Capture all 32 layers (overrides --layer)")
     parser.add_argument("--max-tokens", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=3,
                         help="Number of warmup requests before benchmarking")
@@ -168,9 +170,8 @@ def main():
         # Cycle if we need more
         prompts = (prompts * (args.n_prompts // len(prompts) + 1))[:args.n_prompts]
 
-    layer = args.layer
-    all_layers = list(range(32)) if layer == -1 else [layer]
-    layer_desc = "all 32" if layer == -1 else str(layer)
+    all_layers = list(range(32)) if args.all_layers else [args.layer]
+    layer_desc = "all 32" if args.all_layers else str(args.layer)
     print(f"Config: {args.n_prompts} prompts, layer {layer_desc}, "
           f"max_tokens={args.max_tokens}")
     print(f"Server: {args.base_url}\n")

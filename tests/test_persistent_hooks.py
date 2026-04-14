@@ -306,7 +306,7 @@ def test_persistent_capture_matches_native(vllm_server):
     assert "error" not in resp, resp
 
     native_all = deserialize_tensor(resp["activations"]["residual_stream"])
-    native_layer = native_all[layer]
+    native_layer = native_all[0]  # single layer requested
 
     # Collect persistent results
     collect = requests.post(f"{vllm_server}/v1/hooks/collect").json()

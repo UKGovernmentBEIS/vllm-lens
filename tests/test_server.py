@@ -209,7 +209,7 @@ def test_hook_matches_native_activation_extraction(vllm_server):
     assert "error" not in resp, resp
 
     native_all = deserialize_tensor(resp["activations"]["residual_stream"])
-    native_layer = native_all[layer]  # (seq_len, hidden_dim)
+    native_layer = native_all[0]  # (seq_len, hidden_dim) — single layer requested
 
     hook_results = deserialize_hook_results(resp["hook_results"])
     parts = hook_results["0"]["parts"]
