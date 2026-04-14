@@ -307,7 +307,9 @@ def _hook_inner(
         hook_hidden = hook_hidden.clone()
 
         for i in range(num_reqs):
-            all_hooks = per_req_hooks[i] + per_req_persistent[i]
+            # Persistent hooks fire first (base layer); per-request hooks
+            # see the persistent-modified state.
+            all_hooks = per_req_persistent[i] + per_req_hooks[i]
             if not all_hooks:
                 continue
             req_id = req_ids[i]
@@ -315,20 +317,11 @@ def _hook_inner(
             end = int(query_start_loc[i + 1].item())
             seq_len = end - start
 
-            n_per_req = len(per_req_hooks[i])
             n_persistent = len(per_req_persistent[i])
+            n_per_req = len(per_req_hooks[i])
 
-            # Get-or-create contexts: per-request in _hook_contexts,
-            # persistent in _persistent_hook_contexts.
-            if n_per_req > 0:
-                if req_id not in extension._hook_contexts:
-                    extension._hook_contexts[req_id] = [
-                        HookContext() for _ in range(n_per_req)
-                    ]
-                pr_ctxs = extension._hook_contexts[req_id]
-            else:
-                pr_ctxs = []
-
+            # Get-or-create contexts: persistent first, then per-request
+            # (matching all_hooks order above).
             if n_persistent > 0:
                 if req_id not in extension._persistent_hook_contexts:
                     extension._persistent_hook_contexts[req_id] = [
@@ -338,7 +331,16 @@ def _hook_inner(
             else:
                 ps_ctxs = []
 
-            contexts = pr_ctxs + ps_ctxs
+            if n_per_req > 0:
+                if req_id not in extension._hook_contexts:
+                    extension._hook_contexts[req_id] = [
+                        HookContext() for _ in range(n_per_req)
+                    ]
+                pr_ctxs = extension._hook_contexts[req_id]
+            else:
+                pr_ctxs = []
+
+            contexts = ps_ctxs + pr_ctxs
 
             for hi, hook in enumerate(all_hooks):
                 if layer_idx not in hook.layer_indices:
@@ -687,11 +689,12 @@ class HiddenStatesExtension:
     # ------------------------------------------------------------------
 
     def set_persistent_hooks(self, pickled_data: bytes) -> None:
-        """Register hooks that apply to every subsequent request.
+        """Append hooks that apply to every subsequent request.
 
         Accepts cloudpickle'd ``list[Hook]``.  Validates layer indices.
-        Replaces any previously registered persistent hooks.
-        Also ensures forward hooks are installed on the model layers.
+        Appends to existing persistent hooks (call ``clear_persistent_hooks``
+        first for a clean slate).  Also ensures forward hooks are installed
+        on the model layers.
         """
         self.install_hooks()
         hooks: list[Hook] = cloudpickle.loads(pickled_data)
@@ -702,7 +705,7 @@ class HiddenStatesExtension:
                     raise ValueError(
                         f"layer_index {idx} out of range [0, {num_layers})"
                     )
-        self._persistent_hooks = hooks
+        self._persistent_hooks.extend(hooks)
 
     def get_all_hook_results(self) -> bytes | None:
         """Retrieve accumulated persistent hook contexts from all requests.
