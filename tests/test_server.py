@@ -254,3 +254,80 @@ def test_hook_matches_native_activation_extraction(vllm_server):
 
     mean_diff = (n - h).abs().mean().item()
     assert mean_diff < 1e-4, f"Mean abs diff {mean_diff} too large"
+
+
+# ---------------------------------------------------------------------------
+# Pre-hooks
+# ---------------------------------------------------------------------------
+
+
+def test_pre_hook_modification_changes_output(vllm_server):
+    """A pre-hook that corrupts layer 0 input should change the output."""
+    prompt = "The capital of France is"
+
+    baseline = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": prompt,
+            "max_tokens": 20,
+            "temperature": 0.0,
+        },
+    ).json()
+
+    def corrupt_input(ctx, h):
+        gen = torch.Generator(device=h.device).manual_seed(42)
+        noise = torch.randn(h.shape, generator=gen, device=h.device, dtype=h.dtype)
+        return h + noise * 100.0
+
+    hook = Hook(fn=corrupt_input, layer_indices=[0], pre=True)
+    corrupted = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": prompt,
+            "max_tokens": 20,
+            "temperature": 0.0,
+            "vllm_xargs": {
+                "apply_hooks": json.dumps([hook.model_dump()]),
+            },
+        },
+    ).json()
+
+    assert "error" not in corrupted, corrupted
+    assert corrupted["choices"][0]["text"] != baseline["choices"][0]["text"]
+
+
+def test_pre_hook_none_preserves_output(vllm_server):
+    """A pre-hook returning None should not change the output."""
+    prompt = "The capital of France is"
+
+    baseline = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": prompt,
+            "max_tokens": 20,
+            "temperature": 0.0,
+        },
+    ).json()
+
+    def noop(ctx, h):
+        return None
+
+    hook = Hook(fn=noop, layer_indices=[0], pre=True)
+    hooked = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": prompt,
+            "max_tokens": 20,
+            "temperature": 0.0,
+            "vllm_xargs": {
+                "apply_hooks": json.dumps([hook.model_dump()]),
+            },
+        },
+    ).json()
+
+    assert "error" not in hooked, hooked
+    assert hooked["choices"][0]["text"] == baseline["choices"][0]["text"]

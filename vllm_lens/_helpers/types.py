@@ -147,6 +147,12 @@ class Hook(BaseModel):
     layer_indices: list[int]
     """Which model layers this hook runs on."""
 
+    pre: bool = False
+    """If True, run as a pre-hook (before the layer forward pass) instead of
+    a post-hook (after).  Pre-hooks receive the layer's input hidden states
+    and can modify them before the layer processes them.  Useful for
+    corrupting embeddings or patching inputs to specific layers."""
+
     @field_validator("fn", mode="before")
     @classmethod
     def _deserialize_fn(cls, v: Any) -> Callable:

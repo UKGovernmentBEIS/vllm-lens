@@ -342,7 +342,7 @@ def _hook_inner(
             contexts = ps_ctxs + pr_ctxs
 
             for hi, hook in enumerate(all_hooks):
-                if layer_idx not in hook.layer_indices:
+                if hook.pre or layer_idx not in hook.layer_indices:
                     continue
                 ctx = contexts[hi]
                 ctx.layer_idx = layer_idx
@@ -420,6 +420,107 @@ def _hook_inner(
     return modified_output
 
 
+def _pre_hook_inner(
+    extension: HiddenStatesExtension,
+    layer_idx: int,
+    input_tensor: torch.Tensor,
+) -> torch.Tensor | None:
+    """Run pre-hooks (hook.pre=True) on the layer input.
+
+    Only runs generic hooks — steering and activation capture are
+    post-hook operations and are not affected.
+    """
+    if not is_forward_context_available():
+        return None
+
+    runner = extension.model_runner
+    num_reqs = runner.input_batch.num_reqs
+    if num_reqs == 0:
+        return None
+
+    req_ids = runner.input_batch.req_ids
+    ctx = get_forward_context()
+    attn_metadata = ctx.attn_metadata
+    if attn_metadata is None:
+        return None
+    if isinstance(attn_metadata, list):
+        attn_metadata = attn_metadata[0]
+        if attn_metadata is None:
+            return None
+    query_start_loc: torch.Tensor | None = None
+    for _meta in attn_metadata.values():
+        if hasattr(_meta, "query_start_loc"):
+            query_start_loc = getattr(_meta, "query_start_loc")
+            break
+    if query_start_loc is None:
+        return None
+
+    # Collect pre-hooks from per-request and persistent sources.
+    persistent_hooks = extension._persistent_hooks
+    modified = False
+    working = input_tensor
+
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        req_state = runner.requests.get(req_id)
+        extra = (
+            req_state.sampling_params.extra_args
+            if req_state and req_state.sampling_params
+            else None
+        )
+        all_hooks = [h for h in persistent_hooks if h.pre]
+        per_req = _find_hook_configs_no_persistent(extension, req_id, extra)
+        all_hooks.extend(h for h in per_req if h.pre)
+        if not all_hooks:
+            continue
+
+        start = int(query_start_loc[i].item())
+        end = int(query_start_loc[i + 1].item())
+        seq_len = end - start
+
+        # Get-or-create contexts (reuse same dicts as post-hooks).
+        n_persistent_pre = sum(1 for h in persistent_hooks if h.pre)
+        n_per_req_pre = sum(1 for h in per_req if h.pre)
+
+        if n_persistent_pre > 0:
+            key = f"pre_{req_id}"
+            if key not in extension._persistent_hook_contexts:
+                extension._persistent_hook_contexts[key] = [
+                    HookContext() for _ in range(n_persistent_pre)
+                ]
+            ps_ctxs = extension._persistent_hook_contexts[key]
+        else:
+            ps_ctxs = []
+
+        if n_per_req_pre > 0:
+            key = f"pre_{req_id}"
+            if key not in extension._hook_contexts:
+                extension._hook_contexts[key] = [
+                    HookContext() for _ in range(n_per_req_pre)
+                ]
+            pr_ctxs = extension._hook_contexts[key]
+        else:
+            pr_ctxs = []
+
+        contexts = ps_ctxs + pr_ctxs
+
+        for hi, hook in enumerate(all_hooks):
+            if layer_idx not in hook.layer_indices:
+                continue
+            hctx = contexts[hi]
+            hctx.layer_idx = layer_idx
+            hctx.seq_len = seq_len
+
+            result = hook.fn(hctx, working[start:end])
+            if result is not None:
+                if not modified:
+                    working = input_tensor.clone()
+                    modified = True
+                working[start:end] = result
+
+    return working if modified else None
+
+
 def _make_hook(extension: HiddenStatesExtension, layer_idx: int) -> Callable:
     """Create a forward hook closure for a specific layer index."""
 
@@ -438,6 +539,37 @@ def _make_hook(extension: HiddenStatesExtension, layer_idx: int) -> Callable:
         except Exception:
             logger.warning(
                 "vllm-lens hook error on layer %d, skipping", layer_idx, exc_info=True
+            )
+            return None
+
+    return hook
+
+
+def _make_pre_hook(extension: HiddenStatesExtension, layer_idx: int) -> Callable:
+    """Create a forward pre-hook closure for a specific layer index.
+
+    vLLM decoder layers have signature
+    ``forward(positions, hidden_states, residual)`` — the hidden states
+    are at ``args[1]``, not ``args[0]``.
+    """
+
+    def hook(
+        _module: torch.nn.Module,
+        args: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, ...] | None:
+        """Forward pre-hook: run user pre-hooks on the layer input."""
+        try:
+            # hidden_states is args[1] (args[0] is positions).
+            hidden = args[1]
+            result = _pre_hook_inner(extension, layer_idx, hidden)
+            if result is not None:
+                return args[:1] + (result,) + args[2:]
+            return None
+        except Exception:
+            logger.warning(
+                "vllm-lens pre-hook error on layer %d, skipping",
+                layer_idx,
+                exc_info=True,
             )
             return None
 
@@ -527,6 +659,7 @@ class HiddenStatesExtension:
         for layer_idx, layer in enumerate(layers):
             if isinstance(layer, PPMissingLayer):
                 continue
+            layer.register_forward_pre_hook(_make_pre_hook(self, layer_idx))
             layer.register_forward_hook(_make_hook(self, layer_idx))
 
     # ------------------------------------------------------------------
