@@ -6,6 +6,7 @@ provider (VLLMLensAPI via get_model + vLLM server).
 """
 
 import gc
+import os
 import signal
 import socket
 import subprocess
@@ -229,6 +230,13 @@ async def _run_inspect_path(
     try:
         _wait_for_server(base_url, timeout=120.0)
 
+        # Clear env vars that inspect_ai tries to load as hook modules; they
+        # may reference packages not installed in the test environment.
+        saved_env = {}
+        for key in ("INSPECT_API_KEY_OVERRIDE",):
+            if key in os.environ:
+                saved_env[key] = os.environ.pop(key)
+
         model = get_model(
             f"vllm-lens/{MODEL_NAME}",
             base_url=f"{base_url}/v1",
@@ -257,6 +265,7 @@ async def _run_inspect_path(
             results[prompt] = output.metadata["activations"]["residual_stream"]
 
         del model
+        os.environ.update(saved_env)
         return results
     finally:
         proc.send_signal(signal.SIGTERM)

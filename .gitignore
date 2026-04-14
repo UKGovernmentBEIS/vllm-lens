@@ -16,6 +16,10 @@ wheels/
 logs/
 scratch/
 
+# Benchmarks
+vllm_lens/_benchmarks/output/
+vllm_lens/_benchmarks/logs/
+
 # Core dump
 **/core
 
@@ -26,5 +30,5 @@ scratch/
 *.sif
 
 # Other
-benchmarks.json
 .claude/settings.json
+.claude/scheduled_tasks.lock
