@@ -9,7 +9,7 @@ import torch
 import typer
 from datasets import load_dataset
 from dotenv import load_dotenv
-from nnsight import LanguageModel
+from nnsight import LanguageModel  # pyright: ignore[reportAttributeAccessIssue]
 from tqdm import tqdm
 from utils.types import BenchmarkConfig, BenchmarkResult
 
