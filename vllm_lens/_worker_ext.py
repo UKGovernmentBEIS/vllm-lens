@@ -17,12 +17,13 @@ import pickle
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+import cloudpickle
 import torch
 import zstandard as zstd
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.models.utils import PPMissingLayer
 
-from vllm_lens._helpers.types import SteeringVector
+from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
 
 if TYPE_CHECKING:
     from jaxtyping import Float, Int
@@ -75,6 +76,27 @@ def _find_steering_configs(
         steering_id = extra_args.get("_steering_id")
         if steering_id and steering_id in extension._steering_data:
             results.extend(extension._steering_data[steering_id])
+    return results
+
+
+def _find_hook_configs(
+    extension: HiddenStatesExtension,
+    internal_req_id: str,
+    extra_args: dict[str, Any] | None,
+) -> list[Hook]:
+    """Find all hook definitions that apply to an internal request ID.
+
+    Same matching logic as ``_find_steering_configs``: prefix match for
+    the async path, ``_hook_id`` sentinel for the offline path.
+    """
+    results: list[Hook] = []
+    for external_id, hooks in extension._hook_data.items():
+        if internal_req_id.startswith(f"{external_id}-"):
+            results.extend(hooks)
+    if extra_args:
+        hook_id = extra_args.get("_hook_id")
+        if hook_id and hook_id in extension._hook_data:
+            results.extend(extension._hook_data[hook_id])
     return results
 
 
@@ -233,6 +255,79 @@ def _hook_inner(
                 per_req_steering[i], layer_idx, target, start, end, abs_start
             )
 
+    # --- Phase 2.5: run generic hooks --------------------------------
+    per_req_hooks: list[list[Hook]] = []
+    needs_hooks = False
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        req_state = runner.requests.get(req_id)
+        extra = (
+            req_state.sampling_params.extra_args
+            if req_state and req_state.sampling_params
+            else None
+        )
+        hooks = _find_hook_configs(extension, req_id, extra)
+        per_req_hooks.append(hooks)
+        if hooks:
+            needs_hooks = True
+
+    if needs_hooks:
+        # Compute hidden_states (summed if tuple) same as Phase 3 does.
+        hook_src = modified_output if modified_output is not None else output
+        if isinstance(hook_src, tuple):
+            hook_hidden = (
+                hook_src[0] + hook_src[1]
+                if hook_src[1] is not None
+                else hook_src[0]
+            )
+        else:
+            hook_hidden = hook_src
+        # Clone to avoid aliasing — hooks read/write this independently.
+        hook_hidden = hook_hidden.clone()
+
+        for i in range(num_reqs):
+            if not per_req_hooks[i]:
+                continue
+            req_id = req_ids[i]
+            start = int(query_start_loc[i].item())
+            end = int(query_start_loc[i + 1].item())
+            seq_len = end - start
+
+            # Get-or-create per-request contexts (one per hook).
+            if req_id not in extension._hook_contexts:
+                extension._hook_contexts[req_id] = [
+                    HookContext() for _ in per_req_hooks[i]
+                ]
+            contexts = extension._hook_contexts[req_id]
+
+            for hi, hook in enumerate(per_req_hooks[i]):
+                if layer_idx not in hook.layer_indices:
+                    continue
+                ctx = contexts[hi]
+                ctx.layer_idx = layer_idx
+                ctx.seq_len = seq_len
+
+                result = hook.fn(ctx, hook_hidden[start:end])
+
+                if result is not None:
+                    # Apply delta so Phase 3 captures the modified state.
+                    delta = result - hook_hidden[start:end]
+                    if modified_output is None:
+                        if isinstance(output, tuple):
+                            modified_output = (output[0].clone(), output[1])
+                        else:
+                            modified_output = output.clone()
+                    if isinstance(modified_output, tuple):
+                        modified_output[0][start:end] = (
+                            modified_output[0][start:end] + delta
+                        )
+                    else:
+                        modified_output[start:end] = (
+                            modified_output[start:end] + delta
+                        )
+                    # Update hook_hidden so subsequent hooks see the change.
+                    hook_hidden[start:end] = result
+
     # --- Phase 3: capture activations (rank 0 only) -----------------
     if getattr(extension, "_should_capture", True):
         capture_src = modified_output if modified_output is not None else output
@@ -333,6 +428,14 @@ class HiddenStatesExtension:
     # key (external_req_id or _steering_id) → list of SteeringVector
     _steering_data: dict[str, list[SteeringVector]] = {}
 
+    # Per-request hook definitions:
+    # key (external_req_id or _hook_id) → list of Hook
+    _hook_data: dict[str, list[Hook]] = {}
+
+    # Per-request hook contexts (one HookContext per hook per internal request):
+    # internal_req_id → list[HookContext]
+    _hook_contexts: dict[str, list[HookContext]] = {}
+
     # Whether this rank should capture activations (only TP rank 0).
     _should_capture: bool = True
 
@@ -353,6 +456,8 @@ class HiddenStatesExtension:
         # Reset to instance-level dicts (class-level defaults are shared)
         self._captured_states = {}
         self._steering_data = {}
+        self._hook_data = {}
+        self._hook_contexts = {}
 
         # Only rank 0 captures — residual streams are replicated across
         # TP ranks after all-reduce, so the data is identical.
@@ -469,3 +574,58 @@ class HiddenStatesExtension:
     def _debug_captured_states_count(self) -> int:
         """Return the number of entries in _captured_states (for testing)."""
         return len(self._captured_states)
+
+    # ------------------------------------------------------------------
+    # Hook data management (called via collective_rpc)
+    # ------------------------------------------------------------------
+
+    def set_hook_data(self, key: str, pickled_data: bytes) -> None:
+        """Receive and store hook definitions for a request.
+
+        Called via ``collective_rpc`` before generation begins.  Unpickles
+        the list of ``Hook`` instances (using cloudpickle for the callable
+        ``fn``), validates layer indices against the model, and stores them
+        keyed by *key* (an external request ID or ``_hook_id`` sentinel).
+        """
+        hooks: list[Hook] = cloudpickle.loads(pickled_data)
+        num_layers = len(_get_layers(self.model_runner.model))
+        for hook in hooks:
+            for idx in hook.layer_indices:
+                if idx < 0 or idx >= num_layers:
+                    raise ValueError(
+                        f"layer_index {idx} out of range [0, {num_layers})"
+                    )
+        self._hook_data[key] = hooks
+
+    def get_hook_results(self, external_req_id: str) -> bytes | None:
+        """Retrieve hook results (``ctx.saved`` dicts) for a request.
+
+        Only rank 0 returns data (gated by ``_should_capture``).
+        Matches by ``"{external_req_id}-"`` prefix on ``_hook_contexts``.
+        Returns ``{str(hook_index): ctx.saved}`` pickled.
+        """
+        if not getattr(self, "_should_capture", True):
+            return None
+        prefix = f"{external_req_id}-"
+        for req_id in list(self._hook_contexts):
+            if req_id.startswith(prefix):
+                contexts = self._hook_contexts.pop(req_id)
+                saved_dicts = {
+                    str(i): ctx.saved for i, ctx in enumerate(contexts)
+                }
+                return pickle.dumps(saved_dicts)
+        return None
+
+    def clear_hook_data(self, key: str) -> None:
+        """Remove hook definitions for a completed request."""
+        self._hook_data.pop(key, None)
+
+    def clear_hook_contexts(self, external_req_id: str) -> None:
+        """Remove hook contexts for a completed or aborted request.
+
+        Prefix-match cleanup, same pattern as ``clear_captured_states``.
+        """
+        prefix = f"{external_req_id}-"
+        for req_id in list(self._hook_contexts):
+            if req_id.startswith(prefix):
+                del self._hook_contexts[req_id]

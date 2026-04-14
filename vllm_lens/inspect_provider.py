@@ -17,8 +17,11 @@ from inspect_ai.tool._tool_choice import ToolChoice
 from inspect_ai.tool._tool_info import ToolInfo
 from typing_extensions import override
 
-from vllm_lens._helpers._serialize import deserialize_tensor
-from vllm_lens._helpers.types import SteeringVector
+from vllm_lens._helpers._serialize import (
+    deserialize_hook_results,
+    deserialize_tensor,
+)
+from vllm_lens._helpers.types import Hook, SteeringVector
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,9 @@ _pending_activations: ContextVar[dict[str, Any] | None] = ContextVar(
 )
 _pending_token_ids: ContextVar[dict[str, list[int]] | None] = ContextVar(
     "_pending_token_ids", default=None
+)
+_pending_hook_results: ContextVar[dict[str, Any] | None] = ContextVar(
+    "_pending_hook_results", default=None
 )
 
 DEFAULT_ATTEMPT_TIMEOUT = 3600  # 1 hour
@@ -86,6 +92,7 @@ class VLLMLensAPI(VLLMAPI):
         / ``"token_ids"`` (returned by vLLM when ``return_token_ids`` is set).
         """
         _pending_activations.set(response.get("activations"))
+        _pending_hook_results.set(response.get("hook_results"))
 
         token_id_data: dict[str, list[int]] = {}
         prompt_token_ids = response.get("prompt_token_ids")
@@ -118,6 +125,7 @@ class VLLMLensAPI(VLLMAPI):
 
         token_act = _pending_activations.set(None)
         token_tid = _pending_token_ids.set(None)
+        token_hr = _pending_hook_results.set(None)
         try:
             result = await super().generate(input, tools, tool_choice, config)
 
@@ -128,6 +136,10 @@ class VLLMLensAPI(VLLMAPI):
                 metadata["activations"] = {
                     name: deserialize_tensor(encoded) for name, encoded in raw.items()
                 }
+
+            raw_hr = _pending_hook_results.get()
+            if raw_hr is not None:
+                metadata["hook_results"] = deserialize_hook_results(raw_hr)
 
             tid = _pending_token_ids.get()
             if tid is not None:
@@ -147,6 +159,7 @@ class VLLMLensAPI(VLLMAPI):
         finally:
             _pending_activations.reset(token_act)
             _pending_token_ids.reset(token_tid)
+            _pending_hook_results.reset(token_hr)
 
     @staticmethod
     def _transform_config(config: GenerateConfig) -> GenerateConfig:
@@ -167,7 +180,7 @@ class VLLMLensAPI(VLLMAPI):
 
         config = config.model_copy(deep=True)
 
-        # extra_args → vllm_xargs with serialized steering vectors
+        # extra_args → vllm_xargs with serialized steering vectors and hooks
         if extra_args is not None:
             del config.extra_body["extra_args"]  # type: ignore[reportOptionalSubscript]
             vectors: list[SteeringVector] | None = extra_args.get(
@@ -179,6 +192,14 @@ class VLLMLensAPI(VLLMAPI):
                 extra_args = dict(extra_args)
                 extra_args["apply_steering_vectors"] = json.dumps(
                     [sv.model_dump() for sv in vectors]
+                )
+            hooks: list[Hook] | None = extra_args.get("apply_hooks")
+            if hooks is not None:
+                # model_dump() invokes @field_serializer to cloudpickle fn.
+                if extra_args is vectors:  # not yet copied
+                    extra_args = dict(extra_args)
+                extra_args["apply_hooks"] = json.dumps(
+                    [h.model_dump() for h in hooks]
                 )
             config.extra_body["vllm_xargs"] = extra_args  # type: ignore[reportOptionalSubscript]
 
@@ -214,6 +235,7 @@ class VLLMLensAPI(VLLMAPI):
         resp = call.response
         if isinstance(resp, dict):
             resp.pop("activations", None)
+            resp.pop("hook_results", None)
             resp.pop("prompt_token_ids", None)
             for choice in resp.get("choices") or []:  # type: ignore
                 if isinstance(choice, dict):

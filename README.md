@@ -77,6 +77,30 @@ vllm-lens registers as a [vLLM plugin](https://docs.vllm.ai/en/stable/design/plu
 2. **Per-sample hook operations**. vLLM dynamically batches tokens from multiple concurrent requests into a single forward pass, so a core challenge is "book-keeping" - working out which operations (e.g., activation extraction) should be applied to which parts of the request. To do this we read the `forward_context` metadata, utilising the `query_start_loc` (a tensor of token boundaries per request) and `req_ids` (mapping batch index to request ID). We then, for example, apply hooks to just the slices that correspond to the request. Any extracted activations are moved to CPU ram and compressed (lossless), ready to be requested by the vLLM scheduler process. Steering runs on all tensor-parallel ranks (since it modifies the forward pass), but capture only runs on TP rank 0 (residual streams are identical across TP replicas after all-reduce).
 3. **Response collation.** The plugin intercepts the response before it is sent to the client, at which point it queries the relevant vLLM processes for any requested activations. If trims surplus activations, as vLLM does under the hook with tokens (the scheduler often gets ahead of the number of tokens it needs to generate, before stopping). Activations are then returned to the client.
 
+## Running tests
+
+Integration tests in `tests/` run against a live vLLM server. You can either let the fixture start one automatically, or point at an existing server:
+
+```bash
+# Option 1: Let pytest start a server (requires GPU, takes a few minutes to boot)
+pytest tests/ -v
+
+# Option 2: Start a server yourself, then run tests against it
+vllm serve meta-llama/Llama-3.1-8B-Instruct --port 8000
+VLLM_TEST_PORT=8000 pytest tests/ -v
+```
+
+Environment variables:
+- `VLLM_TEST_PORT` — server port (default: `8100`)
+- `VLLM_TEST_MODEL` — model to serve (default: `meta-llama/Llama-3.1-8B-Instruct`)
+- `VLLM_TEST_STARTUP_TIMEOUT` — seconds to wait for server startup (default: `300`)
+
+Unit tests in `vllm_lens/tests/` use a small model and don't require a running server:
+
+```bash
+pytest vllm_lens/tests/ -v
+```
+
 ## Credits
 
 Developed by Alan Cooney, with credit going to Sid Black for the original vLLM worker extension idea.

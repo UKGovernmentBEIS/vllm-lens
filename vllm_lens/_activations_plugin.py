@@ -17,11 +17,15 @@ import pickle
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
+import cloudpickle
 import torch
 import zstandard as zstd
 
-from vllm_lens._helpers._serialize import serialize_activations
-from vllm_lens._helpers.types import SteeringVector
+from vllm_lens._helpers._serialize import (
+    serialize_activations,
+    serialize_hook_results,
+)
+from vllm_lens._helpers.types import Hook, SteeringVector
 
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 _ZSTD_DECOMPRESSOR = zstd.ZstdDecompressor()
@@ -166,10 +170,19 @@ async def _patched_generate(
             SteeringVector.model_validate(d) for d in json.loads(steering_vectors)
         ]
 
+    # Extract hooks (callables can't survive msgspec).
+    hooks_list = extra.pop("apply_hooks", None)
+    if isinstance(hooks_list, str):
+        hooks_list = [Hook.model_validate(d) for d in json.loads(hooks_list)]
+
     # Allow explicit prefix-cache bypass via extra_args.
     skip_kv_cache = extra.pop("skip_reading_prefix_cache", None)
 
-    needs_hooks = wants_activations or steering_vectors is not None
+    needs_hooks = (
+        wants_activations
+        or steering_vectors is not None
+        or hooks_list is not None
+    )
     if needs_hooks or skip_kv_cache:
         # Hooks rely on forward passes firing; prefix-cached tokens skip
         # computation entirely, so force a fresh prefill for this request.
@@ -185,27 +198,46 @@ async def _patched_generate(
             args=(request_id, pickle.dumps(steering_vectors)),
         )
 
+    # Send hook data to workers before the forward pass begins.
+    if hooks_list is not None:
+        await self.collective_rpc(
+            "set_hook_data",
+            args=(request_id, cloudpickle.dumps(hooks_list)),
+        )
+
     assert _original_generate is not None
     try:
         async for output in _original_generate(
             self, prompt, sampling_params, request_id, **kwargs
         ):
-            if output.finished and wants_activations:
-                states = await self.collective_rpc(
-                    "get_captured_states", args=(request_id,)
-                )
-                activations = _merge_captured_states(states)
-                if activations is not None:
-                    n_prompt = len(output.prompt_token_ids)
-                    n_gen = len(output.outputs[0].token_ids)
-                    _trim_activations(activations, n_prompt + n_gen - 1)
-                    output.activations = activations
+            if output.finished:
+                if wants_activations:
+                    states = await self.collective_rpc(
+                        "get_captured_states", args=(request_id,)
+                    )
+                    activations = _merge_captured_states(states)
+                    if activations is not None:
+                        n_prompt = len(output.prompt_token_ids)
+                        n_gen = len(output.outputs[0].token_ids)
+                        _trim_activations(activations, n_prompt + n_gen - 1)
+                        output.activations = activations
+                if hooks_list is not None:
+                    raw_results = await self.collective_rpc(
+                        "get_hook_results", args=(request_id,)
+                    )
+                    for raw in raw_results or ():
+                        if raw is not None:
+                            output.hook_results = pickle.loads(raw)
+                            break
             yield output
     finally:
         if steering_vectors is not None:
             await self.collective_rpc("clear_steering_data", args=(request_id,))
         if wants_activations:
             await self.collective_rpc("clear_captured_states", args=(request_id,))
+        if hooks_list is not None:
+            await self.collective_rpc("clear_hook_data", args=(request_id,))
+            await self.collective_rpc("clear_hook_contexts", args=(request_id,))
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +284,18 @@ def _patched_llm_generate(
                 sp.extra_args = {}
             sp.extra_args["_steering_id"] = steering_id
 
+    # Extract hooks per-request (same pattern as steering).
+    hook_payloads: dict[str, bytes] = {}  # hook_id -> cloudpickled hooks
+    for idx, sp in enumerate(params_list):
+        extra = sp.extra_args or {}
+        hooks = extra.pop("apply_hooks", None)
+        if hooks is not None:
+            hook_id = f"_hook_{idx}"
+            hook_payloads[hook_id] = cloudpickle.dumps(hooks)
+            if sp.extra_args is None:
+                sp.extra_args = {}
+            sp.extra_args["_hook_id"] = hook_id
+
     # Pop skip_reading_prefix_cache from extra_args for each request.
     any_skip_kv_cache = False
     for sp in params_list:
@@ -259,7 +303,8 @@ def _patched_llm_generate(
             any_skip_kv_cache = True
 
     has_steering = len(steering_payloads) > 0
-    needs_hooks = wants_activations or has_steering
+    has_hooks = len(hook_payloads) > 0
+    needs_hooks = wants_activations or has_steering or has_hooks
     if needs_hooks or any_skip_kv_cache:
         for sp in params_list:
             sp.skip_reading_prefix_cache = True
@@ -271,6 +316,10 @@ def _patched_llm_generate(
     # Send steering data to workers before generation.
     for sid, payload in steering_payloads.items():
         self.collective_rpc("set_steering_data", args=(sid, payload))
+
+    # Send hook data to workers before generation.
+    for hid, payload in hook_payloads.items():
+        self.collective_rpc("set_hook_data", args=(hid, payload))
 
     assert _original_llm_generate is not None
     outputs = _original_llm_generate(self, prompts, sampling_params, **kwargs)
@@ -286,9 +335,24 @@ def _patched_llm_generate(
                 _trim_activations(activations, n_prompt + n_gen - 1)
                 output.activations = activations
 
+    if has_hooks:
+        for output in outputs:
+            req_id = output.request_id
+            raw_results = self.collective_rpc(
+                "get_hook_results", args=(req_id,)
+            )
+            for raw in raw_results or ():
+                if raw is not None:
+                    output.hook_results = pickle.loads(raw)
+                    break
+
     # Clean up steering data.
     for sid in steering_payloads:
         self.collective_rpc("clear_steering_data", args=(sid,))
+
+    # Clean up hook data.
+    for hid in hook_payloads:
+        self.collective_rpc("clear_hook_data", args=(hid,))
 
     return outputs
 
@@ -299,13 +363,17 @@ def _patched_llm_generate(
 
 
 def _patched_completion_response(self, final_res_batch, *args, **kwargs):
-    """Wrap the completion response builder to inject serialized activations."""
+    """Wrap the completion response builder to inject serialized activations and hook results."""
     assert _original_completion_response is not None
     response = _original_completion_response(self, final_res_batch, *args, **kwargs)
     for res in final_res_batch or ():
         activations = getattr(res, "activations", None)
         if activations is not None:
             response.activations = serialize_activations(activations)
+        hook_results = getattr(res, "hook_results", None)
+        if hook_results is not None:
+            response.hook_results = serialize_hook_results(hook_results)
+        if activations is not None or hook_results is not None:
             break
     return response
 
@@ -339,6 +407,9 @@ async def _patched_chat_full_generator(
         activations = getattr(last_output, "activations", None)
         if activations is not None:
             response.activations = serialize_activations(activations)
+        hook_results = getattr(last_output, "hook_results", None)
+        if hook_results is not None:
+            response.hook_results = serialize_hook_results(hook_results)
 
     return response
 
