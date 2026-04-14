@@ -238,7 +238,10 @@ def _hook_inner(
         capture_src = modified_output if modified_output is not None else output
         hidden_states: Float[torch.Tensor, "total_tokens hidden_dim"]  # type: ignore[reportUndefinedVariable]
         if isinstance(capture_src, tuple):
-            hidden_states = capture_src[0] + capture_src[1]
+            if capture_src[1] is not None:
+                hidden_states = capture_src[0] + capture_src[1]
+            else:
+                hidden_states = capture_src[0]
         else:
             hidden_states = capture_src
 
