@@ -19,13 +19,16 @@ from .conftest import MODEL
 
 
 def test_activation_extraction(vllm_server):
-    resp = requests.post(f"{vllm_server}/v1/completions", json={
-        "model": MODEL,
-        "prompt": "The future of AI is",
-        "max_tokens": 10,
-        "temperature": 0.0,
-        "vllm_xargs": {"output_residual_stream": "[15]"},
-    }).json()
+    resp = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": "The future of AI is",
+            "max_tokens": 10,
+            "temperature": 0.0,
+            "vllm_xargs": {"output_residual_stream": "[15]"},
+        },
+    ).json()
 
     assert "error" not in resp, resp
     rs = deserialize_tensor(resp["activations"]["residual_stream"])
@@ -41,12 +44,15 @@ def test_activation_extraction(vllm_server):
 def test_steering_changes_output(vllm_server):
     prompt = "I think the best dessert is"
 
-    baseline = requests.post(f"{vllm_server}/v1/completions", json={
-        "model": MODEL,
-        "prompt": prompt,
-        "max_tokens": 20,
-        "temperature": 0.0,
-    }).json()
+    baseline = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": prompt,
+            "max_tokens": 20,
+            "temperature": 0.0,
+        },
+    ).json()
 
     sv = SteeringVector(
         activations=torch.randn(1, 4096),
@@ -54,15 +60,18 @@ def test_steering_changes_output(vllm_server):
         scale=15.0,
         norm_match=True,
     )
-    steered = requests.post(f"{vllm_server}/v1/completions", json={
-        "model": MODEL,
-        "prompt": prompt,
-        "max_tokens": 20,
-        "temperature": 0.0,
-        "vllm_xargs": {
-            "apply_steering_vectors": json.dumps([sv.model_dump()]),
+    steered = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": prompt,
+            "max_tokens": 20,
+            "temperature": 0.0,
+            "vllm_xargs": {
+                "apply_steering_vectors": json.dumps([sv.model_dump()]),
+            },
         },
-    }).json()
+    ).json()
 
     assert steered["choices"][0]["text"] != baseline["choices"][0]["text"]
 
@@ -70,27 +79,33 @@ def test_steering_changes_output(vllm_server):
 def test_steering_scale_zero_matches_baseline(vllm_server):
     prompt = "The capital of France is"
 
-    baseline = requests.post(f"{vllm_server}/v1/completions", json={
-        "model": MODEL,
-        "prompt": prompt,
-        "max_tokens": 20,
-        "temperature": 0.0,
-    }).json()
+    baseline = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": prompt,
+            "max_tokens": 20,
+            "temperature": 0.0,
+        },
+    ).json()
 
     sv = SteeringVector(
         activations=torch.randn(1, 4096),
         layer_indices=[15],
         scale=0.0,
     )
-    steered = requests.post(f"{vllm_server}/v1/completions", json={
-        "model": MODEL,
-        "prompt": prompt,
-        "max_tokens": 20,
-        "temperature": 0.0,
-        "vllm_xargs": {
-            "apply_steering_vectors": json.dumps([sv.model_dump()]),
+    steered = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": prompt,
+            "max_tokens": 20,
+            "temperature": 0.0,
+            "vllm_xargs": {
+                "apply_steering_vectors": json.dumps([sv.model_dump()]),
+            },
         },
-    }).json()
+    ).json()
 
     assert steered["choices"][0]["text"] == baseline["choices"][0]["text"]
 
@@ -106,15 +121,18 @@ def test_hook_capture(vllm_server):
         return None
 
     hook = Hook(fn=capture_norm, layer_indices=[15, 16])
-    resp = requests.post(f"{vllm_server}/v1/completions", json={
-        "model": MODEL,
-        "prompt": "Hello world",
-        "max_tokens": 5,
-        "temperature": 0.0,
-        "vllm_xargs": {
-            "apply_hooks": json.dumps([hook.model_dump()]),
+    resp = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": "Hello world",
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "vllm_xargs": {
+                "apply_hooks": json.dumps([hook.model_dump()]),
+            },
         },
-    }).json()
+    ).json()
 
     assert "error" not in resp, resp
     assert "hook_results" in resp
@@ -128,26 +146,32 @@ def test_hook_capture(vllm_server):
 def test_hook_modification_changes_output(vllm_server):
     prompt = "The meaning of life is"
 
-    baseline = requests.post(f"{vllm_server}/v1/completions", json={
-        "model": MODEL,
-        "prompt": prompt,
-        "max_tokens": 20,
-        "temperature": 0.0,
-    }).json()
+    baseline = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": prompt,
+            "max_tokens": 20,
+            "temperature": 0.0,
+        },
+    ).json()
 
     def zero_residual(ctx, h):
         return torch.zeros_like(h)
 
     hook = Hook(fn=zero_residual, layer_indices=[15])
-    modified = requests.post(f"{vllm_server}/v1/completions", json={
-        "model": MODEL,
-        "prompt": prompt,
-        "max_tokens": 20,
-        "temperature": 0.0,
-        "vllm_xargs": {
-            "apply_hooks": json.dumps([hook.model_dump()]),
+    modified = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": prompt,
+            "max_tokens": 20,
+            "temperature": 0.0,
+            "vllm_xargs": {
+                "apply_hooks": json.dumps([hook.model_dump()]),
+            },
         },
-    }).json()
+    ).json()
 
     assert "error" not in modified, modified
     assert modified["choices"][0]["text"] != baseline["choices"][0]["text"]
@@ -156,26 +180,32 @@ def test_hook_modification_changes_output(vllm_server):
 def test_hook_none_preserves_output(vllm_server):
     prompt = "The capital of France is"
 
-    baseline = requests.post(f"{vllm_server}/v1/completions", json={
-        "model": MODEL,
-        "prompt": prompt,
-        "max_tokens": 20,
-        "temperature": 0.0,
-    }).json()
+    baseline = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": prompt,
+            "max_tokens": 20,
+            "temperature": 0.0,
+        },
+    ).json()
 
     def noop_hook(ctx, h):
         return None
 
     hook = Hook(fn=noop_hook, layer_indices=[15])
-    hooked = requests.post(f"{vllm_server}/v1/completions", json={
-        "model": MODEL,
-        "prompt": prompt,
-        "max_tokens": 20,
-        "temperature": 0.0,
-        "vllm_xargs": {
-            "apply_hooks": json.dumps([hook.model_dump()]),
+    hooked = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": prompt,
+            "max_tokens": 20,
+            "temperature": 0.0,
+            "vllm_xargs": {
+                "apply_hooks": json.dumps([hook.model_dump()]),
+            },
         },
-    }).json()
+    ).json()
 
     assert "error" not in hooked, hooked
     assert hooked["choices"][0]["text"] == baseline["choices"][0]["text"]
@@ -195,16 +225,19 @@ def test_hook_matches_native_activation_extraction(vllm_server):
     hook = Hook(fn=capture_accumulate, layer_indices=[layer])
 
     # Request both native capture and hook capture in the same call.
-    resp = requests.post(f"{vllm_server}/v1/completions", json={
-        "model": MODEL,
-        "prompt": "The future of AI is",
-        "max_tokens": 10,
-        "temperature": 0.0,
-        "vllm_xargs": {
-            "output_residual_stream": f"[{layer}]",
-            "apply_hooks": json.dumps([hook.model_dump()]),
+    resp = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": "The future of AI is",
+            "max_tokens": 10,
+            "temperature": 0.0,
+            "vllm_xargs": {
+                "output_residual_stream": f"[{layer}]",
+                "apply_hooks": json.dumps([hook.model_dump()]),
+            },
         },
-    }).json()
+    ).json()
 
     assert "error" not in resp, resp
 

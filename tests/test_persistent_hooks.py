@@ -23,16 +23,20 @@ def _clean_persistent_hooks(vllm_server):
 
 
 def _completions(base_url: str, prompt: str, max_tokens: int = 5) -> dict:
-    return requests.post(f"{base_url}/v1/completions", json={
-        "model": MODEL,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
-    }).json()
+    return requests.post(
+        f"{base_url}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+        },
+    ).json()
 
 
 def test_register_collect_clear(vllm_server):
     """Full lifecycle: register hooks, run requests, collect, clear."""
+
     def capture_mean(ctx, h):
         ctx.saved[f"mean_L{ctx.layer_idx}"] = h.mean(dim=-1).cpu()
         return None
@@ -40,9 +44,12 @@ def test_register_collect_clear(vllm_server):
     hook = Hook(fn=capture_mean, layer_indices=[15])
 
     # Register
-    resp = requests.post(f"{vllm_server}/v1/hooks/register", json={
-        "hooks": [hook.model_dump()],
-    }).json()
+    resp = requests.post(
+        f"{vllm_server}/v1/hooks/register",
+        json={
+            "hooks": [hook.model_dump()],
+        },
+    ).json()
     assert resp["status"] == "ok"
     assert resp["count"] == 1
 
@@ -77,6 +84,7 @@ def test_register_collect_clear(vllm_server):
 
 def test_persistent_hooks_coexist_with_per_request(vllm_server):
     """Persistent hooks and per-request hooks can be active simultaneously."""
+
     def persistent_hook(ctx, h):
         ctx.saved["persistent"] = True
         return None
@@ -89,20 +97,26 @@ def test_persistent_hooks_coexist_with_per_request(vllm_server):
     per_request = Hook(fn=per_request_hook, layer_indices=[15])
 
     # Register persistent hook
-    requests.post(f"{vllm_server}/v1/hooks/register", json={
-        "hooks": [persistent.model_dump()],
-    })
+    requests.post(
+        f"{vllm_server}/v1/hooks/register",
+        json={
+            "hooks": [persistent.model_dump()],
+        },
+    )
 
     # Run with per-request hook too
-    resp = requests.post(f"{vllm_server}/v1/completions", json={
-        "model": MODEL,
-        "prompt": "Test both",
-        "max_tokens": 5,
-        "temperature": 0.0,
-        "vllm_xargs": {
-            "apply_hooks": json.dumps([per_request.model_dump()]),
+    resp = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": "Test both",
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "vllm_xargs": {
+                "apply_hooks": json.dumps([per_request.model_dump()]),
+            },
         },
-    }).json()
+    ).json()
 
     assert "error" not in resp, resp
     # Per-request hook results come back immediately
@@ -117,9 +131,7 @@ def test_persistent_hooks_coexist_with_per_request(vllm_server):
     for req_id, hook_data in results.items():
         deserialized = deserialize_hook_results(hook_data)
         # Persistent hook is the last in the list (after per-request hooks)
-        found_persistent = any(
-            "persistent" in hd for hd in deserialized.values()
-        )
+        found_persistent = any("persistent" in hd for hd in deserialized.values())
         assert found_persistent, f"Missing persistent hook data for {req_id}"
 
     # Cleanup
@@ -139,9 +151,12 @@ def test_persistent_modification_changes_output(vllm_server):
         return torch.zeros_like(h)
 
     hook = Hook(fn=zero_hook, layer_indices=[15])
-    requests.post(f"{vllm_server}/v1/hooks/register", json={
-        "hooks": [hook.model_dump()],
-    })
+    requests.post(
+        f"{vllm_server}/v1/hooks/register",
+        json={
+            "hooks": [hook.model_dump()],
+        },
+    )
 
     # Same prompt should now produce different output
     hooked = _completions(vllm_server, prompt, max_tokens=20)
@@ -161,6 +176,7 @@ def test_persistent_modification_changes_output(vllm_server):
 def test_same_layer_interaction_order(vllm_server):
     """Persistent hook modifies hidden states; per-request hook on the same
     layer should see the modified states (persistent fires first)."""
+
     def add_one(ctx, h):
         return h + 1.0
 
@@ -172,32 +188,41 @@ def test_same_layer_interaction_order(vllm_server):
     per_request = Hook(fn=capture_mean, layer_indices=[15])
 
     # Baseline: capture without persistent hook
-    resp_baseline = requests.post(f"{vllm_server}/v1/completions", json={
-        "model": MODEL,
-        "prompt": "Test",
-        "max_tokens": 1,
-        "temperature": 0.0,
-        "vllm_xargs": {
-            "apply_hooks": json.dumps([per_request.model_dump()]),
+    resp_baseline = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": "Test",
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "vllm_xargs": {
+                "apply_hooks": json.dumps([per_request.model_dump()]),
+            },
         },
-    }).json()
+    ).json()
     baseline_mean = deserialize_hook_results(resp_baseline["hook_results"])["0"]["mean"]
 
     # Now register persistent +1 hook
-    requests.post(f"{vllm_server}/v1/hooks/register", json={
-        "hooks": [persistent.model_dump()],
-    })
+    requests.post(
+        f"{vllm_server}/v1/hooks/register",
+        json={
+            "hooks": [persistent.model_dump()],
+        },
+    )
 
     # Per-request capture should see higher mean (persistent added 1.0)
-    resp_shifted = requests.post(f"{vllm_server}/v1/completions", json={
-        "model": MODEL,
-        "prompt": "Test",
-        "max_tokens": 1,
-        "temperature": 0.0,
-        "vllm_xargs": {
-            "apply_hooks": json.dumps([per_request.model_dump()]),
+    resp_shifted = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": "Test",
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "vllm_xargs": {
+                "apply_hooks": json.dumps([per_request.model_dump()]),
+            },
         },
-    }).json()
+    ).json()
     shifted_mean = deserialize_hook_results(resp_shifted["hook_results"])["0"]["mean"]
 
     assert shifted_mean > baseline_mean, (
@@ -210,14 +235,18 @@ def test_same_layer_interaction_order(vllm_server):
 
 def test_collect_is_non_destructive(vllm_server):
     """Calling collect twice returns the same data."""
+
     def tag(ctx, h):
         ctx.saved["seen"] = True
         return None
 
     hook = Hook(fn=tag, layer_indices=[15])
-    requests.post(f"{vllm_server}/v1/hooks/register", json={
-        "hooks": [hook.model_dump()],
-    })
+    requests.post(
+        f"{vllm_server}/v1/hooks/register",
+        json={
+            "hooks": [hook.model_dump()],
+        },
+    )
 
     _completions(vllm_server, "Hello")
 
@@ -232,13 +261,17 @@ def test_collect_is_non_destructive(vllm_server):
 
 def test_collect_with_no_requests(vllm_server):
     """Collecting immediately after register (no requests) returns empty."""
+
     def noop(ctx, h):
         return None
 
     hook = Hook(fn=noop, layer_indices=[15])
-    requests.post(f"{vllm_server}/v1/hooks/register", json={
-        "hooks": [hook.model_dump()],
-    })
+    requests.post(
+        f"{vllm_server}/v1/hooks/register",
+        json={
+            "hooks": [hook.model_dump()],
+        },
+    )
 
     resp = requests.post(f"{vllm_server}/v1/hooks/collect").json()
     assert resp["results"] == {}
@@ -248,6 +281,7 @@ def test_collect_with_no_requests(vllm_server):
 
 def test_append_hooks_across_registers(vllm_server):
     """Multiple register calls append hooks; results contain all of them."""
+
     def hook_a(ctx, h):
         ctx.saved["source"] = "A"
         return None
@@ -256,12 +290,18 @@ def test_append_hooks_across_registers(vllm_server):
         ctx.saved["source"] = "B"
         return None
 
-    requests.post(f"{vllm_server}/v1/hooks/register", json={
-        "hooks": [Hook(fn=hook_a, layer_indices=[15]).model_dump()],
-    })
-    requests.post(f"{vllm_server}/v1/hooks/register", json={
-        "hooks": [Hook(fn=hook_b, layer_indices=[15]).model_dump()],
-    })
+    requests.post(
+        f"{vllm_server}/v1/hooks/register",
+        json={
+            "hooks": [Hook(fn=hook_a, layer_indices=[15]).model_dump()],
+        },
+    )
+    requests.post(
+        f"{vllm_server}/v1/hooks/register",
+        json={
+            "hooks": [Hook(fn=hook_b, layer_indices=[15]).model_dump()],
+        },
+    )
 
     _completions(vllm_server, "Test append")
 
@@ -290,19 +330,26 @@ def test_persistent_capture_matches_native(vllm_server):
         return None
 
     hook = Hook(fn=capture_accumulate, layer_indices=[layer])
-    requests.post(f"{vllm_server}/v1/hooks/register", json={
-        "hooks": [hook.model_dump()],
-    })
+    requests.post(
+        f"{vllm_server}/v1/hooks/register",
+        json={
+            "hooks": [hook.model_dump()],
+        },
+    )
 
     # Run with native capture too
     from vllm_lens import deserialize_tensor
-    resp = requests.post(f"{vllm_server}/v1/completions", json={
-        "model": MODEL,
-        "prompt": "The future of AI is",
-        "max_tokens": 10,
-        "temperature": 0.0,
-        "vllm_xargs": {"output_residual_stream": f"[{layer}]"},
-    }).json()
+
+    resp = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": "The future of AI is",
+            "max_tokens": 10,
+            "temperature": 0.0,
+            "vllm_xargs": {"output_residual_stream": f"[{layer}]"},
+        },
+    ).json()
     assert "error" not in resp, resp
 
     native_all = deserialize_tensor(resp["activations"]["residual_stream"])
@@ -319,7 +366,12 @@ def test_persistent_capture_matches_native(vllm_server):
     hook_acts = torch.cat(parts, dim=0)
 
     min_len = min(native_layer.shape[0], hook_acts.shape[0])
-    mean_diff = (native_layer[:min_len].float() - hook_acts[:min_len].float()).abs().mean().item()
+    mean_diff = (
+        (native_layer[:min_len].float() - hook_acts[:min_len].float())
+        .abs()
+        .mean()
+        .item()
+    )
     assert mean_diff < 1e-4, f"Mean abs diff {mean_diff} too large"
 
     requests.post(f"{vllm_server}/v1/hooks/clear")

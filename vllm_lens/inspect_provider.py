@@ -198,9 +198,7 @@ class VLLMLensAPI(VLLMAPI):
                 # model_dump() invokes @field_serializer to cloudpickle fn.
                 if extra_args is vectors:  # not yet copied
                     extra_args = dict(extra_args)
-                extra_args["apply_hooks"] = json.dumps(
-                    [h.model_dump() for h in hooks]
-                )
+                extra_args["apply_hooks"] = json.dumps([h.model_dump() for h in hooks])
             config.extra_body["vllm_xargs"] = extra_args  # type: ignore[reportOptionalSubscript]
 
         # lora_request → model name override

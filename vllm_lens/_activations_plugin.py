@@ -342,9 +342,7 @@ def _patched_llm_generate(
     if has_hooks:
         for output in outputs:
             req_id = output.request_id
-            raw_results = self.collective_rpc(
-                "get_hook_results", args=(req_id,)
-            )
+            raw_results = self.collective_rpc("get_hook_results", args=(req_id,))
             for raw in raw_results or ():
                 if raw is not None:
                     output.hook_results = pickle.loads(raw)
@@ -442,9 +440,7 @@ def _llm_register_hooks(self: LLM, hooks: list) -> None:
     if not getattr(self, "_hooks_installed", False):
         self.collective_rpc("install_hooks")
         self._hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
-    self.collective_rpc(
-        "set_persistent_hooks", args=(cloudpickle.dumps(hooks),)
-    )
+    self.collective_rpc("set_persistent_hooks", args=(cloudpickle.dumps(hooks),))
     self._has_persistent_hooks = True  # type: ignore[reportAttributeAccessIssue]
 
 

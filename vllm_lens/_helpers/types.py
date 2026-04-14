@@ -157,9 +157,7 @@ class Hook(BaseModel):
             return cloudpickle.loads(v)
         if callable(v):
             return v
-        raise ValueError(
-            f"fn must be a callable or a cloudpickle dict, got {type(v)}"
-        )
+        raise ValueError(f"fn must be a callable or a cloudpickle dict, got {type(v)}")
 
     @field_serializer("fn")
     def _serialize_fn(self, v: Callable, _info: Any) -> dict[str, str]:

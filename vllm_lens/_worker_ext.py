@@ -298,9 +298,7 @@ def _hook_inner(
         hook_src = modified_output if modified_output is not None else output
         if isinstance(hook_src, tuple):
             hook_hidden = (
-                hook_src[0] + hook_src[1]
-                if hook_src[1] is not None
-                else hook_src[0]
+                hook_src[0] + hook_src[1] if hook_src[1] is not None else hook_src[0]
             )
         else:
             hook_hidden = hook_src
@@ -365,9 +363,7 @@ def _hook_inner(
                             modified_output[0][start:end] + delta
                         )
                     else:
-                        modified_output[start:end] = (
-                            modified_output[start:end] + delta
-                        )
+                        modified_output[start:end] = modified_output[start:end] + delta
                     # Update hook_hidden so subsequent hooks see the change.
                     hook_hidden[start:end] = result
 
@@ -671,9 +667,7 @@ class HiddenStatesExtension:
         for req_id in list(self._hook_contexts):
             if req_id.startswith(prefix):
                 contexts = self._hook_contexts.pop(req_id)
-                saved_dicts = {
-                    str(i): ctx.saved for i, ctx in enumerate(contexts)
-                }
+                saved_dicts = {str(i): ctx.saved for i, ctx in enumerate(contexts)}
                 return pickle.dumps(saved_dicts)
         return None
 
@@ -728,9 +722,7 @@ class HiddenStatesExtension:
             return None
         results: dict[str, dict[str, dict[str, Any]]] = {}
         for req_id, contexts in self._persistent_hook_contexts.items():
-            results[req_id] = {
-                str(i): ctx.saved for i, ctx in enumerate(contexts)
-            }
+            results[req_id] = {str(i): ctx.saved for i, ctx in enumerate(contexts)}
         return pickle.dumps(results)
 
     def clear_persistent_hooks(self) -> None:

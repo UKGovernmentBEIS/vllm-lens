@@ -40,10 +40,15 @@ def vllm_server():
     vllm_bin = os.path.join(os.path.dirname(sys.executable), "vllm")
     proc = subprocess.Popen(
         [
-            vllm_bin, "serve", MODEL,
-            "--dtype", "auto",
-            "--gpu-memory-utilization", "0.9",
-            "--port", str(SERVER_PORT),
+            vllm_bin,
+            "serve",
+            MODEL,
+            "--dtype",
+            "auto",
+            "--gpu-memory-utilization",
+            "0.9",
+            "--port",
+            str(SERVER_PORT),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

@@ -85,6 +85,7 @@
 
 [tool.pyright]
     include=["vllm_lens"]
+    exclude=["vllm_lens/_examples", "vllm_lens/tests"]
     reportMissingImports=false
     reportMissingModuleSource=false
     reportMissingTypeStubs=false

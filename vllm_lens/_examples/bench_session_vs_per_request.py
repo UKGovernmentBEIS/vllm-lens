@@ -86,13 +86,16 @@ def bench_per_request(
     layers_str = json.dumps(layers)
     t0 = time.perf_counter()
     for prompt in prompts:
-        resp = requests.post(f"{base_url}/v1/completions", json={
-            "model": MODEL,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": 0.0,
-            "vllm_xargs": {"output_residual_stream": layers_str},
-        }).json()
+        resp = requests.post(
+            f"{base_url}/v1/completions",
+            json={
+                "model": MODEL,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "vllm_xargs": {"output_residual_stream": layers_str},
+            },
+        ).json()
         assert "error" not in resp, resp
         rs = deserialize_tensor(resp["activations"]["residual_stream"])
         activations.append(rs)
@@ -116,19 +119,25 @@ def bench_persistent(
     t0 = time.perf_counter()
 
     # Register once
-    resp = requests.post(f"{base_url}/v1/hooks/register", json={
-        "hooks": [hook.model_dump()],
-    }).json()
+    resp = requests.post(
+        f"{base_url}/v1/hooks/register",
+        json={
+            "hooks": [hook.model_dump()],
+        },
+    ).json()
     assert resp["status"] == "ok"
 
     # Run all prompts (no activation data in responses)
     for prompt in prompts:
-        resp = requests.post(f"{base_url}/v1/completions", json={
-            "model": MODEL,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": 0.0,
-        }).json()
+        resp = requests.post(
+            f"{base_url}/v1/completions",
+            json={
+                "model": MODEL,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+            },
+        ).json()
         assert "error" not in resp, resp
 
     # Collect all at once
@@ -156,39 +165,53 @@ def main():
     )
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--n-prompts", type=int, default=50)
-    parser.add_argument("--layer", type=int, default=15,
-                        help="Layer index to capture")
-    parser.add_argument("--all-layers", action="store_true",
-                        help="Capture all 32 layers (overrides --layer)")
+    parser.add_argument("--layer", type=int, default=15, help="Layer index to capture")
+    parser.add_argument(
+        "--all-layers",
+        action="store_true",
+        help="Capture all 32 layers (overrides --layer)",
+    )
     parser.add_argument("--max-tokens", type=int, default=10)
-    parser.add_argument("--warmup", type=int, default=3,
-                        help="Number of warmup requests before benchmarking")
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=3,
+        help="Number of warmup requests before benchmarking",
+    )
     args = parser.parse_args()
 
-    prompts = PROMPTS[:args.n_prompts]
+    prompts = PROMPTS[: args.n_prompts]
     if len(prompts) < args.n_prompts:
         # Cycle if we need more
-        prompts = (prompts * (args.n_prompts // len(prompts) + 1))[:args.n_prompts]
+        prompts = (prompts * (args.n_prompts // len(prompts) + 1))[: args.n_prompts]
 
     all_layers = list(range(32)) if args.all_layers else [args.layer]
     layer_desc = "all 32" if args.all_layers else str(args.layer)
-    print(f"Config: {args.n_prompts} prompts, layer {layer_desc}, "
-          f"max_tokens={args.max_tokens}")
+    print(
+        f"Config: {args.n_prompts} prompts, layer {layer_desc}, "
+        f"max_tokens={args.max_tokens}"
+    )
     print(f"Server: {args.base_url}\n")
 
     # Warmup
     print(f"Warming up with {args.warmup} requests...")
-    for p in prompts[:args.warmup]:
-        requests.post(f"{args.base_url}/v1/completions", json={
-            "model": MODEL, "prompt": p, "max_tokens": 1, "temperature": 0.0,
-        })
+    for p in prompts[: args.warmup]:
+        requests.post(
+            f"{args.base_url}/v1/completions",
+            json={
+                "model": MODEL,
+                "prompt": p,
+                "max_tokens": 1,
+                "temperature": 0.0,
+            },
+        )
 
     # Benchmark per-request
     print("\n--- Per-request activation extraction ---")
     t_per, acts_per = bench_per_request(
         args.base_url, prompts, all_layers, args.max_tokens
     )
-    print(f"  Time: {t_per:.2f}s ({t_per/len(prompts)*1000:.1f}ms/prompt)")
+    print(f"  Time: {t_per:.2f}s ({t_per / len(prompts) * 1000:.1f}ms/prompt)")
     print(f"  Collected {len(acts_per)} activation tensors")
 
     # Benchmark persistent
@@ -196,11 +219,13 @@ def main():
     t_persistent, acts_persistent = bench_persistent(
         args.base_url, prompts, all_layers, args.max_tokens
     )
-    print(f"  Time: {t_persistent:.2f}s ({t_persistent/len(prompts)*1000:.1f}ms/prompt)")
+    print(
+        f"  Time: {t_persistent:.2f}s ({t_persistent / len(prompts) * 1000:.1f}ms/prompt)"
+    )
     print(f"  Collected {len(acts_persistent)} activation tensors")
 
     # Compare
-    print(f"\n--- Comparison ---")
+    print("\n--- Comparison ---")
     speedup = t_per / t_persistent if t_persistent > 0 else float("inf")
     print(f"  Per-request:  {t_per:.2f}s")
     print(f"  Persistent:   {t_persistent:.2f}s")
@@ -210,8 +235,10 @@ def main():
     # (test_persistent_capture_matches_native). The persistent path returns
     # results keyed by internal request IDs with no guaranteed ordering,
     # so per-prompt comparison requires extra bookkeeping.
-    print(f"\n  Shapes: per-request {acts_per[0].shape}, "
-          f"persistent {acts_persistent[0].shape}")
+    print(
+        f"\n  Shapes: per-request {acts_per[0].shape}, "
+        f"persistent {acts_persistent[0].shape}"
+    )
 
 
 if __name__ == "__main__":

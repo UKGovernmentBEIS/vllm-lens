@@ -38,9 +38,7 @@ async def register_hooks(raw_request: Request):
 
 @router.post("/collect")
 async def collect_hook_results(raw_request: Request):
-    raw_list = await _engine_client(raw_request).collective_rpc(
-        "get_all_hook_results"
-    )
+    raw_list = await _engine_client(raw_request).collective_rpc("get_all_hook_results")
     merged: dict[str, Any] = {}
     for raw in raw_list or ():
         if raw is not None:
