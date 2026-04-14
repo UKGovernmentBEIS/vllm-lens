@@ -289,9 +289,7 @@ def print_heatmap(results: dict[str, Any]) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Causal tracing via vllm-lens")
     parser.add_argument("--base-url", default="http://localhost:8000")
-    parser.add_argument(
-        "--prompt", default="The Eiffel Tower is in the city of"
-    )
+    parser.add_argument("--prompt", default="The Eiffel Tower is in the city of")
     parser.add_argument("--subject", default="Eiffel Tower")
     parser.add_argument("--answer", default=" Paris")
     parser.add_argument("--noise-scale", type=float, default=3.0)
