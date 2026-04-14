@@ -1,8 +1,13 @@
 # vLLM-lens
 
-vLLM-Lens enables top-down interpretability (e.g., probes, steering, activation oracles). It offers high performance, supporting tensor parallelism & pipeline parallelism (across GPUs and nodes) out of the box. You can also apply all these techniques concurrently (in the same dynamic batch) - removing the need to switch between model instances.
+vLLM-Lens enables top-down interpretability (e.g., probes, steering, activation oracles, causal tracing). It offers high performance, supporting tensor parallelism & pipeline parallelism (across GPUs and nodes) out of the box. You can also apply all these techniques concurrently (in the same dynamic batch) - removing the need to switch between model instances.
 
-Note this performance comes at the expense of flexibility - for example, you would need to edit the source to add additional custom hooks (though it should be easy enough for coding agents to do that). For more flexibility out of the box, consider [nnsight](https://nnsight.net/) or [TransformerLens](https://transformerlensorg.github.io/TransformerLens/).
+Features:
+- **Activation extraction** — capture residual stream hidden states from specific layers
+- **Steering vectors** — add activation vectors to modify the residual stream in-flight
+- **Generic hooks** — run arbitrary Python functions per-request, per-layer during inference (inspired by [Garçon](https://transformer-circuits.pub/2021/garcon/index.html))
+- **Persistent hooks** — register hooks once, run many requests, collect results in bulk
+- **Pre-hooks** — modify layer inputs (e.g., corrupt embeddings for causal tracing)
 
 The module auto-registers as a [vLLM general plugin](https://docs.vllm.ai/en/latest/design/plugin_system.html) and an [Inspect](https://inspect.aisi.org.uk/) model provider on install. Interact with model internals per-call via `SamplingParams.extra_args` (vLLM) or `GenerateConfig.extra_body` (Inspect).
 
@@ -12,9 +17,90 @@ The module auto-registers as a [vLLM general plugin](https://docs.vllm.ai/en/lat
 uv add vllm-lens
 ```
 
+## Quickstart
+
+vllm-lens auto-registers as a vLLM plugin — just start a server normally:
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct
+```
+
+All vllm-lens features (activation extraction, steering, hooks) are available immediately via `SamplingParams.extra_args` (offline) or `vllm_xargs` (HTTP API). The plugin also registers custom HTTP endpoints for persistent hook management at `/v1/hooks/*`.
+
 ## Examples
 
-These examples use the Inspect integration. See the [`examples/`](examples/) folder for offline and online direct vLLM usage.
+### Generic hooks
+
+Hooks let you run arbitrary Python functions on hidden states at specific layers during inference. They can capture data (via `ctx.saved`) and/or modify hidden states (by returning a tensor).
+
+```python
+from vllm import LLM, SamplingParams
+from vllm_lens import Hook
+
+def ablate_neuron(ctx, h):
+    ctx.saved[f"pre_L{ctx.layer_idx}"] = h[:, 42].cpu()
+    h = h.clone()
+    h[:, 42] = 0
+    return h  # return None to skip modification
+
+hook = Hook(fn=ablate_neuron, layer_indices=[15, 16])
+sp = SamplingParams(
+    temperature=0.0,
+    max_tokens=10,
+    extra_args={"apply_hooks": [hook]},
+)
+outputs = llm.generate(["Hello world"], sp)
+print(outputs[0].hook_results)  # {"0": {"pre_L15": tensor, "pre_L16": tensor}}
+```
+
+Pre-hooks run before the layer forward pass (useful for corrupting inputs):
+
+```python
+def corrupt_embeddings(ctx, h):
+    noise = torch.randn_like(h) * 3.0
+    return h + noise
+
+hook = Hook(fn=corrupt_embeddings, layer_indices=[0], pre=True)
+```
+
+### Persistent hooks (Garçon-style)
+
+Register hooks once, run many requests, collect all results in one bulk transfer:
+
+```python
+llm.register_hooks([hook])
+
+for prompt in prompts:
+    llm.generate([prompt], sp)  # hooks fire, results stay server-side
+
+results = llm.collect_hook_results()  # bulk retrieval
+llm.clear_hooks()
+```
+
+Over HTTP (no dev mode required):
+
+```
+POST /v1/hooks/register   {"hooks": [<Hook json>...]}
+POST /v1/completions      (hooks fire automatically)
+POST /v1/hooks/collect    → {"results": {<req_id>: {<hook_idx>: <ctx.saved>}}}
+POST /v1/hooks/clear
+```
+
+Multiple `register` calls append hooks. `collect` is non-destructive. `clear` removes hooks and all accumulated results.
+
+### Causal tracing (activation patching)
+
+The [`causal_tracing.py`](vllm_lens/_examples/causal_tracing.py) example implements ROME-style causal tracing using pre-hooks for embedding corruption and post-hooks for clean-state restoration:
+
+```bash
+python -m vllm_lens._examples.causal_tracing \
+    --base-url http://localhost:8000 \
+    --prompt "The Eiffel Tower is in the city of" \
+    --subject "Eiffel Tower" \
+    --answer " Paris"
+```
+
+This produces a (layers × tokens) heatmap showing which hidden states are causally important for factual recall.
 
 ### Inspect AI provider
 
