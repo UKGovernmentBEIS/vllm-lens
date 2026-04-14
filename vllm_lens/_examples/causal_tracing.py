@@ -26,7 +26,7 @@ from typing import Any
 
 import requests
 import torch
-from vllm_lens import Hook, deserialize_hook_results, deserialize_tensor
+from vllm_lens import Hook, deserialize_hook_results
 
 MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 N_LAYERS = 32
@@ -269,7 +269,7 @@ def print_heatmap(results: dict[str, Any]) -> None:
     recovery = recovery.clamp(0, 1)
 
     chars = " ░▒▓█"
-    print(f"\nCausal trace heatmap (rows=layers, cols=tokens)")
+    print("\nCausal trace heatmap (rows=layers, cols=tokens)")
     print(f"  Clean logprob: {clean:.4f}, Corrupted: {corrupted:.4f}")
     print()
 
