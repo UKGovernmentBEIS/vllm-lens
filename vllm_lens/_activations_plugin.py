@@ -42,6 +42,7 @@ _original_generate: Callable | None = None
 _original_llm_generate: Callable | None = None
 _original_completion_response: Callable | None = None
 _original_chat_full_generator: Callable | None = None
+_original_register_routers: Callable | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -178,10 +179,12 @@ async def _patched_generate(
     # Allow explicit prefix-cache bypass via extra_args.
     skip_kv_cache = extra.pop("skip_reading_prefix_cache", None)
 
+    has_persistent = getattr(self, "_has_persistent_hooks", False)
     needs_hooks = (
         wants_activations
         or steering_vectors is not None
         or hooks_list is not None
+        or has_persistent
     )
     if needs_hooks or skip_kv_cache:
         # Hooks rely on forward passes firing; prefix-cached tokens skip
@@ -304,7 +307,8 @@ def _patched_llm_generate(
 
     has_steering = len(steering_payloads) > 0
     has_hooks = len(hook_payloads) > 0
-    needs_hooks = wants_activations or has_steering or has_hooks
+    has_persistent = getattr(self, "_has_persistent_hooks", False)
+    needs_hooks = wants_activations or has_steering or has_hooks or has_persistent
     if needs_hooks or any_skip_kv_cache:
         for sp in params_list:
             sp.skip_reading_prefix_cache = True
@@ -415,6 +419,51 @@ async def _patched_chat_full_generator(
 
 
 # ---------------------------------------------------------------------------
+# Persistent hooks — HTTP router
+# ---------------------------------------------------------------------------
+
+
+def _patched_register_routers(app):
+    """Inject vllm-lens hook router after vLLM registers its own routes."""
+    assert _original_register_routers is not None
+    _original_register_routers(app)
+    from vllm_lens._hooks_router import router as hooks_router
+
+    app.include_router(hooks_router)
+
+
+# ---------------------------------------------------------------------------
+# Persistent hooks — offline LLM methods
+# ---------------------------------------------------------------------------
+
+
+def _llm_register_hooks(self: LLM, hooks: list) -> None:
+    """Register persistent hooks that apply to every subsequent request."""
+    if not getattr(self, "_hooks_installed", False):
+        self.collective_rpc("install_hooks")
+        self._hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
+    self.collective_rpc(
+        "set_persistent_hooks", args=(cloudpickle.dumps(hooks),)
+    )
+    self._has_persistent_hooks = True  # type: ignore[reportAttributeAccessIssue]
+
+
+def _llm_collect_hook_results(self: LLM) -> dict:
+    """Collect all accumulated hook results from the worker."""
+    raw_list = self.collective_rpc("get_all_hook_results")
+    for raw in raw_list or ():
+        if raw is not None:
+            return pickle.loads(raw)
+    return {}
+
+
+def _llm_clear_hooks(self: LLM) -> None:
+    """Remove persistent hooks and all accumulated contexts."""
+    self.collective_rpc("clear_persistent_hooks")
+    self._has_persistent_hooks = False  # type: ignore[reportAttributeAccessIssue]
+
+
+# ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
 
@@ -434,6 +483,7 @@ def register() -> None:
     global _original_create_engine_config
     global _original_generate, _original_llm_generate
     global _original_completion_response, _original_chat_full_generator
+    global _original_register_routers
 
     from vllm import LLM
     from vllm.engine.arg_utils import EngineArgs
@@ -447,6 +497,11 @@ def register() -> None:
 
     _original_llm_generate = LLM.generate
     LLM.generate = _patched_llm_generate
+
+    # Add persistent hook methods to LLM.
+    LLM.register_hooks = _llm_register_hooks  # type: ignore[reportAttributeAccessIssue]
+    LLM.collect_hook_results = _llm_collect_hook_results  # type: ignore[reportAttributeAccessIssue]
+    LLM.clear_hooks = _llm_clear_hooks  # type: ignore[reportAttributeAccessIssue]
 
     # Patch OpenAI-compatible response builders so activations survive
     # HTTP serialization.  Wrapped in try/except because these modules
@@ -472,5 +527,14 @@ def register() -> None:
 
         _original_chat_full_generator = OpenAIServingChat.chat_completion_full_generator
         OpenAIServingChat.chat_completion_full_generator = _patched_chat_full_generator
+    except Exception:
+        pass
+
+    # Patch the serve router registration to inject our hooks API.
+    try:
+        import vllm.entrypoints.serve as _serve_mod
+
+        _original_register_routers = _serve_mod.register_vllm_serve_api_routers
+        _serve_mod.register_vllm_serve_api_routers = _patched_register_routers
     except Exception:
         pass

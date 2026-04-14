@@ -86,9 +86,22 @@ def _find_hook_configs(
 ) -> list[Hook]:
     """Find all hook definitions that apply to an internal request ID.
 
-    Same matching logic as ``_find_steering_configs``: prefix match for
-    the async path, ``_hook_id`` sentinel for the offline path.
+    Checks three sources (in order):
+    1. Per-request hooks keyed by external ID prefix (async path).
+    2. Per-request hooks keyed by ``_hook_id`` sentinel (offline path).
+    3. Persistent hooks (apply to every request).
     """
+    results = _find_hook_configs_no_persistent(extension, internal_req_id, extra_args)
+    results.extend(extension._persistent_hooks)
+    return results
+
+
+def _find_hook_configs_no_persistent(
+    extension: HiddenStatesExtension,
+    internal_req_id: str,
+    extra_args: dict[str, Any] | None,
+) -> list[Hook]:
+    """Find per-request hook definitions only (excludes persistent hooks)."""
     results: list[Hook] = []
     for external_id, hooks in extension._hook_data.items():
         if internal_req_id.startswith(f"{external_id}-"):
@@ -256,8 +269,13 @@ def _hook_inner(
             )
 
     # --- Phase 2.5: run generic hooks --------------------------------
+    # Collect per-request hooks and persistent hooks separately so their
+    # contexts are stored in different dicts (per-request contexts get
+    # cleaned up after each request; persistent ones accumulate).
     per_req_hooks: list[list[Hook]] = []
+    per_req_persistent: list[list[Hook]] = []
     needs_hooks = False
+    persistent_hooks = extension._persistent_hooks
     for i in range(num_reqs):
         req_id = req_ids[i]
         req_state = runner.requests.get(req_id)
@@ -266,9 +284,12 @@ def _hook_inner(
             if req_state and req_state.sampling_params
             else None
         )
-        hooks = _find_hook_configs(extension, req_id, extra)
+        # _find_hook_configs returns per-request hooks only (persistent
+        # hooks are handled separately below).
+        hooks = _find_hook_configs_no_persistent(extension, req_id, extra)
         per_req_hooks.append(hooks)
-        if hooks:
+        per_req_persistent.append(persistent_hooks)
+        if hooks or persistent_hooks:
             needs_hooks = True
 
     if needs_hooks:
@@ -286,21 +307,40 @@ def _hook_inner(
         hook_hidden = hook_hidden.clone()
 
         for i in range(num_reqs):
-            if not per_req_hooks[i]:
+            all_hooks = per_req_hooks[i] + per_req_persistent[i]
+            if not all_hooks:
                 continue
             req_id = req_ids[i]
             start = int(query_start_loc[i].item())
             end = int(query_start_loc[i + 1].item())
             seq_len = end - start
 
-            # Get-or-create per-request contexts (one per hook).
-            if req_id not in extension._hook_contexts:
-                extension._hook_contexts[req_id] = [
-                    HookContext() for _ in per_req_hooks[i]
-                ]
-            contexts = extension._hook_contexts[req_id]
+            n_per_req = len(per_req_hooks[i])
+            n_persistent = len(per_req_persistent[i])
 
-            for hi, hook in enumerate(per_req_hooks[i]):
+            # Get-or-create contexts: per-request in _hook_contexts,
+            # persistent in _persistent_hook_contexts.
+            if n_per_req > 0:
+                if req_id not in extension._hook_contexts:
+                    extension._hook_contexts[req_id] = [
+                        HookContext() for _ in range(n_per_req)
+                    ]
+                pr_ctxs = extension._hook_contexts[req_id]
+            else:
+                pr_ctxs = []
+
+            if n_persistent > 0:
+                if req_id not in extension._persistent_hook_contexts:
+                    extension._persistent_hook_contexts[req_id] = [
+                        HookContext() for _ in range(n_persistent)
+                    ]
+                ps_ctxs = extension._persistent_hook_contexts[req_id]
+            else:
+                ps_ctxs = []
+
+            contexts = pr_ctxs + ps_ctxs
+
+            for hi, hook in enumerate(all_hooks):
                 if layer_idx not in hook.layer_indices:
                     continue
                 ctx = contexts[hi]
@@ -432,9 +472,16 @@ class HiddenStatesExtension:
     # key (external_req_id or _hook_id) → list of Hook
     _hook_data: dict[str, list[Hook]] = {}
 
+    # Persistent hooks (apply to every request, not auto-cleaned):
+    _persistent_hooks: list[Hook] = []
+
     # Per-request hook contexts (one HookContext per hook per internal request):
     # internal_req_id → list[HookContext]
     _hook_contexts: dict[str, list[HookContext]] = {}
+
+    # Persistent hook contexts (separate from per-request to avoid cleanup conflicts):
+    # internal_req_id → list[HookContext]
+    _persistent_hook_contexts: dict[str, list[HookContext]] = {}
 
     # Whether this rank should capture activations (only TP rank 0).
     _should_capture: bool = True
@@ -453,11 +500,16 @@ class HiddenStatesExtension:
         if self._hooks_installed:
             return
         self._hooks_installed = True
-        # Reset to instance-level dicts (class-level defaults are shared)
+        # Reset to instance-level dicts (class-level defaults are shared).
+        # Do NOT reset _persistent_hooks — they may have been set via
+        # set_persistent_hooks() before the first generate call.
         self._captured_states = {}
         self._steering_data = {}
         self._hook_data = {}
+        if not isinstance(self.__dict__.get("_persistent_hooks"), list):
+            self._persistent_hooks = []
         self._hook_contexts = {}
+        self._persistent_hook_contexts = {}
 
         # Only rank 0 captures — residual streams are replicated across
         # TP ranks after all-reduce, so the data is identical.
@@ -629,3 +681,49 @@ class HiddenStatesExtension:
         for req_id in list(self._hook_contexts):
             if req_id.startswith(prefix):
                 del self._hook_contexts[req_id]
+
+    # ------------------------------------------------------------------
+    # Persistent hook management (called via collective_rpc)
+    # ------------------------------------------------------------------
+
+    def set_persistent_hooks(self, pickled_data: bytes) -> None:
+        """Register hooks that apply to every subsequent request.
+
+        Accepts cloudpickle'd ``list[Hook]``.  Validates layer indices.
+        Replaces any previously registered persistent hooks.
+        Also ensures forward hooks are installed on the model layers.
+        """
+        self.install_hooks()
+        hooks: list[Hook] = cloudpickle.loads(pickled_data)
+        num_layers = len(_get_layers(self.model_runner.model))
+        for hook in hooks:
+            for idx in hook.layer_indices:
+                if idx < 0 or idx >= num_layers:
+                    raise ValueError(
+                        f"layer_index {idx} out of range [0, {num_layers})"
+                    )
+        self._persistent_hooks = hooks
+
+    def get_all_hook_results(self) -> bytes | None:
+        """Retrieve accumulated persistent hook contexts from all requests.
+
+        Only rank 0 returns data.  Does NOT clear — call
+        ``clear_persistent_hooks`` explicitly.
+
+        Returns pickled ``{internal_req_id: {hook_idx_str: ctx.saved}}``.
+        """
+        if not getattr(self, "_should_capture", True):
+            return None
+        if not self._persistent_hook_contexts:
+            return None
+        results: dict[str, dict[str, dict[str, Any]]] = {}
+        for req_id, contexts in self._persistent_hook_contexts.items():
+            results[req_id] = {
+                str(i): ctx.saved for i, ctx in enumerate(contexts)
+            }
+        return pickle.dumps(results)
+
+    def clear_persistent_hooks(self) -> None:
+        """Remove persistent hooks and all accumulated contexts."""
+        self._persistent_hooks = []
+        self._persistent_hook_contexts = {}
