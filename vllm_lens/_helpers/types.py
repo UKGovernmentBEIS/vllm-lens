@@ -114,28 +114,31 @@ class HookContext:
     each call.
     """
 
-    __slots__ = ("layer_idx", "seq_len", "saved", "model")
+    __slots__ = ("layer_idx", "seq_len", "saved", "model", "_prefetched")
 
     def __init__(self) -> None:
         self.layer_idx: int = 0
         self.seq_len: int = 0
         self.saved: dict[str, Any] = {}
         self.model: Any = None
-        """The full model (e.g. ``LlamaForCausalLM``).  Set by the
-        dispatcher.  Useful for accessing ``lm_head``, layer norm, etc."""
+        self._prefetched: dict[str, torch.Tensor] = {}
 
     def get_parameter(self, name: str) -> torch.Tensor:
-        """Get a model parameter by name, auto-gathering across TP ranks.
+        """Get a model parameter by name, handling TP and PP.
 
-        With pipeline parallelism, the parameter must be on this PP
-        stage.  In practice, hook a layer on the same PP stage as the
-        parameter (e.g. hook the last layer to access ``lm_head.weight``).
+        If the parameter was pre-fetched (via ``prefetch_parameters``
+        RPC at registration time), returns the cached copy — this works
+        across PP stages.  Otherwise falls back to a local TP gather
+        (parameter must be on this PP stage).
 
         Example::
 
             weight = ctx.get_parameter("lm_head.weight")
             logits = hidden_states @ weight.T
         """
+        if name in self._prefetched:
+            return self._prefetched[name]
+
         import torch.distributed as dist
 
         from vllm.distributed.parallel_state import get_tp_group
@@ -148,8 +151,8 @@ class HookContext:
             if isinstance(obj, PPMissingLayer):
                 raise AttributeError(
                     f"Parameter {name!r} is not on this pipeline-parallel "
-                    f"stage. Hook a layer on the same PP stage as the "
-                    f"target parameter (e.g. last layer for lm_head)."
+                    f"stage. Pass prefetch_params=[{name!r}] to "
+                    f"register_hooks() to make it available on all ranks."
                 )
 
         param = torch.as_tensor(obj)

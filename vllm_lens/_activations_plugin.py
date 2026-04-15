@@ -460,12 +460,18 @@ def _patched_register_routers(app):
 # ---------------------------------------------------------------------------
 
 
-def _llm_register_hooks(self: LLM, hooks: list) -> None:
+def _llm_register_hooks(
+    self: LLM,
+    hooks: list,
+    prefetch_params: list[str] | None = None,
+) -> None:
     """Register persistent hooks that apply to every subsequent request."""
     if not getattr(self, "_hooks_installed", False):
         self.collective_rpc("install_hooks")
         self._hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
     self.collective_rpc("set_persistent_hooks", args=(cloudpickle.dumps(hooks),))
+    if prefetch_params:
+        self.collective_rpc("prefetch_parameters", args=(prefetch_params,))
     self._has_persistent_hooks = True  # type: ignore[reportAttributeAccessIssue]
 
 

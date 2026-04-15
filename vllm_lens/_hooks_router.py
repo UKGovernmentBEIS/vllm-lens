@@ -33,6 +33,9 @@ async def register_hooks(raw_request: Request):
     engine = _engine_client(raw_request)
     await engine.collective_rpc("set_persistent_hooks", args=(payload,))
     engine._has_persistent_hooks = True
+    prefetch = body.get("prefetch_params")
+    if prefetch:
+        await engine.collective_rpc("prefetch_parameters", args=(prefetch,))
     return JSONResponse({"status": "ok", "count": len(hooks)})
 
 

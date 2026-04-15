@@ -32,6 +32,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_DTYPE_LIST = [
+    torch.float32, torch.float16, torch.bfloat16,
+    torch.int64, torch.int32, torch.int16, torch.int8, torch.float64,
+]
+_DTYPE_TO_IDX_MAP = {d: i for i, d in enumerate(_DTYPE_LIST)}
+
+
+def _dtype_to_idx(dtype: torch.dtype) -> int:
+    return _DTYPE_TO_IDX_MAP.get(dtype, 0)
+
 _ZSTD_COMPRESSOR = zstd.ZstdCompressor(level=1)
 
 
@@ -353,6 +363,7 @@ def _hook_inner(
                 ctx.layer_idx = layer_idx
                 ctx.seq_len = seq_len
                 ctx.model = runner.model
+                ctx._prefetched = extension._prefetched_params
 
                 result = hook.fn(ctx, hook_hidden[start:end])
 
@@ -516,6 +527,7 @@ def _pre_hook_inner(
             hctx.layer_idx = layer_idx
             hctx.seq_len = seq_len
             hctx.model = runner.model
+            hctx._prefetched = extension._prefetched_params
 
             result = hook.fn(hctx, working[start:end])
             if result is not None:
@@ -865,3 +877,91 @@ class HiddenStatesExtension:
         """Remove persistent hooks and all accumulated contexts."""
         self._persistent_hooks = []
         self._persistent_hook_contexts = {}
+
+    # ------------------------------------------------------------------
+    # Parameter prefetch (called via collective_rpc — all ranks in sync)
+    # ------------------------------------------------------------------
+
+    _prefetched_params: dict[str, torch.Tensor] = {}
+
+    def prefetch_parameters(self, names: list[str]) -> None:
+        """Pre-fetch and gather parameters across TP and PP ranks.
+
+        Safe to call PP collectives here because ``collective_rpc``
+        runs on all ranks simultaneously.  Results are stored in
+        ``_prefetched_params`` for use by ``HookContext.get_parameter``.
+        """
+        import torch.distributed as dist
+
+        from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+        from vllm.model_executor.models.utils import PPMissingLayer
+
+        model = self.model_runner.model
+        tp_group = get_tp_group()
+        pp_group = get_pp_group()
+
+        for name in names:
+            # Traverse to find the parameter.
+            obj: Any = model
+            parts = name.split(".")
+            is_local = True
+            for attr in parts:
+                obj = getattr(obj, attr)
+                if isinstance(obj, PPMissingLayer):
+                    is_local = False
+                    break
+
+            param: torch.Tensor | None = None
+            if is_local:
+                param = torch.as_tensor(obj)
+
+                # TP gather.
+                module: Any = model
+                for attr in parts[:-1]:
+                    module = getattr(module, attr)
+                tp_size = getattr(module, "tp_size", 1)
+                if tp_size > 1:
+                    gathered = [torch.empty_like(param) for _ in range(tp_size)]
+                    dist.all_gather(gathered, param, group=tp_group.device_group)
+                    gather_dim = getattr(module, "gather_dim", 0)
+                    param = torch.cat(gathered, dim=gather_dim)
+
+            # PP broadcast — safe here because all ranks are in this RPC.
+            if pp_group.world_size > 1:
+                has_it = torch.tensor(
+                    [1 if is_local else 0], device="cuda", dtype=torch.int32
+                )
+                all_has = [
+                    torch.zeros_like(has_it) for _ in range(pp_group.world_size)
+                ]
+                dist.all_gather(all_has, has_it, group=pp_group.device_group)
+                source_pp = next(
+                    i for i, t in enumerate(all_has) if t.item() == 1
+                )
+                source_global = pp_group.ranks[source_pp]
+
+                if param is None:
+                    # Receive shape + dtype.
+                    meta = torch.zeros(3, device="cuda", dtype=torch.int64)
+                    dist.broadcast(meta, src=source_global, group=pp_group.device_group)
+                    ndim = int(meta[0].item())
+                    dtype = _DTYPE_LIST[int(meta[1].item())]
+                    shape_t = torch.zeros(ndim, device="cuda", dtype=torch.int64)
+                    dist.broadcast(shape_t, src=source_global, group=pp_group.device_group)
+                    shape = tuple(int(s) for s in shape_t.tolist())
+                    param = torch.empty(shape, device="cuda", dtype=dtype)
+                else:
+                    meta = torch.tensor(
+                        [param.ndim, _dtype_to_idx(param.dtype), 0],
+                        device="cuda", dtype=torch.int64,
+                    )
+                    dist.broadcast(meta, src=source_global, group=pp_group.device_group)
+                    shape_t = torch.tensor(
+                        list(param.shape), device="cuda", dtype=torch.int64,
+                    )
+                    dist.broadcast(shape_t, src=source_global, group=pp_group.device_group)
+
+                dist.broadcast(param, src=source_global, group=pp_group.device_group)
+
+            assert param is not None, f"Parameter {name!r} not found on any rank"
+            self._prefetched_params[name] = param

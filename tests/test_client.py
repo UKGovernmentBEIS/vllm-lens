@@ -49,6 +49,56 @@ def test_capture_layers(vllm_server):
 
 
 # ---------------------------------------------------------------------------
+# ctx.get_parameter
+# ---------------------------------------------------------------------------
+
+
+def test_get_parameter_returns_lm_head(vllm_server):
+    """ctx.get_parameter('lm_head.weight') should return the full unembedding matrix."""
+    client = _make_client(vllm_server)
+
+    def check_param(ctx, h):
+        weight = ctx.get_parameter("lm_head.weight")
+        ctx.saved["shape"] = list(weight.shape)
+        ctx.saved["dtype"] = str(weight.dtype)
+        return None
+
+    hook = Hook(fn=check_param, layer_indices=[31])  # last layer
+    output = client.generate("Hello", max_tokens=1, hooks=[hook])
+    assert output.hook_results is not None
+    shape = output.hook_results["0"]["shape"]
+    # Llama 8B vocab size is 128256, hidden dim 4096
+    assert shape[0] == 128256, f"Expected full vocab size, got {shape[0]}"
+    assert shape[1] == 4096, f"Expected hidden dim 4096, got {shape[1]}"
+
+
+def test_prefetch_parameter(vllm_server):
+    """Prefetched parameters should be accessible from any layer."""
+    client = _make_client(vllm_server)
+    client.clear_hooks()
+
+    def check_prefetched(ctx, h):
+        weight = ctx.get_parameter("lm_head.weight")
+        ctx.saved["shape"] = list(weight.shape)
+        return None
+
+    # Hook on layer 0 (early layer) but access lm_head (last PP stage).
+    # Without prefetch this would fail on PP>1; with prefetch it works.
+    hook = Hook(fn=check_prefetched, layer_indices=[0])
+    client.register_hooks([hook], prefetch_params=["lm_head.weight"])
+    client.generate("Hello", max_tokens=1)
+
+    results = client.collect_hook_results()
+    assert len(results) >= 1
+    for req_id, hook_data in results.items():
+        shape = hook_data["0"]["shape"]
+        assert shape[0] == 128256
+        assert shape[1] == 4096
+
+    client.clear_hooks()
+
+
+# ---------------------------------------------------------------------------
 # Per-request hooks
 # ---------------------------------------------------------------------------
 

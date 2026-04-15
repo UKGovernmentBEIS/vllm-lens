@@ -176,11 +176,23 @@ class VLLMLensClient:
     # Persistent hooks
     # ------------------------------------------------------------------
 
-    def register_hooks(self, hooks: list[Hook]) -> None:
-        """Register persistent hooks (appends to existing)."""
+    def register_hooks(
+        self,
+        hooks: list[Hook],
+        prefetch_params: list[str] | None = None,
+    ) -> None:
+        """Register persistent hooks (appends to existing).
+
+        Args:
+            hooks: Hooks to register.
+            prefetch_params: Parameter names to pre-fetch across all ranks
+                (TP + PP).  Needed for ``ctx.get_parameter()`` with PP.
+        """
+        body: dict[str, Any] = {"hooks": [h.model_dump() for h in hooks]}
+        if prefetch_params:
+            body["prefetch_params"] = prefetch_params
         resp = self._session.post(
-            f"{self.base_url}/v1/hooks/register",
-            json={"hooks": [h.model_dump() for h in hooks]},
+            f"{self.base_url}/v1/hooks/register", json=body,
         ).json()
         if resp.get("status") != "ok":
             raise RuntimeError(f"Failed to register hooks: {resp}")
