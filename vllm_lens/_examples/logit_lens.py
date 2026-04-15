@@ -57,10 +57,13 @@ def run_logit_lens(
         return None
 
     hook = Hook(fn=project_hook, layer_indices=all_layers)
+    # max_tokens=1 so there's a single prefill pass and token count
+    # matches between the echo'd logprobs and the hook's captured data.
     output = client.generate(
-        prompt, hooks=[hook], logprobs=5, echo=True,
+        prompt, max_tokens=1, hooks=[hook], logprobs=5, echo=True,
     )
 
+    # Exclude the generated token — we only have hook data for prompt tokens.
     tokens = output.logprobs["tokens"][:-1] if output.logprobs else []
     print(f"Generated: {output.text!r}")
     print(f"Tokens ({len(tokens)}): {tokens}\n")
