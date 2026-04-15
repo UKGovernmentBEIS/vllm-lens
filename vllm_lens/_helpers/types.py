@@ -104,17 +104,6 @@ class SteeringVector(BaseModel):
         return self._layer_index_map_cache  # type: ignore[reportAttributeAccessIssue]
 
 
-_IDX_TO_DTYPE: dict[int, torch.dtype] = {
-    0: torch.float32,
-    1: torch.float16,
-    2: torch.bfloat16,
-    3: torch.int64,
-    4: torch.int32,
-    5: torch.int16,
-    6: torch.int8,
-    7: torch.float64,
-}
-
 
 class HookContext:
     """Mutable context passed to hook functions during forward passes.
@@ -136,13 +125,11 @@ class HookContext:
         dispatcher.  Useful for accessing ``lm_head``, layer norm, etc."""
 
     def get_parameter(self, name: str) -> torch.Tensor:
-        """Get a model parameter by name, handling TP and PP transparently.
+        """Get a model parameter by name, auto-gathering across TP ranks.
 
-        - **TP**: auto-gathers sharded parameters across the TP group.
-        - **PP**: broadcasts from the PP rank that owns the parameter.
-
-        Uses vLLM's TP and PP process groups so collectives only involve
-        the correct subset of ranks (no global all-gather that would hang).
+        With pipeline parallelism, the parameter must be on this PP
+        stage.  In practice, hook a layer on the same PP stage as the
+        parameter (e.g. hook the last layer to access ``lm_head.weight``).
 
         Example::
 
@@ -151,84 +138,34 @@ class HookContext:
         """
         import torch.distributed as dist
 
-        from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+        from vllm.distributed.parallel_state import get_tp_group
         from vllm.model_executor.models.utils import PPMissingLayer
 
-        # Traverse dotted name. If we hit PPMissingLayer, this rank
-        # doesn't own the parameter — we'll receive it via PP broadcast.
         obj: Any = self.model
         parts = name.split(".")
-        is_local = True
         for attr in parts:
             obj = getattr(obj, attr)
             if isinstance(obj, PPMissingLayer):
-                is_local = False
-                break
-
-        param: torch.Tensor | None = None
-        if is_local:
-            local_param = torch.as_tensor(obj)
-            param = local_param
-
-            # TP gather if sharded — uses TP process group only.
-            tp_group = get_tp_group()
-            module: Any = self.model
-            for attr in parts[:-1]:
-                module = getattr(module, attr)
-            tp_size = getattr(module, "tp_size", 1)
-            if tp_size > 1:
-                gathered = [torch.empty_like(local_param) for _ in range(tp_size)]
-                dist.all_gather(gathered, local_param, group=tp_group.device_group)
-                gather_dim = getattr(module, "gather_dim", 0)
-                param = torch.cat(gathered, dim=gather_dim)
-
-        # PP broadcast: use PP process group so only PP ranks participate.
-        pp_group = get_pp_group()
-        if pp_group.world_size > 1:
-            # Find which PP rank has the parameter.
-            has_it = torch.tensor(
-                [1 if is_local else 0], device="cuda", dtype=torch.int32
-            )
-            all_has = [
-                torch.zeros_like(has_it) for _ in range(pp_group.world_size)
-            ]
-            dist.all_gather(all_has, has_it, group=pp_group.device_group)
-            source_pp_rank = next(
-                i for i, t in enumerate(all_has) if t.item() == 1
-            )
-            # Convert PP-local rank to global rank for broadcast.
-            source_global = pp_group.ranks[source_pp_rank]
-
-            _dtype_to_idx = {v: k for k, v in _IDX_TO_DTYPE.items()}
-
-            if param is None:
-                # Receive shape + dtype, allocate, then receive data.
-                meta = torch.zeros(2, device="cuda", dtype=torch.int64)
-                dist.broadcast(meta, src=source_global, group=pp_group.device_group)
-                ndim = int(meta[0].item())
-                dtype_idx = int(meta[1].item())
-                shape_t = torch.zeros(ndim, device="cuda", dtype=torch.int64)
-                dist.broadcast(shape_t, src=source_global, group=pp_group.device_group)
-                shape = tuple(int(s) for s in shape_t.tolist())
-                param = torch.empty(
-                    shape, device="cuda", dtype=_IDX_TO_DTYPE[dtype_idx]
+                raise AttributeError(
+                    f"Parameter {name!r} is not on this pipeline-parallel "
+                    f"stage. Hook a layer on the same PP stage as the "
+                    f"target parameter (e.g. last layer for lm_head)."
                 )
-            else:
-                # Send shape + dtype metadata.
-                meta = torch.tensor(
-                    [param.ndim, _dtype_to_idx.get(param.dtype, 0)],
-                    device="cuda",
-                    dtype=torch.int64,
-                )
-                dist.broadcast(meta, src=source_global, group=pp_group.device_group)
-                shape_t = torch.tensor(
-                    list(param.shape), device="cuda", dtype=torch.int64
-                )
-                dist.broadcast(shape_t, src=source_global, group=pp_group.device_group)
 
-            dist.broadcast(param, src=source_global, group=pp_group.device_group)
+        param = torch.as_tensor(obj)
 
-        assert param is not None, f"Parameter {name!r} not found on any rank"
+        # TP gather if sharded.
+        tp_group = get_tp_group()
+        module: Any = self.model
+        for attr in parts[:-1]:
+            module = getattr(module, attr)
+        tp_size = getattr(module, "tp_size", 1)
+        if tp_size > 1:
+            gathered = [torch.empty_like(param) for _ in range(tp_size)]
+            dist.all_gather(gathered, param, group=tp_group.device_group)
+            gather_dim = getattr(module, "gather_dim", 0)
+            param = torch.cat(gathered, dim=gather_dim)
+
         return param
 
 
