@@ -49,11 +49,9 @@ def run_logit_lens(
             normed = norm(h) if norm is not None else h
             logits = normed.float() @ weight.float().T  # (seq_len, vocab_size)
             topk = logits.topk(top_k, dim=-1)
-        if "top_ids" not in ctx.saved:
-            ctx.saved["top_ids"] = []
-            ctx.saved["top_logits"] = []
-        ctx.saved["top_ids"].append(topk.indices.cpu())
-        ctx.saved["top_logits"].append(topk.values.float().cpu())
+        # Key by layer index so PP merge preserves ordering.
+        ctx.saved[f"ids_{ctx.layer_idx}"] = topk.indices.cpu()
+        ctx.saved[f"logits_{ctx.layer_idx}"] = topk.values.float().cpu()
         return None
 
     hook = Hook(fn=project_hook, layer_indices=all_layers)
@@ -71,8 +69,10 @@ def run_logit_lens(
     print(f"Tokens ({len(tokens)}): {tokens}\n")
 
     assert output.hook_results is not None, "No hook results returned"
-    top_ids = output.hook_results["0"]["top_ids"]
-    top_logits = output.hook_results["0"]["top_logits"]
+    saved = output.hook_results["0"]
+    # Reconstruct ordered lists from layer-keyed results.
+    top_ids = [saved[f"ids_{i}"] for i in range(N_LAYERS)]
+    top_logits = [saved[f"logits_{i}"] for i in range(N_LAYERS)]
 
     return {
         "tokens": tokens,
