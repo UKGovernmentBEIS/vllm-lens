@@ -104,13 +104,15 @@ llm.clear_hooks()
 Over HTTP (no dev mode required):
 
 ```
-POST /v1/hooks/register   {"hooks": [<Hook json>...]}
-POST /v1/completions      (hooks fire automatically)
-POST /v1/hooks/collect    → {"results": {<req_id>: {<hook_idx>: <ctx.saved>}}}
+POST /v1/hooks/register          {"hooks": [...], "prefetch_params": [...]}
+POST /v1/completions             (hooks fire automatically)
+POST /v1/hooks/collect           → {"results": {<req_id>: ...}}
 POST /v1/hooks/clear
+POST /v1/hooks/prefetch          {"params": ["lm_head.weight", ...]}
+POST /v1/hooks/clear_prefetched
 ```
 
-Multiple `register` calls append hooks. `collect` is non-destructive. `clear` removes hooks and all accumulated results.
+Multiple `register` calls append hooks. `collect` is non-destructive. `clear` removes hooks and all accumulated results. Pre-fetched parameters persist independently.
 
 ### Accessing model parameters from hooks
 
@@ -124,13 +126,21 @@ def logit_lens(ctx, h):
     return None
 ```
 
-With pipeline parallelism, parameters may live on a different PP stage. Pre-fetch them at registration time so they're available on all ranks:
+With pipeline parallelism, parameters may live on a different PP stage. Pre-fetch them so they're available on all ranks:
 
 ```python
+# Standalone — works with both per-request and persistent hooks
+client.prefetch_params(["lm_head.weight"])
+output = client.generate(prompt, hooks=[hook])  # hook can use lm_head.weight
+
+# Or at registration time for persistent hooks
 client.register_hooks([hook], prefetch_params=["lm_head.weight"])
-# or
-llm.register_hooks([hook], prefetch_params=["lm_head.weight"])
+
+# Clean up when done
+client.clear_prefetched()
 ```
+
+Pre-fetched parameters persist until explicitly cleared. When the parameter already exists locally (TP=1, same PP stage), no copy is made.
 
 ### Causal tracing (activation patching)
 
