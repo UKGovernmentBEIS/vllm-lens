@@ -33,6 +33,33 @@ def test_model_auto_detected(vllm_server):
     assert "Llama" in client.model or "llama" in client.model
 
 
+def test_chat_returns_text(vllm_server):
+    client = _make_client(vllm_server)
+    output = client.chat(
+        [{"role": "user", "content": "Say hello in one word."}],
+        max_tokens=5,
+    )
+    assert isinstance(output.text, str)
+    assert len(output.text) > 0
+
+
+def test_chat_with_hooks(vllm_server):
+    client = _make_client(vllm_server)
+
+    def capture(ctx, h):
+        ctx.saved["mean"] = h.mean().item()
+        return None
+
+    hook = Hook(fn=capture, layer_indices=[15])
+    output = client.chat(
+        [{"role": "user", "content": "What is 2+2?"}],
+        max_tokens=5,
+        hooks=[hook],
+    )
+    assert output.hook_results is not None
+    assert "mean" in output.hook_results["0"]
+
+
 # ---------------------------------------------------------------------------
 # Activation capture
 # ---------------------------------------------------------------------------

@@ -92,6 +92,51 @@ class VLLMLensClient:
             self._model = resp["data"][0]["id"]
         return self._model
 
+    def _build_xargs(
+        self,
+        hooks: list[Hook] | None,
+        capture_layers: list[int] | None,
+        steering_vectors: list[SteeringVector] | None,
+    ) -> dict[str, str]:
+        xargs: dict[str, str] = {}
+        if capture_layers is not None:
+            xargs["output_residual_stream"] = json.dumps(capture_layers)
+        if hooks is not None:
+            xargs["apply_hooks"] = json.dumps([h.model_dump() for h in hooks])
+        if steering_vectors is not None:
+            xargs["apply_steering_vectors"] = json.dumps(
+                [sv.model_dump() for sv in steering_vectors]
+            )
+        return xargs
+
+    def _parse_response(self, resp: dict[str, Any]) -> GenerateOutput:
+        if "error" in resp:
+            raise RuntimeError(resp["error"].get("message", resp["error"]))
+
+        choice = resp["choices"][0]
+        text = choice.get("message", {}).get("content") or choice.get("text", "")
+
+        activations = None
+        if "activations" in resp:
+            activations = {
+                name: deserialize_tensor(encoded)
+                for name, encoded in resp["activations"].items()
+            }
+
+        hook_results = None
+        if "hook_results" in resp:
+            hook_results = deserialize_hook_results(resp["hook_results"])
+
+        lp = choice.get("logprobs")
+
+        return GenerateOutput(
+            text=text,
+            activations=activations,
+            hook_results=hook_results,
+            logprobs=lp,
+            raw=resp,
+        )
+
     def generate(
         self,
         prompt: str,
@@ -105,18 +150,9 @@ class VLLMLensClient:
         echo: bool = False,
         **kwargs: Any,
     ) -> GenerateOutput:
-        """Generate a completion, optionally with hooks, capture, or steering.
+        """Generate a completion from a raw prompt.
 
-        Args:
-            prompt: The input text.
-            max_tokens: Maximum tokens to generate.
-            temperature: Sampling temperature.
-            hooks: Per-request hooks (results returned in output).
-            capture_layers: Layer indices for activation capture.
-            steering_vectors: Steering vectors to apply.
-            logprobs: Number of top log-probabilities to return.
-            echo: Whether to echo the prompt tokens.
-            **kwargs: Additional fields passed to the request body.
+        Uses ``/v1/completions``. For chat messages, use :meth:`chat`.
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -130,47 +166,50 @@ class VLLMLensClient:
         if echo:
             body["echo"] = True
 
-        vllm_xargs: dict[str, str] = {}
-        if capture_layers is not None:
-            vllm_xargs["output_residual_stream"] = json.dumps(capture_layers)
-        if hooks is not None:
-            vllm_xargs["apply_hooks"] = json.dumps([h.model_dump() for h in hooks])
-        if steering_vectors is not None:
-            vllm_xargs["apply_steering_vectors"] = json.dumps(
-                [sv.model_dump() for sv in steering_vectors]
-            )
-        if vllm_xargs:
-            body["vllm_xargs"] = vllm_xargs
+        xargs = self._build_xargs(hooks, capture_layers, steering_vectors)
+        if xargs:
+            body["vllm_xargs"] = xargs
 
         resp = self._session.post(f"{self.base_url}/v1/completions", json=body).json()
-        if "error" in resp:
-            raise RuntimeError(resp["error"].get("message", resp["error"]))
+        return self._parse_response(resp)
 
-        # Parse response.
-        text = resp["choices"][0]["text"]
+    def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int = 16,
+        temperature: float = 0.0,
+        hooks: list[Hook] | None = None,
+        capture_layers: list[int] | None = None,
+        steering_vectors: list[SteeringVector] | None = None,
+        **kwargs: Any,
+    ) -> GenerateOutput:
+        """Generate a chat completion from a list of messages.
 
-        activations = None
-        if "activations" in resp:
-            activations = {
-                name: deserialize_tensor(encoded)
-                for name, encoded in resp["activations"].items()
-            }
+        Uses ``/v1/chat/completions``.
 
-        hook_results = None
-        if "hook_results" in resp:
-            hook_results = deserialize_hook_results(resp["hook_results"])
+        Example::
 
-        lp = None
-        if "logprobs" in resp.get("choices", [{}])[0]:
-            lp = resp["choices"][0]["logprobs"]
+            output = client.chat([
+                {"role": "user", "content": "What is the capital of France?"}
+            ], hooks=[hook])
+        """
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            **kwargs,
+        }
 
-        return GenerateOutput(
-            text=text,
-            activations=activations,
-            hook_results=hook_results,
-            logprobs=lp,
-            raw=resp,
-        )
+        xargs = self._build_xargs(hooks, capture_layers, steering_vectors)
+        if xargs:
+            body["vllm_xargs"] = xargs
+
+        resp = self._session.post(
+            f"{self.base_url}/v1/chat/completions", json=body
+        ).json()
+        return self._parse_response(resp)
 
     # ------------------------------------------------------------------
     # Persistent hooks
