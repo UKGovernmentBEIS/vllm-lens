@@ -344,7 +344,7 @@ def _hook_inner(
 
             ctx_idx = 0
             for hook in all_hooks:
-                if hook.pre or layer_idx not in hook.layer_indices:
+                if hook.pre or not hook.has_layer(layer_idx):
                     if not hook.pre:
                         ctx_idx += 1
                     continue
@@ -510,7 +510,7 @@ def _pre_hook_inner(
         contexts = ps_ctxs + pr_ctxs
 
         for hi, hook in enumerate(all_hooks):
-            if layer_idx not in hook.layer_indices:
+            if not hook.has_layer(layer_idx):
                 continue
             hctx = contexts[hi]
             hctx.layer_idx = layer_idx

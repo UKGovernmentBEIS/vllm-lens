@@ -95,7 +95,13 @@ class SteeringVector(BaseModel):
     @property
     def layer_index_map(self) -> dict[int, int]:
         """Maps actual model layer index to index into ``activations`` dim-0."""
-        return {li: i for i, li in enumerate(self.layer_indices)}
+        if not hasattr(self, "_layer_index_map_cache"):
+            object.__setattr__(
+                self,
+                "_layer_index_map_cache",
+                {li: i for i, li in enumerate(self.layer_indices)},
+            )
+        return self._layer_index_map_cache  # type: ignore[reportAttributeAccessIssue]
 
 
 _IDX_TO_DTYPE: dict[int, torch.dtype] = {
@@ -269,7 +275,13 @@ class Hook(BaseModel):
 
     @model_validator(mode="after")
     def _check_layers(self) -> Self:
-        """Validate layer_indices is non-empty."""
+        """Validate layer_indices is non-empty and cache as a set."""
         if not self.layer_indices:
             raise ValueError("layer_indices must be non-empty")
+        # Cache as frozenset for O(1) membership tests on the hot path.
+        object.__setattr__(self, "_layer_set", frozenset(self.layer_indices))
         return self
+
+    def has_layer(self, layer_idx: int) -> bool:
+        """O(1) layer membership test (uses cached frozenset)."""
+        return layer_idx in self._layer_set  # type: ignore[reportAttributeAccessIssue]

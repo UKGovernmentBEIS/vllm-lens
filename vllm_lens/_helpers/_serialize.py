@@ -114,16 +114,25 @@ def decode_activations(response_json: dict[str, Any]) -> dict[str, Any]:
     return {name: deserialize_tensor(encoded) for name, encoded in raw.items()}
 
 
+_JSON_SAFE_TYPES = (str, int, float, bool, type(None))
+
+
 def _serialize_value(v: Any) -> Any:
     """Serialize a single value from ``ctx.saved`` for JSON transport."""
     if isinstance(v, torch.Tensor):
         return {"__type__": "tensor", **serialize_tensor(v)}
-    try:
-        json.dumps(v)
+    if isinstance(v, _JSON_SAFE_TYPES):
         return v
-    except (TypeError, ValueError):
-        return {
-            "__type__": "cloudpickle",
+    if isinstance(v, (list, dict)):
+        # Recurse for containers — fall through to cloudpickle if nested
+        # values aren't JSON-safe.
+        try:
+            json.dumps(v)
+            return v
+        except (TypeError, ValueError):
+            pass
+    return {
+        "__type__": "cloudpickle",
             "data": base64.b64encode(cloudpickle.dumps(v)).decode("ascii"),
         }
 
