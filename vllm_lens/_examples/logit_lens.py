@@ -81,8 +81,16 @@ def run_logit_lens(
     }
 
 
-def print_logit_lens(results: dict[str, Any], focus_position: int = -1) -> None:
+def print_logit_lens(
+    results: dict[str, Any],
+    model_name: str,
+    focus_position: int = -1,
+) -> None:
     """Print the logit lens for a specific token position."""
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
     tokens = results["tokens"]
     top_ids = results["top_ids"]
     top_logits = results["top_logits"]
@@ -95,8 +103,8 @@ def print_logit_lens(results: dict[str, Any], focus_position: int = -1) -> None:
         f"Logit lens at position {focus_position} (token: {tokens[focus_position]!r})"
     )
     print("  Predicting the token AFTER this position.\n")
-    print(f"{'Layer':>6s}  {'Top-1 ID':>8s}  {'Logit':>8s}  {'Top-5 IDs'}")
-    print("-" * 60)
+    print(f"{'Layer':>6s}  {'Top-1':>8s}  {'Logit':>8s}  {'Top-5'}")
+    print("-" * 70)
 
     for layer_idx in range(n_layers):
         ids = top_ids[layer_idx]
@@ -105,20 +113,13 @@ def print_logit_lens(results: dict[str, Any], focus_position: int = -1) -> None:
         pos_ids = ids[focus_position]
         pos_logits = logits[focus_position]
 
-        top1_id = pos_ids[0].item()
+        top1 = tokenizer.decode([pos_ids[0].item()])
         top1_logit = pos_logits[0].item()
-        top5 = [str(pos_ids[k].item()) for k in range(pos_ids.shape[0])]
+        top5 = [tokenizer.decode([pos_ids[k].item()]) for k in range(pos_ids.shape[0])]
 
         print(
-            f"L{layer_idx:02d}     {top1_id:>8d}  {top1_logit:>8.2f}  {', '.join(top5)}"
+            f"L{layer_idx:02d}     {top1!r:>8s}  {top1_logit:>8.2f}  {top5}"
         )
-
-    print(
-        "\nNote: Token IDs shown (no tokenizer access over HTTP). "
-        "Load results and decode locally:\n"
-        "  results = torch.load('logit_lens_results.pt')\n"
-        "  tokenizer.decode([id]) for each ID"
-    )
 
 
 def main():
@@ -135,7 +136,7 @@ def main():
 
     client = VLLMLensClient(args.base_url)
     results = run_logit_lens(client, args.prompt)
-    print_logit_lens(results, focus_position=args.position)
+    print_logit_lens(results, client.model, focus_position=args.position)
 
     torch.save(results, "logit_lens_results.pt")
     print("\nResults saved to logit_lens_results.pt")
