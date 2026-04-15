@@ -95,3 +95,16 @@ async def prefetch_params(raw_request: Request):
 async def clear_prefetched(raw_request: Request):
     await _engine_client(raw_request).collective_rpc("clear_prefetched_params")
     return JSONResponse({"status": "ok"})
+
+
+@router.get("/ui/{filename:path}")
+async def serve_ui(filename: str):
+    """Serve static HTML files (e.g. emotion_tracker.html) from CWD."""
+    import os
+
+    from fastapi.responses import FileResponse
+
+    path = os.path.join(os.getcwd(), filename)
+    if not os.path.isfile(path):
+        raise HTTPException(404, f"File not found: {filename}")
+    return FileResponse(path)
