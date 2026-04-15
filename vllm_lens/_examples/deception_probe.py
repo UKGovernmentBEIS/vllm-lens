@@ -155,7 +155,7 @@ def train_probe(
     honest_acts: list[torch.Tensor],
     deceptive_acts: list[torch.Tensor],
     lr: float = 0.01,
-    epochs: int = 200,
+    epochs: int = 20,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Train a logistic regression probe (pure torch).
 
@@ -164,14 +164,16 @@ def train_probe(
 
     Returns (weight, bias) tensors.
     """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     X_honest = torch.stack([a.flatten() for a in honest_acts])
     X_deceptive = torch.stack([a.flatten() for a in deceptive_acts])
 
-    X = torch.cat([X_honest, X_deceptive], dim=0).float()
+    X = torch.cat([X_honest, X_deceptive], dim=0).float().to(device)
     y = torch.cat([
         torch.zeros(len(X_honest)),
         torch.ones(len(X_deceptive)),
-    ])
+    ]).to(device)
 
     # Normalize features.
     mean = X.mean(dim=0)
@@ -180,8 +182,8 @@ def train_probe(
 
     # Logistic regression.
     d = X.shape[1]
-    w = torch.zeros(d, requires_grad=True)
-    b = torch.zeros(1, requires_grad=True)
+    w = torch.zeros(d, device=device, requires_grad=True)
+    b = torch.zeros(1, device=device, requires_grad=True)
     opt = torch.optim.LBFGS([w, b], lr=lr, max_iter=20)
 
     def closure():
@@ -193,14 +195,17 @@ def train_probe(
 
     for epoch in range(epochs):
         loss = opt.step(closure)
-        if epoch % 50 == 0:
-            with torch.no_grad():
-                logits = X @ w + b
-                preds = (logits > 0).float()
-                acc = (preds == y).float().mean()
-                print(f"  Epoch {epoch}: loss={loss:.4f}, acc={acc:.2%}")
+        with torch.no_grad():
+            logits = X @ w + b
+            preds = (logits > 0).float()
+            acc = (preds == y).float().mean()
+        if epoch % 10 == 0:
+            print(f"  Epoch {epoch}: loss={loss:.4f}, acc={acc:.2%}")
+        if loss < 1e-6:
+            print(f"  Converged at epoch {epoch}")
+            break
 
-    return w.detach(), b.detach(), mean, std
+    return w.detach().cpu(), b.detach().cpu(), mean.cpu(), std.cpu()
 
 
 def evaluate_probe(
