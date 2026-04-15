@@ -104,7 +104,6 @@ class SteeringVector(BaseModel):
         return self._layer_index_map_cache  # type: ignore[reportAttributeAccessIssue]
 
 
-
 class HookContext:
     """Mutable context passed to hook functions during forward passes.
 

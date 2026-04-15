@@ -56,7 +56,11 @@ async def collect_hook_results(raw_request: Request):
                     merged[req_id][hook_idx] = {}
                 for key, val in saved.items():
                     existing = merged[req_id][hook_idx]
-                    if key in existing and isinstance(existing[key], list) and isinstance(val, list):
+                    if (
+                        key in existing
+                        and isinstance(existing[key], list)
+                        and isinstance(val, list)
+                    ):
                         existing[key].extend(val)
                     else:
                         existing[key] = val

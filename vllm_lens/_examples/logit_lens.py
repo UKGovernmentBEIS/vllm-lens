@@ -60,7 +60,11 @@ def run_logit_lens(
     # max_tokens=1 so there's a single prefill pass and token count
     # matches between the echo'd logprobs and the hook's captured data.
     output = client.generate(
-        prompt, max_tokens=1, hooks=[hook], logprobs=5, echo=True,
+        prompt,
+        max_tokens=1,
+        hooks=[hook],
+        logprobs=5,
+        echo=True,
     )
 
     # Exclude the generated token — we only have hook data for prompt tokens.
@@ -119,9 +123,7 @@ def print_logit_lens(
         top1_logit = pos_logits[0].item()
         top5 = [tokenizer.decode([pos_ids[k].item()]) for k in range(pos_ids.shape[0])]
 
-        print(
-            f"L{layer_idx:02d}     {top1!r:>8s}  {top1_logit:>8.2f}  {top5}"
-        )
+        print(f"L{layer_idx:02d}     {top1!r:>8s}  {top1_logit:>8.2f}  {top5}")
 
 
 def main():

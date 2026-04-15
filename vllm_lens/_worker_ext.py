@@ -33,14 +33,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DTYPE_LIST = [
-    torch.float32, torch.float16, torch.bfloat16,
-    torch.int64, torch.int32, torch.int16, torch.int8, torch.float64,
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+    torch.int64,
+    torch.int32,
+    torch.int16,
+    torch.int8,
+    torch.float64,
 ]
 _DTYPE_TO_IDX_MAP = {d: i for i, d in enumerate(_DTYPE_LIST)}
 
 
 def _dtype_to_idx(dtype: torch.dtype) -> int:
     return _DTYPE_TO_IDX_MAP.get(dtype, 0)
+
 
 _ZSTD_COMPRESSOR = zstd.ZstdCompressor(level=1)
 
@@ -933,13 +940,9 @@ class HiddenStatesExtension:
                 has_it = torch.tensor(
                     [1 if is_local else 0], device="cuda", dtype=torch.int32
                 )
-                all_has = [
-                    torch.zeros_like(has_it) for _ in range(pp_group.world_size)
-                ]
+                all_has = [torch.zeros_like(has_it) for _ in range(pp_group.world_size)]
                 dist.all_gather(all_has, has_it, group=pp_group.device_group)
-                source_pp = next(
-                    i for i, t in enumerate(all_has) if t.item() == 1
-                )
+                source_pp = next(i for i, t in enumerate(all_has) if t.item() == 1)
                 source_global = pp_group.ranks[source_pp]
 
                 if param is None:
@@ -949,19 +952,26 @@ class HiddenStatesExtension:
                     ndim = int(meta[0].item())
                     dtype = _DTYPE_LIST[int(meta[1].item())]
                     shape_t = torch.zeros(ndim, device="cuda", dtype=torch.int64)
-                    dist.broadcast(shape_t, src=source_global, group=pp_group.device_group)
+                    dist.broadcast(
+                        shape_t, src=source_global, group=pp_group.device_group
+                    )
                     shape = tuple(int(s) for s in shape_t.tolist())
                     param = torch.empty(shape, device="cuda", dtype=dtype)
                 else:
                     meta = torch.tensor(
                         [param.ndim, _dtype_to_idx(param.dtype), 0],
-                        device="cuda", dtype=torch.int64,
+                        device="cuda",
+                        dtype=torch.int64,
                     )
                     dist.broadcast(meta, src=source_global, group=pp_group.device_group)
                     shape_t = torch.tensor(
-                        list(param.shape), device="cuda", dtype=torch.int64,
+                        list(param.shape),
+                        device="cuda",
+                        dtype=torch.int64,
                     )
-                    dist.broadcast(shape_t, src=source_global, group=pp_group.device_group)
+                    dist.broadcast(
+                        shape_t, src=source_global, group=pp_group.device_group
+                    )
 
                 dist.broadcast(param, src=source_global, group=pp_group.device_group)
 

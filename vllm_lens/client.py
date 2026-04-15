@@ -192,7 +192,8 @@ class VLLMLensClient:
         if prefetch_params:
             body["prefetch_params"] = prefetch_params
         resp = self._session.post(
-            f"{self.base_url}/v1/hooks/register", json=body,
+            f"{self.base_url}/v1/hooks/register",
+            json=body,
         ).json()
         if resp.get("status") != "ok":
             raise RuntimeError(f"Failed to register hooks: {resp}")

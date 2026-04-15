@@ -108,7 +108,9 @@ def run_causal_trace(
         return None
 
     capture_hook = Hook(fn=capture_all, layer_indices=all_layers)
-    clean_output = client.generate(prompt, max_tokens=1, hooks=[capture_hook], logprobs=20)
+    clean_output = client.generate(
+        prompt, max_tokens=1, hooks=[capture_hook], logprobs=20
+    )
 
     clean_logprob = get_answer_logprob(clean_output, answer_token)
     print(f"  Clean logprob({answer_token!r}): {clean_logprob:.4f}")
@@ -145,7 +147,10 @@ def run_causal_trace(
 
     corrupt_hook = Hook(fn=corrupt_subject, layer_indices=[0], pre=True)
     corrupted_output = client.generate(
-        prompt, max_tokens=1, hooks=[corrupt_hook], logprobs=20,
+        prompt,
+        max_tokens=1,
+        hooks=[corrupt_hook],
+        logprobs=20,
     )
 
     corrupted_logprob = get_answer_logprob(corrupted_output, answer_token)

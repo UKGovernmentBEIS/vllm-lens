@@ -5,7 +5,6 @@ from vllm_lens import Hook, SteeringVector
 from vllm_lens.client import VLLMLensClient
 
 
-
 def _make_client(vllm_server: str) -> VLLMLensClient:
     return VLLMLensClient(vllm_server)
 

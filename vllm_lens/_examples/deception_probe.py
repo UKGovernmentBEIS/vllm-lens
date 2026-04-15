@@ -127,10 +127,12 @@ def train_probe(
     X_deceptive = torch.stack([a.flatten() for a in deceptive_acts])
 
     X = torch.cat([X_honest, X_deceptive], dim=0).float().to(device)
-    y = torch.cat([
-        torch.zeros(len(X_honest)),
-        torch.ones(len(X_deceptive)),
-    ]).to(device)
+    y = torch.cat(
+        [
+            torch.zeros(len(X_honest)),
+            torch.ones(len(X_deceptive)),
+        ]
+    ).to(device)
 
     # Normalize features.
     mean = X.mean(dim=0)
@@ -204,7 +206,9 @@ def main():
 
     print("=== Deception Detection Probe ===\n")
     print(f"Probe layers: {PROBE_LAYERS}")
-    print(f"Train questions: {len(TRAIN_QUESTIONS)}, Eval questions: {len(EVAL_QUESTIONS)}\n")
+    print(
+        f"Train questions: {len(TRAIN_QUESTIONS)}, Eval questions: {len(EVAL_QUESTIONS)}\n"
+    )
 
     # Generate prompts.
     train_honest = [_make_prompt(HONEST_INSTRUCTION, q) for q in TRAIN_QUESTIONS]

@@ -70,7 +70,11 @@ def _merge_hook_results(
             if hook_idx not in merged:
                 merged[hook_idx] = {}
             for key, val in saved.items():
-                if key in merged[hook_idx] and isinstance(merged[hook_idx][key], list) and isinstance(val, list):
+                if (
+                    key in merged[hook_idx]
+                    and isinstance(merged[hook_idx][key], list)
+                    and isinstance(val, list)
+                ):
                     merged[hook_idx][key].extend(val)
                 else:
                     merged[hook_idx][key] = val
@@ -382,9 +386,7 @@ def _patched_llm_generate(
         self.collective_rpc("clear_hook_data", args=(hid,))
     if has_hooks:
         for output in outputs:
-            self.collective_rpc(
-                "clear_hook_contexts", args=(output.request_id,)
-            )
+            self.collective_rpc("clear_hook_contexts", args=(output.request_id,))
 
     return outputs
 

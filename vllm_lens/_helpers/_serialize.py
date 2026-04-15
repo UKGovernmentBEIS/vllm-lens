@@ -133,8 +133,8 @@ def _serialize_value(v: Any) -> Any:
             pass
     return {
         "__type__": "cloudpickle",
-            "data": base64.b64encode(cloudpickle.dumps(v)).decode("ascii"),
-        }
+        "data": base64.b64encode(cloudpickle.dumps(v)).decode("ascii"),
+    }
 
 
 def _deserialize_value(v: Any) -> Any:
