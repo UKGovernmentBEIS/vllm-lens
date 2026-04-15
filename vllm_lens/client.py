@@ -213,3 +213,25 @@ class VLLMLensClient:
     def clear_hooks(self) -> None:
         """Remove all persistent hooks and accumulated results."""
         self._session.post(f"{self.base_url}/v1/hooks/clear")
+
+    # ------------------------------------------------------------------
+    # Parameter prefetch
+    # ------------------------------------------------------------------
+
+    def prefetch_params(self, names: list[str]) -> None:
+        """Pre-fetch model parameters across all TP/PP ranks.
+
+        Makes the parameters available to ``ctx.get_parameter()`` in
+        hooks on any layer, even with pipeline parallelism.  Parameters
+        persist until :meth:`clear_prefetched` is called.
+        """
+        resp = self._session.post(
+            f"{self.base_url}/v1/hooks/prefetch",
+            json={"params": names},
+        ).json()
+        if resp.get("status") != "ok":
+            raise RuntimeError(f"Failed to prefetch parameters: {resp}")
+
+    def clear_prefetched(self) -> None:
+        """Remove all pre-fetched parameters."""
+        self._session.post(f"{self.base_url}/v1/hooks/clear_prefetched")

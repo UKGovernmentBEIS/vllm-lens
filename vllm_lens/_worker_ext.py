@@ -913,18 +913,20 @@ class HiddenStatesExtension:
 
             param: torch.Tensor | None = None
             if is_local:
-                param = torch.as_tensor(obj)
+                local_t = torch.as_tensor(obj)
 
-                # TP gather.
+                # TP gather if sharded; otherwise reuse the existing tensor.
                 module: Any = model
                 for attr in parts[:-1]:
                     module = getattr(module, attr)
                 tp_size = getattr(module, "tp_size", 1)
                 if tp_size > 1:
-                    gathered = [torch.empty_like(param) for _ in range(tp_size)]
-                    dist.all_gather(gathered, param, group=tp_group.device_group)
+                    gathered = [torch.empty_like(local_t) for _ in range(tp_size)]
+                    dist.all_gather(gathered, local_t, group=tp_group.device_group)
                     gather_dim = getattr(module, "gather_dim", 0)
                     param = torch.cat(gathered, dim=gather_dim)
+                else:
+                    param = local_t  # no copy — reference to existing parameter
 
             # PP broadcast — safe here because all ranks are in this RPC.
             if pp_group.world_size > 1:
@@ -965,3 +967,7 @@ class HiddenStatesExtension:
 
             assert param is not None, f"Parameter {name!r} not found on any rank"
             self._prefetched_params[name] = param
+
+    def clear_prefetched_params(self) -> None:
+        """Remove all pre-fetched parameters."""
+        self._prefetched_params = {}

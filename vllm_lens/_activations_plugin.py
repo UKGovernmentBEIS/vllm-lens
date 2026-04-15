@@ -490,6 +490,19 @@ def _llm_clear_hooks(self: LLM) -> None:
     self._has_persistent_hooks = False  # type: ignore[reportAttributeAccessIssue]
 
 
+def _llm_prefetch_params(self: LLM, names: list[str]) -> None:
+    """Pre-fetch model parameters across all TP/PP ranks."""
+    if not getattr(self, "_hooks_installed", False):
+        self.collective_rpc("install_hooks")
+        self._hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
+    self.collective_rpc("prefetch_parameters", args=(names,))
+
+
+def _llm_clear_prefetched(self: LLM) -> None:
+    """Remove all pre-fetched parameters."""
+    self.collective_rpc("clear_prefetched_params")
+
+
 # ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
@@ -529,6 +542,8 @@ def register() -> None:
     LLM.register_hooks = _llm_register_hooks  # type: ignore[reportAttributeAccessIssue]
     LLM.collect_hook_results = _llm_collect_hook_results  # type: ignore[reportAttributeAccessIssue]
     LLM.clear_hooks = _llm_clear_hooks  # type: ignore[reportAttributeAccessIssue]
+    LLM.prefetch_params = _llm_prefetch_params  # type: ignore[reportAttributeAccessIssue]
+    LLM.clear_prefetched = _llm_clear_prefetched  # type: ignore[reportAttributeAccessIssue]
 
     # Patch OpenAI-compatible response builders so activations survive
     # HTTP serialization.  Wrapped in try/except because these modules

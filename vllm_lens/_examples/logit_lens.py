@@ -57,6 +57,8 @@ def run_logit_lens(
         return None
 
     hook = Hook(fn=project_hook, layer_indices=all_layers)
+    # Prefetch lm_head weight so hooks on any PP stage can access it.
+    client.prefetch_params(["lm_head.weight"])
     # max_tokens=1 so there's a single prefill pass and token count
     # matches between the echo'd logprobs and the hook's captured data.
     output = client.generate(

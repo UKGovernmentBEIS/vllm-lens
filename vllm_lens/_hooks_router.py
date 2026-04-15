@@ -68,3 +68,21 @@ async def clear_hooks(raw_request: Request):
     await engine.collective_rpc("clear_persistent_hooks")
     engine._has_persistent_hooks = False
     return JSONResponse({"status": "ok"})
+
+
+@router.post("/prefetch")
+async def prefetch_params(raw_request: Request):
+    body = await raw_request.json()
+    names = body.get("params")
+    if names is None:
+        raise HTTPException(400, "Missing 'params' in request body")
+    await _engine_client(raw_request).collective_rpc(
+        "prefetch_parameters", args=(names,)
+    )
+    return JSONResponse({"status": "ok", "params": names})
+
+
+@router.post("/clear_prefetched")
+async def clear_prefetched(raw_request: Request):
+    await _engine_client(raw_request).collective_rpc("clear_prefetched_params")
+    return JSONResponse({"status": "ok"})
