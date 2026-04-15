@@ -103,9 +103,8 @@ def run_causal_trace(
     all_layers = list(range(N_LAYERS))
 
     def capture_all(ctx, h):
-        if "parts" not in ctx.saved:
-            ctx.saved["parts"] = []
-        ctx.saved["parts"].append(h.cpu())
+        # Key by layer index for correct ordering with PP.
+        ctx.saved[f"L{ctx.layer_idx}"] = h.cpu()
         return None
 
     capture_hook = Hook(fn=capture_all, layer_indices=all_layers)
@@ -115,16 +114,13 @@ def run_causal_trace(
     print(f"  Clean logprob({answer_token!r}): {clean_logprob:.4f}")
 
     assert clean_output.hook_results is not None
-    clean_parts = clean_output.hook_results["0"]["parts"]
-    # Each part is (seq_len, hidden_dim) from one forward pass.
-    # For max_tokens=1, there's one prefill pass with all prompt tokens.
-    clean_acts = clean_parts[0]  # (n_tokens, hidden_dim) from prefill
-    n_tokens = clean_acts.shape[0]
+    saved = clean_output.hook_results["0"]
+    n_tokens = saved["L0"].shape[0]
     print(f"  Captured {n_tokens} token positions across {N_LAYERS} layers")
 
     # Get tokens and subject positions.
     subject_positions, all_tokens = find_subject_positions(client, prompt, subject)
-    tokens = all_tokens[:-1]  # exclude generated token
+    tokens = all_tokens  # include generated token for display context
     print(f"  Subject positions: {subject_positions}")
     print(f"  Tokens: {tokens}")
 
@@ -159,16 +155,10 @@ def run_causal_trace(
     # --- Step 3: Patch runs — restore clean state at each (layer, pos) ---
     print(f"\n[3/3] Patching {N_LAYERS} layers × {n_tokens} positions...")
 
-    # The capture hook fires once per layer per forward pass, appending
-    # to parts each time. With max_tokens=1 (prefill only), parts has
-    # N_LAYERS entries: parts[i] = activations from layer i, shape
-    # (n_tokens, hidden_dim).
-    clean_per_layer = clean_parts[:N_LAYERS]
-
     patch_logprobs = torch.zeros(N_LAYERS, n_tokens)
 
     for layer_idx in range(N_LAYERS):
-        clean_layer_acts = clean_per_layer[layer_idx]  # (n_tokens, hidden_dim)
+        clean_layer_acts = saved[f"L{layer_idx}"]  # (n_tokens, hidden_dim)
 
         for token_pos in range(n_tokens):
             # Create a hook that: (1) corrupts subject at layer 0 pre-hook,
