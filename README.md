@@ -112,6 +112,26 @@ POST /v1/hooks/clear
 
 Multiple `register` calls append hooks. `collect` is non-destructive. `clear` removes hooks and all accumulated results.
 
+### Accessing model parameters from hooks
+
+Hooks can access model parameters (e.g. `lm_head.weight` for logit lens) via `ctx.get_parameter()`. This auto-gathers across TP ranks:
+
+```python
+def logit_lens(ctx, h):
+    weight = ctx.get_parameter("lm_head.weight")  # full unsharded weight
+    logits = h.float() @ weight.float().T
+    ctx.saved["top_ids"] = logits.topk(5).indices.cpu()
+    return None
+```
+
+With pipeline parallelism, parameters may live on a different PP stage. Pre-fetch them at registration time so they're available on all ranks:
+
+```python
+client.register_hooks([hook], prefetch_params=["lm_head.weight"])
+# or
+llm.register_hooks([hook], prefetch_params=["lm_head.weight"])
+```
+
 ### Causal tracing (activation patching)
 
 The [`causal_tracing.py`](vllm_lens/_examples/causal_tracing.py) example implements ROME-style causal tracing using pre-hooks for embedding corruption and post-hooks for clean-state restoration:
