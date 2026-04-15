@@ -23,11 +23,11 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
-import requests
 import torch
-from vllm_lens import Hook, deserialize_hook_results
+from vllm_lens import Hook
 
-from ._utils import N_LAYERS, completions
+from ._utils import N_LAYERS
+from ..client import VLLMLensClient
 
 # Middle half of layers (following Apollo's default).
 PROBE_LAYERS = list(range(N_LAYERS // 4, 3 * N_LAYERS // 4))
@@ -105,7 +105,7 @@ def _make_prompt(instruction: str, question: str) -> str:
 
 
 def extract_activations(
-    base_url: str,
+    client: VLLMLensClient,
     prompts: list[str],
     layers: list[int],
     max_tokens: int = 30,
@@ -114,9 +114,8 @@ def extract_activations(
 
     Returns a list of tensors, each (n_layers, hidden_dim).
     """
-    # Register persistent hook for bulk extraction.
+
     def capture_mean(ctx, h):
-        """Save mean activation across tokens."""
         key = f"mean_L{ctx.layer_idx}"
         if key not in ctx.saved:
             ctx.saved[key] = []
@@ -124,34 +123,22 @@ def extract_activations(
         return None
 
     hook = Hook(fn=capture_mean, layer_indices=layers)
-    requests.post(
-        f"{base_url}/v1/hooks/register",
-        json={"hooks": [hook.model_dump()]},
-    )
+    client.register_hooks([hook])
 
-    # Run all prompts.
     for prompt in prompts:
-        resp = completions(base_url, prompt, max_tokens=max_tokens)
-        assert "error" not in resp, resp
+        client.generate(prompt, max_tokens=max_tokens)
 
-    # Collect results.
-    collect_resp = requests.post(f"{base_url}/v1/hooks/collect").json()
-    results = collect_resp["results"]
+    results = client.collect_hook_results()
+    client.clear_hooks()
 
-    # Clear hooks.
-    requests.post(f"{base_url}/v1/hooks/clear")
-
-    # Parse: for each request, average the mean activations across
-    # forward passes, then stack layers.
+    # Average mean activations across forward passes, stack layers.
     activations = []
     for req_id in sorted(results.keys()):
-        hook_data = deserialize_hook_results(results[req_id])
-        saved = hook_data["0"]
+        saved = results[req_id]["0"]
         layer_acts = []
         for layer_idx in layers:
             key = f"mean_L{layer_idx}"
             if key in saved:
-                # Average across forward passes (prefill + decode steps).
                 parts = saved[key]
                 if isinstance(parts, list):
                     mean_act = torch.stack(parts).mean(dim=0)
@@ -159,7 +146,7 @@ def extract_activations(
                     mean_act = parts
                 layer_acts.append(mean_act)
         if layer_acts:
-            activations.append(torch.stack(layer_acts))  # (n_layers, hidden_dim)
+            activations.append(torch.stack(layer_acts))
 
     return activations
 
@@ -251,6 +238,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=30)
     args = parser.parse_args()
 
+    client = VLLMLensClient(args.base_url)
+
     print("=== Deception Detection Probe ===\n")
     print(f"Probe layers: {PROBE_LAYERS}")
     print(f"Train pairs: {len(TRAIN_PAIRS)}, Eval pairs: {len(EVAL_PAIRS)}\n")
@@ -264,13 +253,13 @@ def main():
     # Extract training activations.
     print("[1/4] Extracting honest training activations...")
     honest_acts = extract_activations(
-        args.base_url, train_honest, PROBE_LAYERS, args.max_tokens
+        client, train_honest, PROBE_LAYERS, args.max_tokens
     )
     print(f"  Got {len(honest_acts)} activations, shape: {honest_acts[0].shape}")
 
     print("\n[2/4] Extracting deceptive training activations...")
     deceptive_acts = extract_activations(
-        args.base_url, train_deceptive, PROBE_LAYERS, args.max_tokens
+        client, train_deceptive, PROBE_LAYERS, args.max_tokens
     )
     print(f"  Got {len(deceptive_acts)} activations, shape: {deceptive_acts[0].shape}")
 
@@ -281,10 +270,10 @@ def main():
     # Extract eval activations.
     print("\n[4/4] Evaluating on held-out data...")
     eval_honest_acts = extract_activations(
-        args.base_url, eval_honest, PROBE_LAYERS, args.max_tokens
+        client, eval_honest, PROBE_LAYERS, args.max_tokens
     )
     eval_deceptive_acts = extract_activations(
-        args.base_url, eval_deceptive, PROBE_LAYERS, args.max_tokens
+        client, eval_deceptive, PROBE_LAYERS, args.max_tokens
     )
 
     results = evaluate_probe(w, b, mean, std, eval_honest_acts, eval_deceptive_acts)

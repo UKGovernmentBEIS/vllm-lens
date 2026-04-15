@@ -21,19 +21,20 @@ Requires a running vLLM server with vllm-lens installed.
 from __future__ import annotations
 
 import argparse
-import json
 from typing import Any
 
 import torch
-from vllm_lens import Hook, deserialize_hook_results
+from vllm_lens import Hook
 
-from ._utils import N_LAYERS, completions
+from ..client import GenerateOutput, VLLMLensClient
+from ._utils import N_LAYERS
 
 
-def get_answer_logprob(resp: dict, answer_token: str) -> float:
-    """Extract the log-probability of a specific token from the response."""
-    logprobs = resp["choices"][0]["logprobs"]
-    top = logprobs["top_logprobs"][0]
+def get_answer_logprob(output: GenerateOutput, answer_token: str) -> float:
+    """Extract the log-probability of a specific token from the output."""
+    if output.logprobs is None:
+        return -100.0
+    top = output.logprobs["top_logprobs"][0]
     if answer_token in top:
         return top[answer_token]
     # Not in top-k — return a very low logprob.
@@ -41,14 +42,15 @@ def get_answer_logprob(resp: dict, answer_token: str) -> float:
 
 
 def find_subject_positions(
-    base_url: str, prompt: str, subject: str
+    client: VLLMLensClient, prompt: str, subject: str
 ) -> tuple[list[int], list[str]]:
     """Find which token positions correspond to the subject string.
 
     Returns ``(subject_positions, all_tokens)`` where positions are
     0-indexed into the full token list (including BOS).
     """
-    resp = completions(base_url, prompt, logprobs=1, echo=True)
+    output = client.generate(prompt, logprobs=1, echo=True)
+    resp = output.raw
 
     tokens = resp["choices"][0]["logprobs"]["tokens"]
     # tokens[0] is typically BOS (<|begin_of_text|>), rest map to the prompt.
@@ -76,7 +78,7 @@ def find_subject_positions(
 
 
 def run_causal_trace(
-    base_url: str,
+    client: VLLMLensClient,
     prompt: str,
     subject: str,
     answer_token: str,
@@ -107,22 +109,13 @@ def run_causal_trace(
         return None
 
     capture_hook = Hook(fn=capture_all, layer_indices=all_layers)
-    clean_resp = completions(
-        base_url,
-        prompt,
-        logprobs=20,
-        vllm_xargs={
-            "apply_hooks": json.dumps([capture_hook.model_dump()]),
-        },
-    )
-    assert "error" not in clean_resp, clean_resp
+    clean_output = client.generate(prompt, hooks=[capture_hook], logprobs=20)
 
-    clean_logprob = get_answer_logprob(clean_resp, answer_token)
+    clean_logprob = get_answer_logprob(clean_output, answer_token)
     print(f"  Clean logprob({answer_token!r}): {clean_logprob:.4f}")
 
-    # Extract clean activations: list of tensors per layer.
-    hook_results = deserialize_hook_results(clean_resp["hook_results"])
-    clean_parts = hook_results["0"]["parts"]
+    assert clean_output.hook_results is not None
+    clean_parts = clean_output.hook_results["0"]["parts"]
     # Each part is (seq_len, hidden_dim) from one forward pass.
     # For max_tokens=1, there's one prefill pass with all prompt tokens.
     clean_acts = clean_parts[0]  # (n_tokens, hidden_dim) from prefill
@@ -130,7 +123,7 @@ def run_causal_trace(
     print(f"  Captured {n_tokens} token positions across {N_LAYERS} layers")
 
     # Get tokens and subject positions.
-    subject_positions, all_tokens = find_subject_positions(base_url, prompt, subject)
+    subject_positions, all_tokens = find_subject_positions(client, prompt, subject)
     tokens = all_tokens[:-1]  # exclude generated token
     print(f"  Subject positions: {subject_positions}")
     print(f"  Tokens: {tokens}")
@@ -155,19 +148,13 @@ def run_causal_trace(
         return h
 
     corrupt_hook = Hook(fn=corrupt_subject, layer_indices=[0], pre=True)
-    corrupted_resp = completions(
-        base_url,
-        prompt,
-        logprobs=20,
-        vllm_xargs={
-            "apply_hooks": json.dumps([corrupt_hook.model_dump()]),
-        },
+    corrupted_output = client.generate(
+        prompt, hooks=[corrupt_hook], logprobs=20,
     )
-    assert "error" not in corrupted_resp, corrupted_resp
 
-    corrupted_logprob = get_answer_logprob(corrupted_resp, answer_token)
+    corrupted_logprob = get_answer_logprob(corrupted_output, answer_token)
     print(f"  Corrupted logprob({answer_token!r}): {corrupted_logprob:.4f}")
-    print(f"  Generated: {corrupted_resp['choices'][0]['text']!r}")
+    print(f"  Generated: {corrupted_output.text!r}")
 
     # --- Step 3: Patch runs — restore clean state at each (layer, pos) ---
     print(f"\n[3/3] Patching {N_LAYERS} layers × {n_tokens} positions...")
@@ -202,18 +189,12 @@ def run_causal_trace(
                 layer_indices=[layer_idx],
             )
 
-            patched_resp = completions(
-                base_url,
+            patched_output = client.generate(
                 prompt,
+                hooks=[corrupt_hook, patch_hook],
                 logprobs=20,
-                vllm_xargs={
-                    "apply_hooks": json.dumps(
-                        [corrupt_hook.model_dump(), patch_hook.model_dump()]
-                    ),
-                },
             )
-            assert "error" not in patched_resp, patched_resp
-            lp = get_answer_logprob(patched_resp, answer_token)
+            lp = get_answer_logprob(patched_output, answer_token)
             patch_logprobs[layer_idx, token_pos] = lp
 
         print(
@@ -268,8 +249,9 @@ def main():
     parser.add_argument("--noise-scale", type=float, default=3.0)
     args = parser.parse_args()
 
+    client = VLLMLensClient(args.base_url)
     results = run_causal_trace(
-        args.base_url,
+        client,
         args.prompt,
         args.subject,
         args.answer,

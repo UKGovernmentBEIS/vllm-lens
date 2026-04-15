@@ -18,18 +18,17 @@ Requires a running vLLM server with vllm-lens installed.
 from __future__ import annotations
 
 import argparse
-import json
 from typing import Any
 
 import torch
+from vllm_lens import Hook
 
-from vllm_lens import Hook, deserialize_hook_results
-
-from ._utils import N_LAYERS, completions, find_norm
+from ..client import VLLMLensClient
+from ._utils import N_LAYERS, find_norm
 
 
 def run_logit_lens(
-    base_url: str,
+    client: VLLMLensClient,
     prompt: str,
     top_k: int = 5,
 ) -> dict[str, Any]:
@@ -58,23 +57,17 @@ def run_logit_lens(
         return None
 
     hook = Hook(fn=project_hook, layer_indices=all_layers)
-    resp = completions(
-        base_url,
-        prompt,
-        vllm_xargs={
-            "apply_hooks": json.dumps([hook.model_dump()]),
-        },
+    output = client.generate(
+        prompt, hooks=[hook], logprobs=5, echo=True,
     )
-    assert "error" not in resp, resp
 
-    tokens = resp["choices"][0]["logprobs"]["tokens"][:-1]
-    generated = resp["choices"][0]["text"]
-    print(f"Generated: {generated!r}")
+    tokens = output.logprobs["tokens"][:-1] if output.logprobs else []
+    print(f"Generated: {output.text!r}")
     print(f"Tokens ({len(tokens)}): {tokens}\n")
 
-    hook_results = deserialize_hook_results(resp["hook_results"])
-    top_ids = hook_results["0"]["top_ids"]
-    top_logits = hook_results["0"]["top_logits"]
+    assert output.hook_results is not None, "No hook results returned"
+    top_ids = output.hook_results["0"]["top_ids"]
+    top_logits = output.hook_results["0"]["top_logits"]
 
     return {
         "tokens": tokens,
@@ -137,7 +130,8 @@ def main():
     )
     args = parser.parse_args()
 
-    results = run_logit_lens(args.base_url, args.prompt)
+    client = VLLMLensClient(args.base_url)
+    results = run_logit_lens(client, args.prompt)
     print_logit_lens(results, focus_position=args.position)
 
     torch.save(results, "logit_lens_results.pt")
