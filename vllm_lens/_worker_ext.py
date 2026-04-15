@@ -316,24 +316,25 @@ def _hook_inner(
             end = int(query_start_loc[i + 1].item())
             seq_len = end - start
 
-            n_persistent = len(per_req_persistent[i])
-            n_per_req = len(per_req_hooks[i])
-
             # Get-or-create contexts: persistent first, then per-request
-            # (matching all_hooks order above).
-            if n_persistent > 0:
+            # (matching all_hooks order above).  Only count post-hooks
+            # (pre-hooks have their own contexts in _pre_hook_inner).
+            n_persistent_post = sum(1 for h in per_req_persistent[i] if not h.pre)
+            n_per_req_post = sum(1 for h in per_req_hooks[i] if not h.pre)
+
+            if n_persistent_post > 0:
                 if req_id not in extension._persistent_hook_contexts:
                     extension._persistent_hook_contexts[req_id] = [
-                        HookContext() for _ in range(n_persistent)
+                        HookContext() for _ in range(n_persistent_post)
                     ]
                 ps_ctxs = extension._persistent_hook_contexts[req_id]
             else:
                 ps_ctxs = []
 
-            if n_per_req > 0:
+            if n_per_req_post > 0:
                 if req_id not in extension._hook_contexts:
                     extension._hook_contexts[req_id] = [
-                        HookContext() for _ in range(n_per_req)
+                        HookContext() for _ in range(n_per_req_post)
                     ]
                 pr_ctxs = extension._hook_contexts[req_id]
             else:
@@ -341,10 +342,14 @@ def _hook_inner(
 
             contexts = ps_ctxs + pr_ctxs
 
-            for hi, hook in enumerate(all_hooks):
+            ctx_idx = 0
+            for hook in all_hooks:
                 if hook.pre or layer_idx not in hook.layer_indices:
+                    if not hook.pre:
+                        ctx_idx += 1
                     continue
-                ctx = contexts[hi]
+                ctx = contexts[ctx_idx]
+                ctx_idx += 1
                 ctx.layer_idx = layer_idx
                 ctx.seq_len = seq_len
                 ctx.model = runner.model
