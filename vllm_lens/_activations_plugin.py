@@ -50,6 +50,28 @@ _original_register_routers: Callable | None = None
 # ---------------------------------------------------------------------------
 
 
+def _merge_hook_results(
+    raw_list: list[bytes | None] | None,
+) -> dict[str, dict[str, Any]] | None:
+    """Merge hook results from multiple PP ranks.
+
+    Each rank returns ``{hook_idx_str: ctx.saved}``.  We merge by
+    combining the ``saved`` dicts for each hook index across ranks.
+    """
+    if not raw_list:
+        return None
+    merged: dict[str, dict[str, Any]] = {}
+    for raw in raw_list:
+        if raw is None:
+            continue
+        rank_results: dict[str, dict[str, Any]] = pickle.loads(raw)
+        for hook_idx, saved in rank_results.items():
+            if hook_idx not in merged:
+                merged[hook_idx] = {}
+            merged[hook_idx].update(saved)
+    return merged or None
+
+
 def _merge_captured_states(
     states: list[bytes | None] | None,
 ) -> dict[str, Any] | None:
@@ -228,10 +250,9 @@ async def _patched_generate(
                     raw_results = await self.collective_rpc(
                         "get_hook_results", args=(request_id,)
                     )
-                    for raw in raw_results or ():
-                        if raw is not None:
-                            output.hook_results = pickle.loads(raw)
-                            break
+                    merged = _merge_hook_results(raw_results)
+                    if merged is not None:
+                        output.hook_results = merged
             yield output
     finally:
         if steering_vectors is not None:
@@ -343,10 +364,9 @@ def _patched_llm_generate(
         for output in outputs:
             req_id = output.request_id
             raw_results = self.collective_rpc("get_hook_results", args=(req_id,))
-            for raw in raw_results or ():
-                if raw is not None:
-                    output.hook_results = pickle.loads(raw)
-                    break
+            merged = _merge_hook_results(raw_results)
+            if merged is not None:
+                output.hook_results = merged
 
     # Clean up steering data.
     for sid in steering_payloads:

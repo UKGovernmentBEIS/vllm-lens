@@ -11,6 +11,7 @@ import requests
 SERVER_PORT = int(os.environ.get("VLLM_TEST_PORT", "8100"))
 MODEL = os.environ.get("VLLM_TEST_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
 TP_SIZE = int(os.environ.get("VLLM_TEST_TP_SIZE", "1"))
+PP_SIZE = int(os.environ.get("VLLM_TEST_PP_SIZE", "1"))
 BASE_URL = f"http://localhost:{SERVER_PORT}"
 
 # How long to wait for the server to start (seconds).
@@ -52,6 +53,8 @@ def vllm_server():
             str(SERVER_PORT),
             "--tensor-parallel-size",
             str(TP_SIZE),
+            "--pipeline-parallel-size",
+            str(PP_SIZE),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

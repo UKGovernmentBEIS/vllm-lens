@@ -22,7 +22,7 @@ import requests
 import torch
 from vllm_lens import Hook, deserialize_hook_results, deserialize_tensor
 
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+from ._utils import MODEL
 
 PROMPTS = [
     "The future of artificial intelligence is",

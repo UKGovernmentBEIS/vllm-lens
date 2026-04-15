@@ -21,44 +21,11 @@ import argparse
 import json
 from typing import Any
 
-import requests
 import torch
+
 from vllm_lens import Hook, deserialize_hook_results
 
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-N_LAYERS = 32
-
-
-def _completions(
-    base_url: str,
-    prompt: str,
-    max_tokens: int = 1,
-    vllm_xargs: dict[str, Any] | None = None,
-) -> dict:
-    body: dict[str, Any] = {
-        "model": MODEL,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
-        "logprobs": 5,
-        "echo": True,
-    }
-    if vllm_xargs:
-        body["vllm_xargs"] = vllm_xargs
-    return requests.post(f"{base_url}/v1/completions", json=body).json()
-
-
-def _find_norm(model: Any) -> Any:
-    """Find the final layer norm from a vLLM model."""
-    if hasattr(model, "model") and hasattr(model.model, "norm"):
-        return model.model.norm
-    if (
-        hasattr(model, "language_model")
-        and hasattr(model.language_model, "model")
-        and hasattr(model.language_model.model, "norm")
-    ):
-        return model.language_model.model.norm
-    return None
+from ._utils import N_LAYERS, completions, find_norm
 
 
 def run_logit_lens(
@@ -77,8 +44,8 @@ def run_logit_lens(
 
     def project_hook(ctx, h):
         """Project hidden states through norm + unembed weight, save top-k."""
-        weight = ctx.get_parameter("lm_head.weight")  # TP-aware
-        norm = _find_norm(ctx.model)
+        weight = ctx.get_parameter("lm_head.weight")
+        norm = find_norm(ctx.model)
         with torch.no_grad():
             normed = norm(h) if norm is not None else h
             logits = normed.float() @ weight.float().T  # (seq_len, vocab_size)
@@ -91,7 +58,7 @@ def run_logit_lens(
         return None
 
     hook = Hook(fn=project_hook, layer_indices=all_layers)
-    resp = _completions(
+    resp = completions(
         base_url,
         prompt,
         vllm_xargs={
@@ -118,14 +85,6 @@ def run_logit_lens(
     }
 
 
-def decode_token_ids(base_url: str, token_ids: list[int]) -> dict[int, str]:
-    """Decode token IDs to strings by generating with each as a prompt."""
-    # Use a single request with all IDs as prompt tokens and echo
-    # This is a workaround since we don't have direct tokenizer access.
-    # For now, just return the IDs as strings — users can decode locally.
-    return {tid: str(tid) for tid in token_ids}
-
-
 def print_logit_lens(results: dict[str, Any], focus_position: int = -1) -> None:
     """Print the logit lens for a specific token position."""
     tokens = results["tokens"]
@@ -137,8 +96,7 @@ def print_logit_lens(results: dict[str, Any], focus_position: int = -1) -> None:
         focus_position = len(tokens) + focus_position
 
     print(
-        f"Logit lens at position {focus_position} "
-        f"(token: {tokens[focus_position]!r})"
+        f"Logit lens at position {focus_position} (token: {tokens[focus_position]!r})"
     )
     print("  Predicting the token AFTER this position.\n")
     print(f"{'Layer':>6s}  {'Top-1 ID':>8s}  {'Logit':>8s}  {'Top-5 IDs'}")
@@ -155,7 +113,9 @@ def print_logit_lens(results: dict[str, Any], focus_position: int = -1) -> None:
         top1_logit = pos_logits[0].item()
         top5 = [str(pos_ids[k].item()) for k in range(pos_ids.shape[0])]
 
-        print(f"L{layer_idx:02d}     {top1_id:>8d}  {top1_logit:>8.2f}  {', '.join(top5)}")
+        print(
+            f"L{layer_idx:02d}     {top1_id:>8d}  {top1_logit:>8.2f}  {', '.join(top5)}"
+        )
 
     print(
         "\nNote: Token IDs shown (no tokenizer access over HTTP). "
@@ -168,9 +128,7 @@ def print_logit_lens(results: dict[str, Any], focus_position: int = -1) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Logit lens via vllm-lens")
     parser.add_argument("--base-url", default="http://localhost:8000")
-    parser.add_argument(
-        "--prompt", default="The Eiffel Tower is in the city of"
-    )
+    parser.add_argument("--prompt", default="The Eiffel Tower is in the city of")
     parser.add_argument(
         "--position",
         type=int,

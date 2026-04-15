@@ -791,12 +791,11 @@ class HiddenStatesExtension:
     def get_hook_results(self, external_req_id: str) -> bytes | None:
         """Retrieve hook results (``ctx.saved`` dicts) for a request.
 
-        Only rank 0 returns data (gated by ``_should_capture``).
+        Returns from ALL ranks (including PP ranks that own different
+        layers).  The plugin merges results across ranks.
         Matches by ``"{external_req_id}-"`` prefix on ``_hook_contexts``.
         Returns ``{str(hook_index): ctx.saved}`` pickled.
         """
-        if not getattr(self, "_should_capture", True):
-            return None
         prefix = f"{external_req_id}-"
         for req_id in list(self._hook_contexts):
             if req_id.startswith(prefix):
@@ -845,13 +844,11 @@ class HiddenStatesExtension:
     def get_all_hook_results(self) -> bytes | None:
         """Retrieve accumulated persistent hook contexts from all requests.
 
-        Only rank 0 returns data.  Does NOT clear — call
+        Returns from ALL ranks (for PP support).  Does NOT clear — call
         ``clear_persistent_hooks`` explicitly.
 
         Returns pickled ``{internal_req_id: {hook_idx_str: ctx.saved}}``.
         """
-        if not getattr(self, "_should_capture", True):
-            return None
         if not self._persistent_hook_contexts:
             return None
         results: dict[str, dict[str, dict[str, Any]]] = {}

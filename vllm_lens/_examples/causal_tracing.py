@@ -24,30 +24,10 @@ import argparse
 import json
 from typing import Any
 
-import requests
 import torch
 from vllm_lens import Hook, deserialize_hook_results
 
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-N_LAYERS = 32
-
-
-def _completions(
-    base_url: str,
-    prompt: str,
-    max_tokens: int = 1,
-    vllm_xargs: dict[str, Any] | None = None,
-) -> dict:
-    body: dict[str, Any] = {
-        "model": MODEL,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
-        "logprobs": 20,
-    }
-    if vllm_xargs:
-        body["vllm_xargs"] = vllm_xargs
-    return requests.post(f"{base_url}/v1/completions", json=body).json()
+from ._utils import N_LAYERS, completions
 
 
 def get_answer_logprob(resp: dict, answer_token: str) -> float:
@@ -68,17 +48,7 @@ def find_subject_positions(
     Returns ``(subject_positions, all_tokens)`` where positions are
     0-indexed into the full token list (including BOS).
     """
-    resp = requests.post(
-        f"{base_url}/v1/completions",
-        json={
-            "model": MODEL,
-            "prompt": prompt,
-            "max_tokens": 1,
-            "temperature": 0.0,
-            "logprobs": 1,
-            "echo": True,
-        },
-    ).json()
+    resp = completions(base_url, prompt, logprobs=1, echo=True)
 
     tokens = resp["choices"][0]["logprobs"]["tokens"]
     # tokens[0] is typically BOS (<|begin_of_text|>), rest map to the prompt.
@@ -137,9 +107,10 @@ def run_causal_trace(
         return None
 
     capture_hook = Hook(fn=capture_all, layer_indices=all_layers)
-    clean_resp = _completions(
+    clean_resp = completions(
         base_url,
         prompt,
+        logprobs=20,
         vllm_xargs={
             "apply_hooks": json.dumps([capture_hook.model_dump()]),
         },
@@ -184,9 +155,10 @@ def run_causal_trace(
         return h
 
     corrupt_hook = Hook(fn=corrupt_subject, layer_indices=[0], pre=True)
-    corrupted_resp = _completions(
+    corrupted_resp = completions(
         base_url,
         prompt,
+        logprobs=20,
         vllm_xargs={
             "apply_hooks": json.dumps([corrupt_hook.model_dump()]),
         },
@@ -230,9 +202,10 @@ def run_causal_trace(
                 layer_indices=[layer_idx],
             )
 
-            patched_resp = _completions(
+            patched_resp = completions(
                 base_url,
                 prompt,
+                logprobs=20,
                 vllm_xargs={
                     "apply_hooks": json.dumps(
                         [corrupt_hook.model_dump(), patch_hook.model_dump()]

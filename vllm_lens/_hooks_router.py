@@ -39,11 +39,19 @@ async def register_hooks(raw_request: Request):
 @router.post("/collect")
 async def collect_hook_results(raw_request: Request):
     raw_list = await _engine_client(raw_request).collective_rpc("get_all_hook_results")
-    merged: dict[str, Any] = {}
+    # Merge across PP ranks: each rank returns {req_id: {hook_idx: saved}}.
+    merged: dict[str, dict[str, dict[str, Any]]] = {}
     for raw in raw_list or ():
-        if raw is not None:
-            merged = pickle.loads(raw)
-            break
+        if raw is None:
+            continue
+        rank_data: dict[str, dict[str, dict[str, Any]]] = pickle.loads(raw)
+        for req_id, hook_data in rank_data.items():
+            if req_id not in merged:
+                merged[req_id] = {}
+            for hook_idx, saved in hook_data.items():
+                if hook_idx not in merged[req_id]:
+                    merged[req_id][hook_idx] = {}
+                merged[req_id][hook_idx].update(saved)
     serialized = {
         req_id: serialize_hook_results(hook_data)
         for req_id, hook_data in merged.items()
