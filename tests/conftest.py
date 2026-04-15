@@ -10,6 +10,7 @@ import requests
 
 SERVER_PORT = int(os.environ.get("VLLM_TEST_PORT", "8100"))
 MODEL = os.environ.get("VLLM_TEST_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+TP_SIZE = int(os.environ.get("VLLM_TEST_TP_SIZE", "1"))
 BASE_URL = f"http://localhost:{SERVER_PORT}"
 
 # How long to wait for the server to start (seconds).
@@ -49,6 +50,8 @@ def vllm_server():
             "0.9",
             "--port",
             str(SERVER_PORT),
+            "--tensor-parallel-size",
+            str(TP_SIZE),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

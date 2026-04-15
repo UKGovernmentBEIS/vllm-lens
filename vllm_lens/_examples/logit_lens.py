@@ -48,31 +48,17 @@ def _completions(
     return requests.post(f"{base_url}/v1/completions", json=body).json()
 
 
-def _find_unembed_weight_and_norm(model: Any) -> tuple[torch.Tensor, Any]:
-    """Find the unembedding weight matrix and final norm from a vLLM model.
-
-    vLLM's ``ParallelLMHead`` can't be called directly (it raises
-    RuntimeError), so we extract the raw weight and do a manual matmul.
-    """
-    # Find lm_head weight
-    if hasattr(model, "lm_head"):
-        weight = model.lm_head.weight
-    elif hasattr(model, "language_model") and hasattr(model.language_model, "lm_head"):
-        weight = model.language_model.lm_head.weight
-    else:
-        raise AttributeError(f"Cannot find lm_head on {type(model).__name__}")
-
-    # Find final layer norm
-    norm = None
+def _find_norm(model: Any) -> Any:
+    """Find the final layer norm from a vLLM model."""
     if hasattr(model, "model") and hasattr(model.model, "norm"):
-        norm = model.model.norm
-    elif (
+        return model.model.norm
+    if (
         hasattr(model, "language_model")
         and hasattr(model.language_model, "model")
         and hasattr(model.language_model.model, "norm")
     ):
-        norm = model.language_model.model.norm
-    return weight, norm
+        return model.language_model.model.norm
+    return None
 
 
 def run_logit_lens(
@@ -91,7 +77,8 @@ def run_logit_lens(
 
     def project_hook(ctx, h):
         """Project hidden states through norm + unembed weight, save top-k."""
-        weight, norm = _find_unembed_weight_and_norm(ctx.model)
+        weight = ctx.get_parameter("lm_head.weight")  # TP-aware
+        norm = _find_norm(ctx.model)
         with torch.no_grad():
             normed = norm(h) if norm is not None else h
             logits = normed.float() @ weight.float().T  # (seq_len, vocab_size)
