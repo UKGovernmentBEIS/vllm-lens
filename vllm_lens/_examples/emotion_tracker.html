@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Emotion Tracker</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Georgia', serif; background: #fafafa; color: #222;
+         padding: 40px 60px; max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 18px; font-weight: 400; letter-spacing: 0.5px;
+       margin-bottom: 8px; color: #555; }
+  .subtitle { font-size: 13px; color: #999; margin-bottom: 30px; }
+  .chunk { margin-bottom: 32px; }
+  .token-row {
+    display: flex; flex-wrap: nowrap; align-items: baseline;
+    font-family: 'Menlo', 'Consolas', monospace; font-size: 14px;
+    line-height: 1.6; margin-bottom: 2px; padding-left: 80px;
+  }
+  .token { padding: 2px 1px; cursor: default; white-space: pre; }
+  .token:hover { background: #f0f0f0; border-radius: 2px; }
+  .heatmap-block { display: flex; flex-direction: column; gap: 1px; margin-bottom: 4px; }
+  .heatmap-row { display: flex; flex-wrap: nowrap; align-items: center; height: 28px; }
+  .heatmap-label {
+    width: 76px; font-family: 'Menlo', monospace; font-size: 9px;
+    color: #999; text-align: right; padding-right: 6px; flex-shrink: 0;
+    line-height: 10px;
+  }
+  .heatmap-cell { height: 10px; flex-shrink: 0; transition: opacity 0.15s; }
+  .heatmap-row:hover .heatmap-cell { opacity: 0.85; }
+  .tooltip {
+    position: fixed; background: #333; color: #fff;
+    font-family: 'Menlo', monospace; font-size: 11px;
+    padding: 6px 10px; border-radius: 4px; pointer-events: none;
+    z-index: 100; display: none; line-height: 1.5; max-width: 220px;
+    white-space: pre;
+  }
+  .legend {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 30px;
+    font-family: 'Menlo', monospace; font-size: 10px; color: #999;
+  }
+  .legend-bar { width: 200px; height: 10px; border-radius: 2px; }
+  .speaker-label {
+    font-family: 'Menlo', monospace; font-size: 11px; color: #999;
+    margin-bottom: 4px; padding-left: 80px; letter-spacing: 0.5px;
+  }
+  .chat-input {
+    display: flex; gap: 8px; margin-top: 30px; padding-left: 80px;
+  }
+  .chat-input input {
+    flex: 1; padding: 8px 12px; font-family: 'Menlo', monospace;
+    font-size: 13px; border: 1px solid #ccc; border-radius: 4px;
+  }
+  .chat-input button {
+    padding: 8px 20px; font-family: 'Menlo', monospace; font-size: 13px;
+    background: #555; color: #fff; border: none; border-radius: 4px;
+    cursor: pointer;
+  }
+  .chat-input button:hover { background: #333; }
+  .chat-input button:disabled { background: #aaa; cursor: wait; }
+  .status { font-family: 'Menlo', monospace; font-size: 11px;
+             color: #999; padding-left: 80px; margin-top: 8px; }
+  .turn { border-bottom: 1px solid #eee; padding-bottom: 16px; margin-bottom: 16px; }
+  .turn:last-of-type { border-bottom: none; }
+  .steering { padding-left: 80px; margin-bottom: 20px; }
+  .steering h3 { font-size: 12px; font-weight: 400; color: #999;
+                  font-family: 'Menlo', monospace; margin-bottom: 8px; }
+  .slider-row { display: flex; align-items: center; gap: 8px; margin: 4px 0;
+                 font-family: 'Menlo', monospace; font-size: 11px; color: #666; }
+  .slider-row label { width: 100px; text-align: right; }
+  .slider-row input[type=range] { width: 160px; }
+  .slider-row .val { width: 40px; }
+</style>
+</head>
+<body>
+<div style="display:flex; align-items:center; gap:12px;">
+  <h1 style="margin:0;">Emotion Tracker</h1>
+  <button onclick="newConversation()" style="background:none; border:1px solid #ddd; color:#999; border-radius:3px; cursor:pointer; font-size:13px; padding:2px 10px; font-family:'Menlo',monospace;">× Clear</button>
+</div>
+<p class="subtitle">Per-token emotion probe activations · diverging blue–gray–red scale</p>
+
+<div class="legend">
+  <span>−1 suppressed</span>
+  <canvas class="legend-bar" id="legendBar" width="200" height="10"></canvas>
+  <span>+1 active</span>
+</div>
+
+<div id="container"></div>
+<div class="tooltip" id="tooltip"></div>
+
+<div class="steering">
+  <h3>Generation Settings</h3>
+  <div class="slider-row">
+    <label>temperature</label>
+    <input type="range" min="0" max="100" value="70" id="tempSlider">
+    <span class="val" id="tempVal">0.70</span>
+  </div>
+  <div class="slider-row">
+    <label>max tokens</label>
+    <input type="range" min="10" max="500" value="100" id="maxTokensSlider">
+    <span class="val" id="maxTokensVal">100</span>
+  </div>
+  <h3 style="margin-top: 12px;">Emotion Steering</h3>
+  <div id="sliders"></div>
+</div>
+
+<div class="chat-input">
+  <input type="text" id="chatInput" placeholder="Type a message..."
+         onkeydown="if(event.key==='Enter') sendMessage()">
+  <button id="sendBtn" onclick="sendMessage()">Send</button>
+</div>
+<div class="status" id="status"></div>
+
+<script>
+const BASE_URL = $BASE_URL;
+const MODEL = $MODEL;
+const EMOTIONS = $EMOTIONS;
+const LAYER = $LAYER;
+const HOOK_JSON = $HOOK_JSON;
+const STEERING_VECTORS = $STEERING_VECTORS;
+
+const container = document.getElementById('container');
+const tooltip = document.getElementById('tooltip');
+
+function valueToColor(v) {
+  const abs = Math.min(Math.abs(v), 1);
+  const mid = 200;
+  if (v >= 0) {
+    const r = Math.round(mid + (255 - mid) * abs);
+    const g = Math.round(mid - mid * abs * 0.7);
+    const b = Math.round(mid - mid * abs * 0.8);
+    return `rgb(${r},${g},${b})`;
+  } else {
+    const r = Math.round(mid - mid * abs * 0.7);
+    const g = Math.round(mid - mid * abs * 0.5);
+    const b = Math.round(mid + (255 - mid) * abs);
+    return `rgb(${r},${g},${b})`;
+  }
+}
+
+function renderTurn(speaker, tokens, probeValues) {
+  const turnDiv = document.createElement('div');
+  turnDiv.className = 'turn';
+  container.appendChild(turnDiv);
+
+  const label = document.createElement('div');
+  label.className = 'speaker-label';
+  label.textContent = speaker + ':';
+  turnDiv.appendChild(label);
+
+  const CHUNK_MAX = 15;
+  const sentences = [[]];
+  tokens.forEach((t, i) => {
+    sentences[sentences.length - 1].push(i);
+    const atNewline = t.includes('\n');
+    const atLimit = sentences[sentences.length - 1].length >= CHUNK_MAX;
+    if ((atNewline || atLimit) && i < tokens.length - 1) {
+      sentences.push([]);
+    }
+  });
+
+  sentences.forEach(indices => {
+    if (indices.length === 0) return;
+    const chunk = document.createElement('div');
+    chunk.className = 'chunk';
+
+    const tokenRow = document.createElement('div');
+    tokenRow.className = 'token-row';
+    indices.forEach(i => {
+      const span = document.createElement('span');
+      span.className = 'token';
+      span.textContent = tokens[i];
+      tokenRow.appendChild(span);
+    });
+    chunk.appendChild(tokenRow);
+    turnDiv.appendChild(chunk);
+
+    const tokenSpans = tokenRow.querySelectorAll('.token');
+    const tokenWidths = Array.from(tokenSpans).map(s => s.offsetWidth);
+    const totalW = tokenWidths.reduce((a, b) => a + b, 0);
+
+    const sparkBlock = document.createElement('div');
+    sparkBlock.className = 'heatmap-block';
+    const sparkH = 28;
+
+    EMOTIONS.forEach(emotion => {
+      const row = document.createElement('div');
+      row.className = 'heatmap-row';
+      row.style.height = sparkH + 'px';
+      const lbl = document.createElement('div');
+      lbl.className = 'heatmap-label';
+      lbl.textContent = emotion;
+      row.appendChild(lbl);
+
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('width', totalW);
+      svg.setAttribute('height', sparkH);
+      svg.style.display = 'block';
+      svg.style.flexShrink = '0';
+
+      const zeroY = sparkH / 2;
+      const zLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      zLine.setAttribute('x1', 0); zLine.setAttribute('x2', totalW);
+      zLine.setAttribute('y1', zeroY); zLine.setAttribute('y2', zeroY);
+      zLine.setAttribute('stroke', '#ddd'); zLine.setAttribute('stroke-width', '0.5');
+      svg.appendChild(zLine);
+
+      let xPos = [];
+      let cx = 0;
+      tokenWidths.forEach(w => { xPos.push(cx + w / 2); cx += w; });
+
+      for (let li = 0; li < indices.length - 1; li++) {
+        const gi0 = indices[li], gi1 = indices[li + 1];
+        const v0 = probeValues[emotion]?.[gi0] || 0;
+        const v1 = probeValues[emotion]?.[gi1] || 0;
+        const y0 = zeroY - v0 * (sparkH / 2) * 0.9;
+        const y1 = zeroY - v1 * (sparkH / 2) * 0.9;
+        const avgV = (v0 + v1) / 2;
+        const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        line.setAttribute('x1', xPos[li]); line.setAttribute('y1', y0);
+        line.setAttribute('x2', xPos[li + 1]); line.setAttribute('y2', y1);
+        line.setAttribute('stroke', valueToColor(avgV));
+        line.setAttribute('stroke-width', '1.5');
+        svg.appendChild(line);
+      }
+
+      tokenWidths.forEach((w, li) => {
+        const gi = indices[li];
+        const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        let rx = 0; for (let j = 0; j < li; j++) rx += tokenWidths[j];
+        rect.setAttribute('x', rx); rect.setAttribute('y', 0);
+        rect.setAttribute('width', w); rect.setAttribute('height', sparkH);
+        rect.setAttribute('fill', 'transparent');
+        rect.addEventListener('mouseenter', (e) => {
+          const allVals = EMOTIONS.map(em => {
+            const val = probeValues[em]?.[gi] || 0;
+            return `${em}: ${val >= 0 ? '+' : ''}${val.toFixed(3)}`;
+          }).join('\n');
+          tooltip.textContent = `"${tokens[gi].trim()}"\n\n${allVals}`;
+          tooltip.style.display = 'block';
+        });
+        rect.addEventListener('mousemove', (e) => {
+          tooltip.style.left = (e.clientX + 12) + 'px';
+          tooltip.style.top = (e.clientY + 12) + 'px';
+        });
+        rect.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
+        svg.appendChild(rect);
+      });
+
+      row.appendChild(svg);
+      sparkBlock.appendChild(row);
+    });
+    chunk.appendChild(sparkBlock);
+  });
+
+  const spacer = document.createElement('div');
+  spacer.style.height = '24px';
+  turnDiv.appendChild(spacer);
+  return turnDiv;
+}
+
+// ── Prefill input with default prompt ─────────────────────
+document.getElementById('chatInput').value = $INITIAL_PROMPT;
+
+// ── Generation settings ──────────────────────────────────
+document.getElementById('tempSlider').addEventListener('input', (ev) => {
+  document.getElementById('tempVal').textContent = (parseInt(ev.target.value) / 100).toFixed(2);
+});
+document.getElementById('maxTokensSlider').addEventListener('input', (ev) => {
+  document.getElementById('maxTokensVal').textContent = ev.target.value;
+});
+
+// ── Steering sliders ──────────────────────────────────────
+const sliderValues = {};
+const slidersEl = document.getElementById('sliders');
+EMOTIONS.forEach(e => {
+  sliderValues[e] = 0;
+  const row = document.createElement('div');
+  row.className = 'slider-row';
+  row.innerHTML = `<label>${e}</label>` +
+    `<input type="range" min="-100" max="100" value="0" id="slider_${e}">` +
+    `<span class="val" id="val_${e}">0.00</span>`;
+  row.querySelector('input').addEventListener('input', (ev) => {
+    const v = parseInt(ev.target.value) / 100;
+    sliderValues[e] = v;
+    document.getElementById('val_' + e).textContent = v.toFixed(2);
+  });
+  slidersEl.appendChild(row);
+});
+
+function buildSteeringPayload() {
+  const vectors = [];
+  EMOTIONS.forEach(e => {
+    if (Math.abs(sliderValues[e]) > 0.001) {
+      const sv = JSON.parse(JSON.stringify(STEERING_VECTORS[e]));
+      sv.scale = sliderValues[e];
+      vectors.push(sv);
+    }
+  });
+  return vectors;
+}
+
+const chatHistory = [];
+
+function newConversation() {
+  chatHistory.length = 0;
+  container.querySelectorAll('.turn').forEach(t => t.remove());
+  document.getElementById('status').textContent = 'Conversation cleared';
+}
+
+async function sendMessage() {
+  const input = document.getElementById('chatInput');
+  const btn = document.getElementById('sendBtn');
+  const status = document.getElementById('status');
+  const prompt = input.value.trim();
+  if (!prompt) return;
+
+  input.value = '';
+  btn.disabled = true;
+
+  chatHistory.push({role: 'user', content: prompt});
+  renderTurn('Human', prompt.split(/(?<=\s)/), {});
+
+  const maxToks = parseInt(document.getElementById('maxTokensSlider').value);
+  const temp = parseInt(document.getElementById('tempSlider').value) / 100;
+  const steeringVecs = buildSteeringPayload();
+  const xargsBase = {};
+  if (steeringVecs.length > 0) {
+    xargsBase.apply_steering_vectors = JSON.stringify(steeringVecs);
+  }
+
+  // Phase 1: Stream text (no hooks — fast).
+  status.textContent = 'Generating text...';
+  const streamTurn = document.createElement('div');
+  streamTurn.className = 'turn';
+  const streamLabel = document.createElement('div');
+  streamLabel.className = 'speaker-label';
+  streamLabel.textContent = 'Assistant:';
+  streamTurn.appendChild(streamLabel);
+  const streamText = document.createElement('div');
+  streamText.className = 'token-row';
+  streamText.style.flexWrap = 'wrap';
+  streamTurn.appendChild(streamText);
+  container.appendChild(streamTurn);
+
+  let fullText = '';
+  try {
+    const streamResp = await fetch(BASE_URL + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: chatHistory,
+        max_tokens: maxToks,
+        temperature: temp,
+        stream: true,
+        vllm_xargs: Object.keys(xargsBase).length > 0 ? xargsBase : undefined
+      })
+    });
+
+    const reader = streamResp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
+        try {
+          const chunk = JSON.parse(line.slice(6));
+          const delta = chunk.choices?.[0]?.delta?.content || '';
+          if (delta) {
+            fullText += delta;
+            if (delta.includes('\n')) {
+              delta.split('\n').forEach((part, i) => {
+                if (i > 0) streamText.appendChild(document.createElement('br'));
+                if (part) {
+                  const span = document.createElement('span');
+                  span.className = 'token';
+                  span.textContent = part;
+                  streamText.appendChild(span);
+                }
+              });
+            } else {
+              const span = document.createElement('span');
+              span.className = 'token';
+              span.textContent = delta;
+              streamText.appendChild(span);
+            }
+          }
+        } catch (e) {}
+      }
+    }
+
+    chatHistory.push({role: 'assistant', content: fullText});
+
+    // Phase 2: Re-run with hooks to get emotion data (non-streaming).
+    status.textContent = 'Analyzing emotions...';
+    const xargsHook = { ...xargsBase, apply_hooks: JSON.stringify(HOOK_JSON) };
+
+    const hookResp = await fetch(BASE_URL + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: chatHistory.slice(0, -1),
+        max_tokens: maxToks,
+        temperature: 0.0,
+        logprobs: true,
+        top_logprobs: 1,
+        vllm_xargs: xargsHook
+      })
+    });
+    const data = await hookResp.json();
+    if (data.error) throw new Error(data.error.message);
+
+    const choice = data.choices[0];
+    const logprobContent = choice.logprobs?.content || [];
+    const tokens = logprobContent.length > 0
+      ? logprobContent.map(lp => lp.token)
+      : (fullText.match(/\S+\s*/g) || [fullText]);
+    const hookResults = data.hook_results;
+
+    const probes = {};
+    EMOTIONS.forEach(e => { probes[e] = []; });
+
+    if (hookResults && hookResults['0']) {
+      const saved = hookResults['0'];
+      const keys = Object.keys(saved).filter(k => k.startsWith('p_'))
+        .sort((a, b) => parseInt(a.split('_')[1]) - parseInt(b.split('_')[1]));
+
+      let allProj = [];
+      keys.forEach(k => {
+        const part = saved[k];
+        if (Array.isArray(part[0])) allProj = allProj.concat(part);
+        else allProj.push(part);
+      });
+
+      if (allProj.length > 0) {
+        let allVals = [];
+        allProj.slice(1).forEach(row => row.forEach(v => allVals.push(Math.abs(v))));
+        allVals.sort((a, b) => a - b);
+        const scale = allVals[Math.floor(allVals.length * 0.99)] || 1;
+
+        const offset = Math.max(0, allProj.length - tokens.length);
+        const n = Math.min(tokens.length, allProj.length - offset);
+        for (let t = 0; t < n; t++) {
+          const pi = offset + t;
+          EMOTIONS.forEach((e, ei) => {
+            probes[e].push(Math.max(-1, Math.min(1, allProj[pi][ei] / scale)));
+          });
+        }
+      }
+    }
+
+    // Replace streaming text with proper tokenized + sparklined version.
+    streamTurn.remove();
+    renderTurn('Assistant', tokens, probes);
+    status.textContent = `Generated ${tokens.length} tokens`;
+  } catch (err) {
+    status.textContent = 'Error: ' + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ── Legend gradient ────────────────────────────────────────
+const lc = document.getElementById('legendBar').getContext('2d');
+for (let x = 0; x < 200; x++) {
+  lc.fillStyle = valueToColor((x / 199) * 2 - 1);
+  lc.fillRect(x, 0, 1, 10);
+}
+</script>
+</body>
+</html>
