@@ -72,15 +72,23 @@ class VLLMLensClient:
     communicates over HTTP.
     """
 
-    def __init__(self, base_url: str, model: str | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        model: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self._model = model
+        self._session = requests.Session()
+        if api_key:
+            self._session.headers["Authorization"] = f"Bearer {api_key}"
 
     @property
     def model(self) -> str:
         """The model name served by the server."""
         if self._model is None:
-            resp = requests.get(f"{self.base_url}/v1/models").json()
+            resp = self._session.get(f"{self.base_url}/v1/models").json()
             self._model = resp["data"][0]["id"]
         return self._model
 
@@ -134,7 +142,7 @@ class VLLMLensClient:
         if vllm_xargs:
             body["vllm_xargs"] = vllm_xargs
 
-        resp = requests.post(f"{self.base_url}/v1/completions", json=body).json()
+        resp = self._session.post(f"{self.base_url}/v1/completions", json=body).json()
         if "error" in resp:
             raise RuntimeError(resp["error"].get("message", resp["error"]))
 
@@ -170,7 +178,7 @@ class VLLMLensClient:
 
     def register_hooks(self, hooks: list[Hook]) -> None:
         """Register persistent hooks (appends to existing)."""
-        resp = requests.post(
+        resp = self._session.post(
             f"{self.base_url}/v1/hooks/register",
             json={"hooks": [h.model_dump() for h in hooks]},
         ).json()
@@ -183,7 +191,7 @@ class VLLMLensClient:
         Returns ``{request_id: {hook_index: ctx.saved}}``.
         Non-destructive — call :meth:`clear_hooks` to clean up.
         """
-        resp = requests.post(f"{self.base_url}/v1/hooks/collect").json()
+        resp = self._session.post(f"{self.base_url}/v1/hooks/collect").json()
         results = resp.get("results", {})
         return {
             req_id: deserialize_hook_results(hook_data)
@@ -192,4 +200,4 @@ class VLLMLensClient:
 
     def clear_hooks(self) -> None:
         """Remove all persistent hooks and accumulated results."""
-        requests.post(f"{self.base_url}/v1/hooks/clear")
+        self._session.post(f"{self.base_url}/v1/hooks/clear")

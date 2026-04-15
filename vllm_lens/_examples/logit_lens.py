@@ -71,7 +71,7 @@ def run_logit_lens(
 
     return {
         "tokens": tokens,
-        "generated": generated,
+        "generated": output.text,
         "top_ids": top_ids,
         "top_logits": top_logits,
         "n_layers": N_LAYERS,

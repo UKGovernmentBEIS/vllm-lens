@@ -27,6 +27,30 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct
 
 All vllm-lens features (activation extraction, steering, hooks) are available immediately via `SamplingParams.extra_args` (offline) or `vllm_xargs` (HTTP API). The plugin also registers custom HTTP endpoints for persistent hook management at `/v1/hooks/*`.
 
+For the HTTP API, a Python client is provided:
+
+```python
+from vllm_lens.client import VLLMLensClient
+from vllm_lens import Hook
+
+client = VLLMLensClient("http://localhost:8000")
+
+# Per-request hook
+output = client.generate("Hello", max_tokens=10, hooks=[hook])
+print(output.hook_results)
+
+# Activation capture
+output = client.generate("Hello", capture_layers=[15])
+print(output.activations)
+
+# Persistent hooks
+client.register_hooks([hook])
+client.generate("prompt 1", max_tokens=10)
+client.generate("prompt 2", max_tokens=10)
+results = client.collect_hook_results()
+client.clear_hooks()
+```
+
 ## Examples
 
 ### Generic hooks
