@@ -17,11 +17,15 @@ import pickle
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
+import cloudpickle
 import torch
 import zstandard as zstd
 
-from vllm_lens._helpers._serialize import serialize_activations
-from vllm_lens._helpers.types import SteeringVector
+from vllm_lens._helpers._serialize import (
+    serialize_activations,
+    serialize_hook_results,
+)
+from vllm_lens._helpers.types import Hook, SteeringVector
 
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 _ZSTD_DECOMPRESSOR = zstd.ZstdDecompressor()
@@ -38,11 +42,43 @@ _original_generate: Callable | None = None
 _original_llm_generate: Callable | None = None
 _original_completion_response: Callable | None = None
 _original_chat_full_generator: Callable | None = None
+_original_register_routers: Callable | None = None
 
 
 # ---------------------------------------------------------------------------
 # PP merge helper
 # ---------------------------------------------------------------------------
+
+
+def _merge_hook_results(
+    raw_list: list[bytes | None] | None,
+) -> dict[str, dict[str, Any]] | None:
+    """Merge hook results from multiple PP ranks.
+
+    Each rank returns ``{hook_idx_str: ctx.saved}``.  For list values
+    (e.g. accumulated activations per layer), concatenates rather than
+    overwrites so data from all PP stages is preserved.
+    """
+    if not raw_list:
+        return None
+    merged: dict[str, dict[str, Any]] = {}
+    for raw in raw_list:
+        if raw is None:
+            continue
+        rank_results: dict[str, dict[str, Any]] = pickle.loads(raw)
+        for hook_idx, saved in rank_results.items():
+            if hook_idx not in merged:
+                merged[hook_idx] = {}
+            for key, val in saved.items():
+                if (
+                    key in merged[hook_idx]
+                    and isinstance(merged[hook_idx][key], list)
+                    and isinstance(val, list)
+                ):
+                    merged[hook_idx][key].extend(val)
+                else:
+                    merged[hook_idx][key] = val
+    return merged or None
 
 
 def _merge_captured_states(
@@ -166,10 +202,21 @@ async def _patched_generate(
             SteeringVector.model_validate(d) for d in json.loads(steering_vectors)
         ]
 
+    # Extract hooks (callables can't survive msgspec).
+    hooks_list = extra.pop("apply_hooks", None)
+    if isinstance(hooks_list, str):
+        hooks_list = [Hook.model_validate(d) for d in json.loads(hooks_list)]
+
     # Allow explicit prefix-cache bypass via extra_args.
     skip_kv_cache = extra.pop("skip_reading_prefix_cache", None)
 
-    needs_hooks = wants_activations or steering_vectors is not None
+    has_persistent = getattr(self, "_has_persistent_hooks", False)
+    needs_hooks = (
+        wants_activations
+        or steering_vectors is not None
+        or hooks_list is not None
+        or has_persistent
+    )
     if needs_hooks or skip_kv_cache:
         # Hooks rely on forward passes firing; prefix-cached tokens skip
         # computation entirely, so force a fresh prefill for this request.
@@ -185,27 +232,45 @@ async def _patched_generate(
             args=(request_id, pickle.dumps(steering_vectors)),
         )
 
+    # Send hook data to workers before the forward pass begins.
+    if hooks_list is not None:
+        await self.collective_rpc(
+            "set_hook_data",
+            args=(request_id, cloudpickle.dumps(hooks_list)),
+        )
+
     assert _original_generate is not None
     try:
         async for output in _original_generate(
             self, prompt, sampling_params, request_id, **kwargs
         ):
-            if output.finished and wants_activations:
-                states = await self.collective_rpc(
-                    "get_captured_states", args=(request_id,)
-                )
-                activations = _merge_captured_states(states)
-                if activations is not None:
-                    n_prompt = len(output.prompt_token_ids)
-                    n_gen = len(output.outputs[0].token_ids)
-                    _trim_activations(activations, n_prompt + n_gen - 1)
-                    output.activations = activations
+            if output.finished:
+                if wants_activations:
+                    states = await self.collective_rpc(
+                        "get_captured_states", args=(request_id,)
+                    )
+                    activations = _merge_captured_states(states)
+                    if activations is not None:
+                        n_prompt = len(output.prompt_token_ids)
+                        n_gen = len(output.outputs[0].token_ids)
+                        _trim_activations(activations, n_prompt + n_gen - 1)
+                        output.activations = activations
+                if hooks_list is not None:
+                    raw_results = await self.collective_rpc(
+                        "get_hook_results", args=(request_id,)
+                    )
+                    merged = _merge_hook_results(raw_results)
+                    if merged is not None:
+                        output.hook_results = merged
             yield output
     finally:
         if steering_vectors is not None:
             await self.collective_rpc("clear_steering_data", args=(request_id,))
         if wants_activations:
             await self.collective_rpc("clear_captured_states", args=(request_id,))
+        if hooks_list is not None:
+            await self.collective_rpc("clear_hook_data", args=(request_id,))
+            await self.collective_rpc("clear_hook_contexts", args=(request_id,))
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +317,18 @@ def _patched_llm_generate(
                 sp.extra_args = {}
             sp.extra_args["_steering_id"] = steering_id
 
+    # Extract hooks per-request (same pattern as steering).
+    hook_payloads: dict[str, bytes] = {}  # hook_id -> cloudpickled hooks
+    for idx, sp in enumerate(params_list):
+        extra = sp.extra_args or {}
+        hooks = extra.pop("apply_hooks", None)
+        if hooks is not None:
+            hook_id = f"_hook_{idx}"
+            hook_payloads[hook_id] = cloudpickle.dumps(hooks)
+            if sp.extra_args is None:
+                sp.extra_args = {}
+            sp.extra_args["_hook_id"] = hook_id
+
     # Pop skip_reading_prefix_cache from extra_args for each request.
     any_skip_kv_cache = False
     for sp in params_list:
@@ -259,7 +336,9 @@ def _patched_llm_generate(
             any_skip_kv_cache = True
 
     has_steering = len(steering_payloads) > 0
-    needs_hooks = wants_activations or has_steering
+    has_hooks = len(hook_payloads) > 0
+    has_persistent = getattr(self, "_has_persistent_hooks", False)
+    needs_hooks = wants_activations or has_steering or has_hooks or has_persistent
     if needs_hooks or any_skip_kv_cache:
         for sp in params_list:
             sp.skip_reading_prefix_cache = True
@@ -271,6 +350,10 @@ def _patched_llm_generate(
     # Send steering data to workers before generation.
     for sid, payload in steering_payloads.items():
         self.collective_rpc("set_steering_data", args=(sid, payload))
+
+    # Send hook data to workers before generation.
+    for hid, payload in hook_payloads.items():
+        self.collective_rpc("set_hook_data", args=(hid, payload))
 
     assert _original_llm_generate is not None
     outputs = _original_llm_generate(self, prompts, sampling_params, **kwargs)
@@ -286,9 +369,24 @@ def _patched_llm_generate(
                 _trim_activations(activations, n_prompt + n_gen - 1)
                 output.activations = activations
 
+    if has_hooks:
+        for output in outputs:
+            req_id = output.request_id
+            raw_results = self.collective_rpc("get_hook_results", args=(req_id,))
+            merged = _merge_hook_results(raw_results)
+            if merged is not None:
+                output.hook_results = merged
+
     # Clean up steering data.
     for sid in steering_payloads:
         self.collective_rpc("clear_steering_data", args=(sid,))
+
+    # Clean up hook data and contexts.
+    for hid in hook_payloads:
+        self.collective_rpc("clear_hook_data", args=(hid,))
+    if has_hooks:
+        for output in outputs:
+            self.collective_rpc("clear_hook_contexts", args=(output.request_id,))
 
     return outputs
 
@@ -299,13 +397,17 @@ def _patched_llm_generate(
 
 
 def _patched_completion_response(self, final_res_batch, *args, **kwargs):
-    """Wrap the completion response builder to inject serialized activations."""
+    """Wrap the completion response builder to inject serialized activations and hook results."""
     assert _original_completion_response is not None
     response = _original_completion_response(self, final_res_batch, *args, **kwargs)
     for res in final_res_batch or ():
         activations = getattr(res, "activations", None)
         if activations is not None:
             response.activations = serialize_activations(activations)
+        hook_results = getattr(res, "hook_results", None)
+        if hook_results is not None:
+            response.hook_results = serialize_hook_results(hook_results)
+        if activations is not None or hook_results is not None:
             break
     return response
 
@@ -339,8 +441,73 @@ async def _patched_chat_full_generator(
         activations = getattr(last_output, "activations", None)
         if activations is not None:
             response.activations = serialize_activations(activations)
+        hook_results = getattr(last_output, "hook_results", None)
+        if hook_results is not None:
+            response.hook_results = serialize_hook_results(hook_results)
 
     return response
+
+
+# ---------------------------------------------------------------------------
+# Persistent hooks — HTTP router
+# ---------------------------------------------------------------------------
+
+
+def _patched_register_routers(app):
+    """Inject vllm-lens hook router after vLLM registers its own routes."""
+    assert _original_register_routers is not None
+    _original_register_routers(app)
+    from vllm_lens._hooks_router import router as hooks_router
+
+    app.include_router(hooks_router)
+
+
+# ---------------------------------------------------------------------------
+# Persistent hooks — offline LLM methods
+# ---------------------------------------------------------------------------
+
+
+def _llm_register_hooks(
+    self: LLM,
+    hooks: list,
+    prefetch_params: list[str] | None = None,
+) -> None:
+    """Register persistent hooks that apply to every subsequent request."""
+    if not getattr(self, "_hooks_installed", False):
+        self.collective_rpc("install_hooks")
+        self._hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
+    self.collective_rpc("set_persistent_hooks", args=(cloudpickle.dumps(hooks),))
+    if prefetch_params:
+        self.collective_rpc("prefetch_parameters", args=(prefetch_params,))
+    self._has_persistent_hooks = True  # type: ignore[reportAttributeAccessIssue]
+
+
+def _llm_collect_hook_results(self: LLM) -> dict:
+    """Collect all accumulated hook results from the worker."""
+    raw_list = self.collective_rpc("get_all_hook_results")
+    for raw in raw_list or ():
+        if raw is not None:
+            return pickle.loads(raw)
+    return {}
+
+
+def _llm_clear_hooks(self: LLM) -> None:
+    """Remove persistent hooks and all accumulated contexts."""
+    self.collective_rpc("clear_persistent_hooks")
+    self._has_persistent_hooks = False  # type: ignore[reportAttributeAccessIssue]
+
+
+def _llm_prefetch_params(self: LLM, names: list[str]) -> None:
+    """Pre-fetch model parameters across all TP/PP ranks."""
+    if not getattr(self, "_hooks_installed", False):
+        self.collective_rpc("install_hooks")
+        self._hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
+    self.collective_rpc("prefetch_parameters", args=(names,))
+
+
+def _llm_clear_prefetched(self: LLM) -> None:
+    """Remove all pre-fetched parameters."""
+    self.collective_rpc("clear_prefetched_params")
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +530,7 @@ def register() -> None:
     global _original_create_engine_config
     global _original_generate, _original_llm_generate
     global _original_completion_response, _original_chat_full_generator
+    global _original_register_routers
 
     from vllm import LLM
     from vllm.engine.arg_utils import EngineArgs
@@ -376,6 +544,13 @@ def register() -> None:
 
     _original_llm_generate = LLM.generate
     LLM.generate = _patched_llm_generate
+
+    # Add persistent hook methods to LLM.
+    LLM.register_hooks = _llm_register_hooks  # type: ignore[reportAttributeAccessIssue]
+    LLM.collect_hook_results = _llm_collect_hook_results  # type: ignore[reportAttributeAccessIssue]
+    LLM.clear_hooks = _llm_clear_hooks  # type: ignore[reportAttributeAccessIssue]
+    LLM.prefetch_params = _llm_prefetch_params  # type: ignore[reportAttributeAccessIssue]
+    LLM.clear_prefetched = _llm_clear_prefetched  # type: ignore[reportAttributeAccessIssue]
 
     # Patch OpenAI-compatible response builders so activations survive
     # HTTP serialization.  Wrapped in try/except because these modules
@@ -401,5 +576,14 @@ def register() -> None:
 
         _original_chat_full_generator = OpenAIServingChat.chat_completion_full_generator
         OpenAIServingChat.chat_completion_full_generator = _patched_chat_full_generator
+    except Exception:
+        pass
+
+    # Patch the serve router registration to inject our hooks API.
+    try:
+        import vllm.entrypoints.serve as _serve_mod
+
+        _original_register_routers = _serve_mod.register_vllm_serve_api_routers
+        _serve_mod.register_vllm_serve_api_routers = _patched_register_routers
     except Exception:
         pass
