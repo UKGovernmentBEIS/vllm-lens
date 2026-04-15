@@ -32,6 +32,10 @@ Execution order per layer:
 4. Steering vectors
 5. Activation capture
 
+### ctx.model access
+
+`HookContext.model` exposes the full model inside hooks, enabling operations like logit lens (projecting hidden states through `lm_head`) without transferring large tensors to the client.
+
 ### Design decisions
 - Persistent hooks fire **before** per-request hooks (base layer → override)
 - Per-request and persistent hooks use separate context storage to avoid cleanup conflicts
@@ -65,5 +69,7 @@ Fixed `output_residual_stream` layer filtering via `vllm_xargs` — string value
 - [x] Persistent capture matches native `output_residual_stream`
 - [x] Pre-hook modification changes output
 - [x] Pre-hook returning None preserves output
+- [x] Pre-hook ctx.saved data is returned in hook_results (regression)
+- [x] output_residual_stream layer filtering parses JSON list correctly (regression)
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)

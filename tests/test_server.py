@@ -331,3 +331,66 @@ def test_pre_hook_none_preserves_output(vllm_server):
 
     assert "error" not in hooked, hooked
     assert hooked["choices"][0]["text"] == baseline["choices"][0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# Regression tests (PR review bugfixes)
+# ---------------------------------------------------------------------------
+
+
+def test_pre_hook_capture_is_returned(vllm_server):
+    """Pre-hook ctx.saved data must be included in hook_results.
+
+    Regression: pre-hook contexts were stored under a 'pre_' key prefix
+    that get_hook_results didn't match, so pre-hook captures were lost.
+    """
+
+    def capture_input(ctx, h):
+        ctx.saved["input_norm"] = h.norm().item()
+        return None
+
+    hook = Hook(fn=capture_input, layer_indices=[0], pre=True)
+    resp = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": "Hello",
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "vllm_xargs": {
+                "apply_hooks": json.dumps([hook.model_dump()]),
+            },
+        },
+    ).json()
+
+    assert "error" not in resp, resp
+    assert "hook_results" in resp, "Pre-hook results missing from response"
+    results = deserialize_hook_results(resp["hook_results"])
+    assert "0" in results
+    assert "input_norm" in results["0"], (
+        f"Pre-hook ctx.saved not returned. Got keys: {list(results['0'].keys())}"
+    )
+
+
+def test_layer_filtering_respects_list(vllm_server):
+    """output_residual_stream=[15] should capture only 1 layer, not all 32.
+
+    Regression: string '[15]' from vllm_xargs was treated as truthy
+    instead of parsed as a JSON list.
+    """
+    resp = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": "Hello",
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "vllm_xargs": {"output_residual_stream": "[15]"},
+        },
+    ).json()
+
+    assert "error" not in resp, resp
+    rs = deserialize_tensor(resp["activations"]["residual_stream"])
+    assert rs.shape[0] == 1, (
+        f"Expected 1 layer (layer 15 only), got {rs.shape[0]} layers"
+    )
