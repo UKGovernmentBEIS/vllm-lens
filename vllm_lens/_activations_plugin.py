@@ -352,9 +352,14 @@ def _patched_llm_generate(
     for sid in steering_payloads:
         self.collective_rpc("clear_steering_data", args=(sid,))
 
-    # Clean up hook data.
+    # Clean up hook data and contexts.
     for hid in hook_payloads:
         self.collective_rpc("clear_hook_data", args=(hid,))
+    if has_hooks:
+        for output in outputs:
+            self.collective_rpc(
+                "clear_hook_contexts", args=(output.request_id,)
+            )
 
     return outputs
 

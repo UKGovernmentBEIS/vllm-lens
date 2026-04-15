@@ -183,20 +183,19 @@ class VLLMLensAPI(VLLMAPI):
         # extra_args → vllm_xargs with serialized steering vectors and hooks
         if extra_args is not None:
             del config.extra_body["extra_args"]  # type: ignore[reportOptionalSubscript]
+            copied = False
             vectors: list[SteeringVector] | None = extra_args.get(
                 "apply_steering_vectors"
             )
             if vectors is not None:
-                # Client-side validation + serialization via Pydantic.
-                # model_dump() invokes @field_serializer to base64-encode tensors.
                 extra_args = dict(extra_args)
+                copied = True
                 extra_args["apply_steering_vectors"] = json.dumps(
                     [sv.model_dump() for sv in vectors]
                 )
             hooks: list[Hook] | None = extra_args.get("apply_hooks")
             if hooks is not None:
-                # model_dump() invokes @field_serializer to cloudpickle fn.
-                if extra_args is vectors:  # not yet copied
+                if not copied:
                     extra_args = dict(extra_args)
                 extra_args["apply_hooks"] = json.dumps([h.model_dump() for h in hooks])
             config.extra_body["vllm_xargs"] = extra_args  # type: ignore[reportOptionalSubscript]

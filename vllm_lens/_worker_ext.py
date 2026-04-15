@@ -479,27 +479,26 @@ def _pre_hook_inner(
         end = int(query_start_loc[i + 1].item())
         seq_len = end - start
 
-        # Get-or-create contexts (reuse same dicts as post-hooks).
+        # Get-or-create contexts under the same req_id as post-hooks
+        # (no prefix) so get_hook_results / clear_hook_contexts can find them.
         n_persistent_pre = sum(1 for h in persistent_hooks if h.pre)
         n_per_req_pre = sum(1 for h in per_req if h.pre)
 
         if n_persistent_pre > 0:
-            key = f"pre_{req_id}"
-            if key not in extension._persistent_hook_contexts:
-                extension._persistent_hook_contexts[key] = [
+            if req_id not in extension._persistent_hook_contexts:
+                extension._persistent_hook_contexts[req_id] = [
                     HookContext() for _ in range(n_persistent_pre)
                 ]
-            ps_ctxs = extension._persistent_hook_contexts[key]
+            ps_ctxs = extension._persistent_hook_contexts[req_id]
         else:
             ps_ctxs = []
 
         if n_per_req_pre > 0:
-            key = f"pre_{req_id}"
-            if key not in extension._hook_contexts:
-                extension._hook_contexts[key] = [
+            if req_id not in extension._hook_contexts:
+                extension._hook_contexts[req_id] = [
                     HookContext() for _ in range(n_per_req_pre)
                 ]
-            pr_ctxs = extension._hook_contexts[key]
+            pr_ctxs = extension._hook_contexts[req_id]
         else:
             pr_ctxs = []
 

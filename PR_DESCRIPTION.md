@@ -46,6 +46,7 @@ Fixed `output_residual_stream` layer filtering via `vllm_xargs` — string value
 ### Examples
 
 - **`causal_tracing.py`** — ROME-style causal tracing (activation patching). Corrupts subject token embeddings via a pre-hook, then systematically restores clean hidden states at each (layer, position) to produce a heatmap of causal importance. Reproduces the classic two-site pattern: early layers at subject tokens + late layers at last token.
+- **`logit_lens.py`** — Projects hidden states at each layer through the unembedding matrix to show how the model's predictions evolve. Uses `ctx.model` to access `lm_head` weights on-GPU, avoiding large activation transfers.
 - **`bench_session_vs_per_request.py`** — Benchmarks persistent vs per-request activation extraction.
 
 ## Test plan
