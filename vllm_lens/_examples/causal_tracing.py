@@ -49,7 +49,7 @@ def find_subject_positions(
     Returns ``(subject_positions, all_tokens)`` where positions are
     0-indexed into the full token list (including BOS).
     """
-    output = client.generate(prompt, logprobs=1, echo=True)
+    output = client.generate(prompt, max_tokens=1, logprobs=1, echo=True)
     resp = output.raw
 
     tokens = resp["choices"][0]["logprobs"]["tokens"]
@@ -109,7 +109,7 @@ def run_causal_trace(
         return None
 
     capture_hook = Hook(fn=capture_all, layer_indices=all_layers)
-    clean_output = client.generate(prompt, hooks=[capture_hook], logprobs=20)
+    clean_output = client.generate(prompt, max_tokens=1, hooks=[capture_hook], logprobs=20)
 
     clean_logprob = get_answer_logprob(clean_output, answer_token)
     print(f"  Clean logprob({answer_token!r}): {clean_logprob:.4f}")
@@ -149,7 +149,7 @@ def run_causal_trace(
 
     corrupt_hook = Hook(fn=corrupt_subject, layer_indices=[0], pre=True)
     corrupted_output = client.generate(
-        prompt, hooks=[corrupt_hook], logprobs=20,
+        prompt, max_tokens=1, hooks=[corrupt_hook], logprobs=20,
     )
 
     corrupted_logprob = get_answer_logprob(corrupted_output, answer_token)
@@ -191,6 +191,7 @@ def run_causal_trace(
 
             patched_output = client.generate(
                 prompt,
+                max_tokens=1,
                 hooks=[corrupt_hook, patch_hook],
                 logprobs=20,
             )
