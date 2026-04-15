@@ -54,7 +54,12 @@ async def collect_hook_results(raw_request: Request):
             for hook_idx, saved in hook_data.items():
                 if hook_idx not in merged[req_id]:
                     merged[req_id][hook_idx] = {}
-                merged[req_id][hook_idx].update(saved)
+                for key, val in saved.items():
+                    existing = merged[req_id][hook_idx]
+                    if key in existing and isinstance(existing[key], list) and isinstance(val, list):
+                        existing[key].extend(val)
+                    else:
+                        existing[key] = val
     serialized = {
         req_id: serialize_hook_results(hook_data)
         for req_id, hook_data in merged.items()

@@ -55,8 +55,9 @@ def _merge_hook_results(
 ) -> dict[str, dict[str, Any]] | None:
     """Merge hook results from multiple PP ranks.
 
-    Each rank returns ``{hook_idx_str: ctx.saved}``.  We merge by
-    combining the ``saved`` dicts for each hook index across ranks.
+    Each rank returns ``{hook_idx_str: ctx.saved}``.  For list values
+    (e.g. accumulated activations per layer), concatenates rather than
+    overwrites so data from all PP stages is preserved.
     """
     if not raw_list:
         return None
@@ -68,7 +69,11 @@ def _merge_hook_results(
         for hook_idx, saved in rank_results.items():
             if hook_idx not in merged:
                 merged[hook_idx] = {}
-            merged[hook_idx].update(saved)
+            for key, val in saved.items():
+                if key in merged[hook_idx] and isinstance(merged[hook_idx][key], list) and isinstance(val, list):
+                    merged[hook_idx][key].extend(val)
+                else:
+                    merged[hook_idx][key] = val
     return merged or None
 
 
