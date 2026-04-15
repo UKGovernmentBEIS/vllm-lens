@@ -107,12 +107,15 @@ class HookContext:
     each call.
     """
 
-    __slots__ = ("layer_idx", "seq_len", "saved")
+    __slots__ = ("layer_idx", "seq_len", "saved", "model")
 
     def __init__(self) -> None:
         self.layer_idx: int = 0
         self.seq_len: int = 0
         self.saved: dict[str, Any] = {}
+        self.model: Any = None
+        """The full model (e.g. ``LlamaForCausalLM``).  Set by the
+        dispatcher.  Useful for accessing ``lm_head``, layer norm, etc."""
 
 
 class Hook(BaseModel):

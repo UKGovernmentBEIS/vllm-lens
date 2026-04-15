@@ -347,6 +347,7 @@ def _hook_inner(
                 ctx = contexts[hi]
                 ctx.layer_idx = layer_idx
                 ctx.seq_len = seq_len
+                ctx.model = runner.model
 
                 result = hook.fn(ctx, hook_hidden[start:end])
 
@@ -510,6 +511,7 @@ def _pre_hook_inner(
             hctx = contexts[hi]
             hctx.layer_idx = layer_idx
             hctx.seq_len = seq_len
+            hctx.model = runner.model
 
             result = hook.fn(hctx, working[start:end])
             if result is not None:
