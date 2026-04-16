@@ -325,13 +325,14 @@ async function sendMessage() {
   const maxToks = parseInt(document.getElementById('maxTokensSlider').value);
   const temp = parseInt(document.getElementById('tempSlider').value) / 100;
   const steeringVecs = buildSteeringPayload();
-  const xargsBase = {};
+  const xargs = { apply_hooks: JSON.stringify(HOOK_JSON) };
   if (steeringVecs.length > 0) {
-    xargsBase.apply_steering_vectors = JSON.stringify(steeringVecs);
+    xargs.apply_steering_vectors = JSON.stringify(steeringVecs);
   }
 
-  // Phase 1: Stream text (no hooks — fast).
-  status.textContent = 'Generating text...';
+  // Single streaming request with hooks — text streams live,
+  // hook results arrive as a final chunk before [DONE].
+  status.textContent = 'Generating...';
   const streamTurn = document.createElement('div');
   streamTurn.className = 'turn';
   const streamLabel = document.createElement('div');
@@ -344,8 +345,10 @@ async function sendMessage() {
   container.appendChild(streamTurn);
 
   let fullText = '';
+  let hookResults = null;
+  let streamTokens = [];
   try {
-    const streamResp = await fetch(BASE_URL + '/v1/chat/completions', {
+    const resp = await fetch(BASE_URL + '/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -354,11 +357,13 @@ async function sendMessage() {
         max_tokens: maxToks,
         temperature: temp,
         stream: true,
-        vllm_xargs: Object.keys(xargsBase).length > 0 ? xargsBase : undefined
+        logprobs: true,
+        top_logprobs: 1,
+        vllm_xargs: xargs
       })
     });
 
-    const reader = streamResp.body.getReader();
+    const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
 
@@ -372,47 +377,28 @@ async function sendMessage() {
         if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
         try {
           const chunk = JSON.parse(line.slice(6));
-          const delta = chunk.choices?.[0]?.delta?.content || '';
+          // Regular streaming chunk with delta content.
+          const delta = chunk.choices?.[0]?.delta?.content;
           if (delta) {
             fullText += delta;
             streamText.textContent += delta;
+          }
+          // Collect token strings from logprobs.
+          const lp = chunk.choices?.[0]?.logprobs?.content;
+          if (lp) lp.forEach(t => streamTokens.push(t.token));
+          // Hook results arrive as a bonus chunk (no choices).
+          if (chunk.hook_results) {
+            hookResults = chunk.hook_results;
+            status.textContent = 'Analyzing emotions...';
           }
         } catch (e) {}
       }
     }
 
     chatHistory.push({role: 'assistant', content: fullText});
-
-    // Phase 2: Echo the generated text back with hooks to get emotions.
-    // Uses /v1/completions with echo=True so hooks see the exact text.
-    status.textContent = 'Analyzing emotions...';
-    const xargsHook = { ...xargsBase, apply_hooks: JSON.stringify(HOOK_JSON) };
-
-    const hookResp = await fetch(BASE_URL + '/v1/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: MODEL,
-        prompt: fullText,
-        max_tokens: 1,
-        temperature: 0.0,
-        echo: true,
-        logprobs: 1,
-        vllm_xargs: xargsHook
-      })
-    });
-    const data = await hookResp.json();
-    if (data.error) throw new Error(data.error.message);
-
-    const choice = data.choices[0];
-    // Echo returns all prompt tokens + 1 generated token.
-    const allTokens = choice.logprobs?.tokens || [];
-    // Drop BOS and the trailing generated token.
-    const tokens = allTokens.slice(
-      allTokens[0]?.startsWith('<|') ? 1 : 0,
-      allTokens.length - 1
-    );
-    const hookResults = data.hook_results;
+    const tokens = streamTokens.length > 0
+      ? streamTokens
+      : (fullText.match(/\S+\s*/g) || [fullText]);
 
     const probes = {};
     EMOTIONS.forEach(e => { probes[e] = []; });
