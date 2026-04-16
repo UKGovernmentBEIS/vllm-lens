@@ -408,7 +408,7 @@ async function sendMessage() {
         model: MODEL,
         messages: chatHistory.slice(0, -1),
         max_tokens: maxToks,
-        temperature: 0.0,
+        temperature: 0.0,  // deterministic to match hook analysis
         logprobs: true,
         top_logprobs: 1,
         vllm_xargs: xargsHook
@@ -456,10 +456,10 @@ async function sendMessage() {
       }
     }
 
-    // Replace streaming text with proper tokenized + sparklined version.
+    // Replace with tokenized + sparklined version from hook analysis.
     streamTurn.remove();
     renderTurn('Assistant', tokens, probes);
-    status.textContent = `Generated ${tokens.length} tokens`;
+    status.textContent = `Generated ${tokens.length} tokens (emotion analysis uses temp=0)`;
   } catch (err) {
     status.textContent = 'Error: ' + err.message;
   } finally {
