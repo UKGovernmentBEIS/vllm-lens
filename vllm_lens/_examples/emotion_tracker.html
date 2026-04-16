@@ -91,8 +91,8 @@
   <h3>Generation Settings</h3>
   <div class="slider-row">
     <label>temperature</label>
-    <input type="range" min="0" max="100" value="70" id="tempSlider">
-    <span class="val" id="tempVal">0.70</span>
+    <input type="range" min="0" max="100" value="0" id="tempSlider">
+    <span class="val" id="tempVal">0.00</span>
   </div>
   <div class="slider-row">
     <label>max tokens</label>
@@ -397,20 +397,21 @@ async function sendMessage() {
 
     chatHistory.push({role: 'assistant', content: fullText});
 
-    // Phase 2: Re-run with hooks to get emotion data (non-streaming).
+    // Phase 2: Echo the generated text back with hooks to get emotions.
+    // Uses /v1/completions with echo=True so hooks see the exact text.
     status.textContent = 'Analyzing emotions...';
     const xargsHook = { ...xargsBase, apply_hooks: JSON.stringify(HOOK_JSON) };
 
-    const hookResp = await fetch(BASE_URL + '/v1/chat/completions', {
+    const hookResp = await fetch(BASE_URL + '/v1/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: MODEL,
-        messages: chatHistory.slice(0, -1),
-        max_tokens: maxToks,
-        temperature: 0.0,  // deterministic to match hook analysis
-        logprobs: true,
-        top_logprobs: 1,
+        prompt: fullText,
+        max_tokens: 1,
+        temperature: 0.0,
+        echo: true,
+        logprobs: 1,
         vllm_xargs: xargsHook
       })
     });
@@ -418,10 +419,13 @@ async function sendMessage() {
     if (data.error) throw new Error(data.error.message);
 
     const choice = data.choices[0];
-    const logprobContent = choice.logprobs?.content || [];
-    const tokens = logprobContent.length > 0
-      ? logprobContent.map(lp => lp.token)
-      : (fullText.match(/\S+\s*/g) || [fullText]);
+    // Echo returns all prompt tokens + 1 generated token.
+    const allTokens = choice.logprobs?.tokens || [];
+    // Drop BOS and the trailing generated token.
+    const tokens = allTokens.slice(
+      allTokens[0]?.startsWith('<|') ? 1 : 0,
+      allTokens.length - 1
+    );
     const hookResults = data.hook_results;
 
     const probes = {};
@@ -459,7 +463,7 @@ async function sendMessage() {
     // Replace with tokenized + sparklined version from hook analysis.
     streamTurn.remove();
     renderTurn('Assistant', tokens, probes);
-    status.textContent = `Generated ${tokens.length} tokens (emotion analysis uses temp=0)`;
+    status.textContent = `Generated ${tokens.length} tokens`;
   } catch (err) {
     status.textContent = 'Error: ' + err.message;
   } finally {
