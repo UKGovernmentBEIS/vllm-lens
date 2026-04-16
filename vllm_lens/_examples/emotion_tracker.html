@@ -347,8 +347,11 @@ async function sendMessage() {
   let fullText = '';
   let hookResults = null;
   let streamTokens = [];
-  try {
+
+  async function doStream() {
+    const controller = new AbortController();
     const resp = await fetch(BASE_URL + '/v1/chat/completions', {
+      signal: controller.signal,
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -366,10 +369,17 @@ async function sendMessage() {
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let gotData = false;
+
+    // Abort if no data within 15s.
+    const firstDataTimeout = setTimeout(() => {
+      if (!gotData) { controller.abort(); }
+    }, 15000);
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (!gotData) { gotData = true; clearTimeout(firstDataTimeout); }
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop();
@@ -377,21 +387,34 @@ async function sendMessage() {
         if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
         try {
           const chunk = JSON.parse(line.slice(6));
-          // Regular streaming chunk with delta content.
           const delta = chunk.choices?.[0]?.delta?.content;
           if (delta) {
             fullText += delta;
             streamText.textContent += delta;
           }
-          // Collect token strings from logprobs.
           const lp = chunk.choices?.[0]?.logprobs?.content;
           if (lp) lp.forEach(t => streamTokens.push(t.token));
-          // Hook results arrive as a bonus chunk (no choices).
           if (chunk.hook_results) {
             hookResults = chunk.hook_results;
             status.textContent = 'Analyzing emotions...';
           }
         } catch (e) {}
+      }
+    }
+    clearTimeout(firstDataTimeout);
+  }
+
+  try {
+    // Retry up to 3 times if connection drops before first data.
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await doStream();
+        break;
+      } catch (e) {
+        if (attempt === 3) throw e;
+        fullText = ''; hookResults = null; streamTokens = [];
+        streamText.textContent = '';
+        status.textContent = `Retrying... (attempt ${attempt + 1}/3)`;
       }
     }
 
