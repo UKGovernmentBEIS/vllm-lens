@@ -61,6 +61,8 @@
              color: #999; padding-left: 80px; margin-top: 8px; }
   .turn { border-bottom: 1px solid #eee; padding-bottom: 16px; margin-bottom: 16px; }
   .turn:last-of-type { border-bottom: none; }
+  .turn.fade-in { animation: fadeIn 0.5s ease-in; }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
   .steering { padding-left: 80px; margin-bottom: 20px; }
   .steering h3 { font-size: 12px; font-weight: 400; color: #999;
                   font-family: 'Menlo', monospace; margin-bottom: 8px; }
@@ -337,8 +339,7 @@ async function sendMessage() {
   streamLabel.textContent = 'Assistant:';
   streamTurn.appendChild(streamLabel);
   const streamText = document.createElement('div');
-  streamText.className = 'token-row';
-  streamText.style.flexWrap = 'wrap';
+  streamText.style.cssText = 'font-family:Menlo,Consolas,monospace; font-size:14px; line-height:1.6; padding-left:80px; white-space:pre-wrap;';
   streamTurn.appendChild(streamText);
   container.appendChild(streamTurn);
 
@@ -374,22 +375,7 @@ async function sendMessage() {
           const delta = chunk.choices?.[0]?.delta?.content || '';
           if (delta) {
             fullText += delta;
-            if (delta.includes('\n')) {
-              delta.split('\n').forEach((part, i) => {
-                if (i > 0) streamText.appendChild(document.createElement('br'));
-                if (part) {
-                  const span = document.createElement('span');
-                  span.className = 'token';
-                  span.textContent = part;
-                  streamText.appendChild(span);
-                }
-              });
-            } else {
-              const span = document.createElement('span');
-              span.className = 'token';
-              span.textContent = delta;
-              streamText.appendChild(span);
-            }
+            streamText.textContent += delta;
           }
         } catch (e) {}
       }
@@ -460,9 +446,10 @@ async function sendMessage() {
       }
     }
 
-    // Replace with tokenized + sparklined version from hook analysis.
+    // Replace with tokenized + sparklined version (with fade-in).
     streamTurn.remove();
-    renderTurn('Assistant', tokens, probes);
+    const turn = renderTurn('Assistant', tokens, probes);
+    turn.classList.add('fade-in');
     status.textContent = `Generated ${tokens.length} tokens`;
   } catch (err) {
     status.textContent = 'Error: ' + err.message;
