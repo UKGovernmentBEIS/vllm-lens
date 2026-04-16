@@ -569,6 +569,7 @@ def register() -> None:
     global _original_create_engine_config
     global _original_generate, _original_llm_generate
     global _original_completion_response, _original_chat_full_generator
+    global _original_chat_stream_generator
     global _original_register_routers
 
     from vllm import LLM
