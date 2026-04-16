@@ -375,7 +375,7 @@ async function sendMessage() {
     // Abort if no data within 15s.
     const firstDataTimeout = setTimeout(() => {
       if (!gotData) { controller.abort(); }
-    }, 15000);
+    }, 5000);
 
     while (true) {
       const { done, value } = await reader.read();
