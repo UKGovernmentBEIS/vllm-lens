@@ -225,11 +225,14 @@ def _hook_inner(
             return None
     # Hybrid models (e.g. Qwen3-Next with GatedDeltaNet) have multiple
     # attention metadata entries — some (like GDNAttentionMetadata) lack
-    # query_start_loc.  Find one that has it.
+    # query_start_loc.  Find one that has it.  Also capture seq_lens from
+    # the same entry so abs_start calculation works for 3D steering.
     query_start_loc: Int[torch.Tensor, "num_reqs_plus1"] | None = None  # type: ignore[reportUndefinedVariable]
+    _attn_meta_with_qsl: Any = None
     for _meta in attn_metadata.values():
         if hasattr(_meta, "query_start_loc"):
             query_start_loc = getattr(_meta, "query_start_loc")
+            _attn_meta_with_qsl = _meta
             break
     if query_start_loc is None:
         logger.warning(
@@ -266,8 +269,12 @@ def _hook_inner(
             target = modified_output
 
         # Retrieve seq_lens for absolute position calculation.
-        # seq_lens may be a tensor or a list depending on vLLM version.
-        seq_lens: Any = getattr(attn_metadata, "seq_lens", None)
+        # For hybrid models attn_metadata is a dict; seq_lens lives on
+        # the individual FlashAttentionMetadata entry (_attn_meta_with_qsl),
+        # not on the dict itself.  Fall back to the dict for non-hybrid cases.
+        seq_lens: Any = getattr(
+            _attn_meta_with_qsl or attn_metadata, "seq_lens", None
+        )
 
         for i in range(num_reqs):
             if not per_req_steering[i]:
@@ -699,8 +706,18 @@ class HiddenStatesExtension:
         against the model, moves activation tensors to GPU in the model's
         dtype, and stores them keyed by *key* (an external request ID or a
         synthetic ``_steering_id``).
+
+        Large payloads (steering vectors for long conversations on big models)
+        are spilled to /dev/shm by the caller to avoid msgspec's 4 GB bytes
+        limit.  In that case ``pickled_data`` starts with ``b"shm:"`` followed
+        by the file path.
         """
-        sv_list: list[SteeringVector] = pickle.loads(pickled_data)
+        if pickled_data.startswith(b"shm:"):
+            path = pickled_data[4:].decode()
+            with open(path, "rb") as f:
+                sv_list: list[SteeringVector] = pickle.load(f)
+        else:
+            sv_list = pickle.loads(pickled_data)
 
         device = next(self.model_runner.model.parameters()).device
         dtype = next(self.model_runner.model.parameters()).dtype

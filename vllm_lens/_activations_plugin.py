@@ -13,7 +13,9 @@ activations for both online (async) and offline (sync) usage.
 from __future__ import annotations
 
 import json
+import os
 import pickle
+import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +31,28 @@ from vllm_lens._helpers.types import Hook, SteeringVector
 
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 _ZSTD_DECOMPRESSOR = zstd.ZstdDecompressor()
+
+# Steering vectors for large models can exceed msgspec's 4 GB per-bytes-object
+# limit when pickled inline (e.g. 32B: 16 layers × 15 k positions × 5120 dims
+# ≈ 5 GB pickle). We spill to /dev/shm and pass the path instead.  The caller
+# cleans up the file after collective_rpc returns (all workers have read it).
+_STEERING_SHM_THRESHOLD = 1 * 1024 * 1024 * 1024  # 1 GB
+
+
+def _pack_steering(vectors: list) -> tuple[bytes, str | None]:
+    """Pickle steering vectors; spill to /dev/shm if pickle exceeds threshold.
+
+    Returns (payload, shm_path_or_None).  If shm_path is not None the caller
+    must delete the file after the collective_rpc call completes.
+    """
+    raw = pickle.dumps(vectors)
+    if len(raw) <= _STEERING_SHM_THRESHOLD:
+        return raw, None
+    path = f"/dev/shm/vllm_sv_{uuid.uuid4().hex}.pkl"
+    with open(path, "wb") as f:
+        f.write(raw)
+    return b"shm:" + path.encode(), path
+
 
 if TYPE_CHECKING:
     from vllm import LLM, SamplingParams
@@ -228,10 +252,18 @@ async def _patched_generate(
 
     # Send steering data to workers before the forward pass begins.
     if steering_vectors is not None:
-        await self.collective_rpc(
-            "set_steering_data",
-            args=(request_id, pickle.dumps(steering_vectors)),
-        )
+        _sv_payload, _sv_shm = _pack_steering(steering_vectors)
+        try:
+            await self.collective_rpc(
+                "set_steering_data",
+                args=(request_id, _sv_payload),
+            )
+        finally:
+            if _sv_shm:
+                try:
+                    os.unlink(_sv_shm)
+                except OSError:
+                    pass
 
     # Send hook data to workers before the forward pass begins.
     if hooks_list is not None:
@@ -307,13 +339,17 @@ def _patched_llm_generate(
     # Extract steering vectors per-request.  We must pop them from
     # extra_args before vLLM serialises SamplingParams (tensors don't
     # survive msgspec), but keep them for the RPC call.
-    steering_payloads: dict[str, bytes] = {}  # steering_id -> pickled vectors
+    steering_payloads: dict[str, bytes] = {}  # steering_id -> payload bytes
+    steering_shm_paths: dict[str, str] = {}   # steering_id -> shm path (if spilled)
     for idx, sp in enumerate(params_list):
         extra = sp.extra_args or {}
         vectors = extra.pop("apply_steering_vectors", None)
         if vectors is not None:
             steering_id = f"_steer_{idx}"
-            steering_payloads[steering_id] = pickle.dumps(vectors)
+            payload, shm_path = _pack_steering(vectors)
+            steering_payloads[steering_id] = payload
+            if shm_path:
+                steering_shm_paths[steering_id] = shm_path
             if sp.extra_args is None:
                 sp.extra_args = {}
             sp.extra_args["_steering_id"] = steering_id
@@ -349,8 +385,15 @@ def _patched_llm_generate(
         self._hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
 
     # Send steering data to workers before generation.
-    for sid, payload in steering_payloads.items():
-        self.collective_rpc("set_steering_data", args=(sid, payload))
+    try:
+        for sid, payload in steering_payloads.items():
+            self.collective_rpc("set_steering_data", args=(sid, payload))
+    finally:
+        for path in steering_shm_paths.values():
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     # Send hook data to workers before generation.
     for hid, payload in hook_payloads.items():
