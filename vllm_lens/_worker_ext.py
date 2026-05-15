@@ -265,7 +265,6 @@ def _hook_inner(
 
             start = query_start_loc[i].item()
             end = query_start_loc[i + 1].item()
-            # Blocking .cpu() benchmarked faster than non_blocking + event sync
             activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
                 start:end
             ].cpu()
@@ -424,6 +423,27 @@ class HiddenStatesExtension:
                 del self._captured_states[req_id]
                 logger.debug("Cleared leaked activations for %s", req_id)
 
+    def _build_payload(
+        self, internal_req_id: str
+    ) -> dict[str, dict[str, "Float[torch.Tensor, 'n_layers total_pos hidden_dim']"]]:  # type: ignore[reportUndefinedVariable]
+        """Materialise the stacked-tensor payload for one internal request id.
+
+        Pops the entry from ``_captured_states`` so successive calls do not
+        re-emit the same data. Shared by :meth:`get_captured_states` and
+        :meth:`get_captured_states_batch`.
+        """
+        layer_dict = self._captured_states.pop(internal_req_id)
+        sorted_indices = sorted(layer_dict.keys())
+        per_layer: list[Float[torch.Tensor, "total_pos hidden_dim"]] = [  # type: ignore[reportUndefinedVariable]
+            torch.cat(layer_dict[idx], dim=0) for idx in sorted_indices
+        ]
+        stacked: Float[torch.Tensor, "n_layers total_pos hidden_dim"] = (  # type: ignore[reportUndefinedVariable]
+            torch.stack(per_layer, dim=0)
+        )
+        if stacked.is_cuda:
+            stacked = stacked.cpu()
+        return {"activations": {"residual_stream": stacked}}
+
     def get_captured_states(self, external_req_id: str) -> bytes | None:
         """Retrieve captured activations for a specific request.
 
@@ -432,8 +452,9 @@ class HiddenStatesExtension:
         ``"{request_id}-{random_suffix}"``. So ``"req-0"`` matches
         ``"req-0-a1b2c3d4"`` but NOT ``"req-00-b5c6d7e8"``.
 
-        Moves tensors to CPU and serializes via pickle for safe ZMQ
-        transport.
+        Moves tensors to CPU and serializes via pickle + zstd for safe ZMQ
+        transport (the compression matters most when the response crosses
+        the network in the OpenAI/Inspect HTTP path).
 
         Returns a dict when deserialized::
 
@@ -449,22 +470,44 @@ class HiddenStatesExtension:
         prefix = f"{external_req_id}-"
         for req_id in list(self._captured_states):
             if req_id.startswith(prefix):
-                layer_dict = self._captured_states.pop(req_id)
-                sorted_indices = sorted(layer_dict.keys())
-                per_layer: list[Float[torch.Tensor, "total_pos hidden_dim"]] = [  # type: ignore[reportUndefinedVariable]
-                    torch.cat(layer_dict[idx], dim=0) for idx in sorted_indices
-                ]
-                stacked: Float[torch.Tensor, "n_layers total_pos hidden_dim"] = (  # type: ignore[reportUndefinedVariable]
-                    torch.stack(per_layer, dim=0)
-                )
-                return _ZSTD_COMPRESSOR.compress(
-                    pickle.dumps(
-                        {
-                            "activations": {"residual_stream": stacked},
-                        }
-                    )
-                )
+                payload = self._build_payload(req_id)
+                return _ZSTD_COMPRESSOR.compress(pickle.dumps(payload))
         return None
+
+    def get_captured_states_batch(
+        self, external_req_ids: list[str]
+    ) -> bytes | None:
+        """Retrieve captured activations for many requests in one RPC.
+
+        Equivalent to calling :meth:`get_captured_states` once per id, but
+        emits a single payload covering every request that has data. At
+        large batch sizes the per-request ``collective_rpc`` roundtrip is
+        the dominant cost on the offline ``LLM.generate`` path; batching it
+        cuts N round-trips to one.
+
+        Returns ``pickle.dumps({external_req_id: payload, ...})`` where
+        each ``payload`` is ``{"activations": {"residual_stream": Tensor}}``.
+        Missing or unmatched ids are simply absent; ``None`` if nothing
+        matched at all.
+
+        We deliberately don't ``zstd``-compress here: this RPC only fires
+        on the offline ``LLM.generate`` path, which is in-process IPC,
+        not HTTP. ``get_captured_states`` keeps zstd for the OpenAI/Inspect
+        path where the response crosses the network.
+        """
+        if not external_req_ids:
+            return None
+        out: dict[str, dict[str, Any]] = {}
+        # Walk live state once and bucket by external id; matches the
+        # ``"{external_req_id}-"`` prefix rule from get_captured_states.
+        for req_id in list(self._captured_states):
+            for external_req_id in external_req_ids:
+                if req_id.startswith(f"{external_req_id}-"):
+                    out[external_req_id] = self._build_payload(req_id)
+                    break
+        if not out:
+            return None
+        return pickle.dumps(out, protocol=pickle.HIGHEST_PROTOCOL)
 
     def _debug_captured_states_count(self) -> int:
         """Return the number of entries in _captured_states (for testing)."""
