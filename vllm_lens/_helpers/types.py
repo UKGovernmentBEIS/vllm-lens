@@ -51,8 +51,10 @@ class SteeringVector(BaseModel):
     """Scalar multiplier applied to the steering vector before addition."""
 
     norm_match: bool = False
-    """If True, rescale the modified hidden state to preserve the original
-    per-token L2 norm."""
+    """If True, scale the steering vector so the added magnitude equals the
+    residual stream's per-token L2 norm (times ``scale``):
+    ``h' = h + scale · ‖h‖ · v/‖v‖``.  Does NOT renormalize ``h'`` back to
+    ``‖h‖`` — the residual norm grows accordingly."""
 
     position_indices: list[int] | None = None
     """Absolute token positions for 3D activations.  ``None`` means broadcast
