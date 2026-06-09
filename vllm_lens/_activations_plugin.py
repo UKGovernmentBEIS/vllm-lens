@@ -155,6 +155,13 @@ async def _patched_generate(
         pass
 
     extra = effective_params.extra_args or {}
+    # Over the OpenAI API, vllm_xargs values must be scalars, so a layer list
+    # arrives as a JSON-encoded string (e.g. "[31]" or "[15,31,46]"). Decode it
+    # in place so the worker's per-layer list-filter selects exactly those layers
+    # (mirrors the apply_steering_vectors decode below). A bare int/True still
+    # means "all layers". This keeps multi-layer capture cheap over HTTP.
+    if isinstance(extra.get("output_residual_stream"), str):
+        extra["output_residual_stream"] = json.loads(extra["output_residual_stream"])
     wants_activations = extra.get("output_residual_stream") is not None
     # Extract steering data and remove from extra_args before vLLM
     # serialises the SamplingParams (tensors don't survive msgspec).
