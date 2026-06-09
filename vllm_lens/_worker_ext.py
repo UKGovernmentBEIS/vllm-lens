@@ -106,12 +106,24 @@ def _apply_steering(
     start: int,
     end: int,
     abs_start: int,
+    norm_ref: torch.Tensor,
 ) -> None:
     """Apply all matching steering vectors to a token slice *in-place*.
 
     ``target`` is the (already-cloned) output tensor.  ``start``/``end``
     are batch-relative indices, ``abs_start`` is the absolute sequence
     position of the first token in ``target[start:end]``.
+
+    ``norm_ref`` is the tensor whose per-token L2 norm ``norm_match`` should
+    match.  For fused-residual models (e.g. Qwen3) the layer returns
+    ``(hidden_states, residual)`` and ``target`` is only ``hidden_states``
+    (the MLP-delta half); the *true* residual stream is
+    ``hidden_states + residual``, so ``norm_ref`` must be that full stream,
+    not the MLP-delta half, or the steering vector is scaled to a far smaller
+    norm than HF uses.  For non-fused / plain-tensor layers the caller passes
+    ``norm_ref = target``.  Required (no default) so a forgotten reference
+    fails at the call instead of silently scaling to the wrong
+    MLP-delta-half norm.
     """
     n_tokens = end - start
     for cfg in configs:
@@ -124,7 +136,7 @@ def _apply_steering(
             # 2D: broadcast to all positions
             v = vec.unsqueeze(0)
             if cfg.norm_match:
-                v = norm_match(target[start:end], v)
+                v = norm_match(norm_ref[start:end], v)
             target[start:end] = target[start:end] + v * cfg.scale
         else:
             # 3D: position-specific
@@ -142,7 +154,7 @@ def _apply_steering(
                 rel = abs_pos - abs_start + start
                 v = vec[pi]
                 if cfg.norm_match:
-                    v = norm_match(target[rel], v)
+                    v = norm_match(norm_ref[rel], v)
                 target[rel] = target[rel] + v * cfg.scale
 
 
@@ -208,9 +220,13 @@ def _hook_inner(
         if isinstance(output, tuple):
             modified_output = (output[0].clone(), output[1])
             target = modified_output[0]
+            # Fused-residual layers: true residual stream is output[0]+output[1].
+            # norm_match must reference the full stream, not the MLP-delta half.
+            norm_ref = output[0] + output[1] if output[1] is not None else output[0]
         else:
             modified_output = output.clone()
             target = modified_output
+            norm_ref = target
 
         # Retrieve seq_lens for absolute position calculation.
         # seq_lens may be a tensor or a list depending on vLLM version.
@@ -230,7 +246,7 @@ def _hook_inner(
             else:
                 abs_start = 0  # fallback: treat as prefill from position 0
             _apply_steering(
-                per_req_steering[i], layer_idx, target, start, end, abs_start
+                per_req_steering[i], layer_idx, target, start, end, abs_start, norm_ref
             )
 
     # --- Phase 3: capture activations (rank 0 only) -----------------
