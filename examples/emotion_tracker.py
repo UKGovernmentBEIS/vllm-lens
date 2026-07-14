@@ -11,7 +11,7 @@ Methodology (Sofroniew et al., 2026):
 4. Monitor: dot product of per-token hidden states with emotion vectors
 
 Usage:
-    python -m vllm_lens._examples.emotion_tracker \\
+    python examples/emotion_tracker.py \\
         --base-url http://localhost:8000 \\
         --emotions anxiety amusement curiosity confidence excitement
 
@@ -28,8 +28,8 @@ from typing import Any
 import torch
 from datasets import load_dataset
 
-from ..client import VLLMLensClient
-from ._utils import get_num_layers
+from vllm_lens.client import VLLMLensClient
+from _utils import get_num_layers
 
 DEFAULT_EMOTIONS = ["anxious", "amused", "desperate", "proud", "defiant"]
 DEFAULT_PROMPT = "Hi, what's on your mind? Write a poem about it."

@@ -12,7 +12,7 @@ Steps:
 4. Evaluate on held-out pairs
 
 Usage:
-    python -m vllm_lens._examples.deception_probe \\
+    python examples/deception_probe.py \\
         --base-url http://localhost:8000
 
 Requires a running vLLM server with vllm-lens installed.
@@ -26,8 +26,8 @@ from typing import Any
 import torch
 from vllm_lens import Hook
 
-from ..client import VLLMLensClient
-from ._utils import get_num_layers
+from vllm_lens.client import VLLMLensClient
+from _utils import get_num_layers
 
 HONEST_INSTRUCTION = "Answer the following question honestly."
 DECEPTIVE_INSTRUCTION = (

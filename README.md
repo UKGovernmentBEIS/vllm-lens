@@ -53,6 +53,24 @@ client.clear_hooks()
 
 ## Examples
 
+Runnable examples live in [`examples/`](examples/) — each is standalone; run any
+with `python examples/<name>.py --help`. Most (`causal_tracing`, `logit_lens`,
+`deception_probe`, `emotion_tracker`) drive a **separately running** vllm-lens
+server over HTTP via [`VLLMLensClient`](vllm_lens/client.py) (start one with
+`vllm serve <model>`, then pass `--base-url`); `activation_oracle` instead spins
+up its own in-process engine. The notebooks are self-contained.
+
+| Example | What it demonstrates |
+| --- | --- |
+| [`causal_tracing.py`](examples/causal_tracing.py) | ROME-style causal tracing — pre-hook embedding corruption + post-hook clean-state patching, rendered as a (layer × token) heatmap. |
+| [`logit_lens.py`](examples/logit_lens.py) | Logit lens — project each layer's hidden states through the final norm + unembedding via `ctx.get_parameter("lm_head.weight")`. |
+| [`deception_probe.py`](examples/deception_probe.py) | Apollo-style linear deception probe — contrastive activation extraction with persistent hooks, then a pure-torch logistic-regression probe. |
+| [`emotion_tracker.py`](examples/emotion_tracker.py) | Anthropic emotion-concepts replication — emotion direction vectors + per-token projection tracking, with an interactive HTML visualization. |
+| [`activation_oracle.py`](examples/activation_oracle.py) | Activation Oracle steering (arXiv:2512.15674) — capture activations and steer a LoRA oracle to describe them. |
+| [`extract_residual_stream.ipynb`](examples/extract_residual_stream.ipynb) | Notebook — per-request and persistent activation capture, offline and over HTTP. |
+| [`inspect-demo.ipynb`](examples/inspect-demo.ipynb) | Notebook — Activation Oracle via the vllm-lens Inspect provider. |
+| [`benchmark.ipynb`](examples/benchmark.ipynb) | Notebook — overhead of activation capture and steering. |
+
 ### Generic hooks
 
 Hooks let you run arbitrary Python functions on hidden states at specific layers during inference. They can capture data (via `ctx.saved`) and/or modify hidden states (by returning a tensor).
@@ -164,10 +182,10 @@ Pre-fetched parameters persist until explicitly cleared. When the parameter alre
 
 ### Causal tracing (activation patching)
 
-The [`causal_tracing.py`](vllm_lens/_examples/causal_tracing.py) example implements ROME-style causal tracing using pre-hooks for embedding corruption and post-hooks for clean-state restoration:
+The [`causal_tracing.py`](examples/causal_tracing.py) example implements ROME-style causal tracing using pre-hooks for embedding corruption and post-hooks for clean-state restoration:
 
 ```bash
-python -m vllm_lens._examples.causal_tracing \
+python examples/causal_tracing.py \
     --base-url http://localhost:8000 \
     --prompt "The Eiffel Tower is in the city of" \
     --subject "Eiffel Tower" \

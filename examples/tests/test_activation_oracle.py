@@ -13,7 +13,7 @@ import torch
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from vllm import AsyncEngineArgs, AsyncLLMEngine
 
-from vllm_lens._examples.activation_oracle import (
+from activation_oracle import (
     LAYER,
     TARGET_MESSAGES,
     AOConfig,
