@@ -25,6 +25,38 @@ async def vllm_model():
     torch.cuda.empty_cache()
 
 
+@pytest.fixture(scope="module")
+async def vllm_model_tp2():
+    """Tensor-parallel (TP=2) engine for cross-rank steering coverage."""
+    engine_args = AsyncEngineArgs(
+        model=MODEL_NAME,
+        dtype="auto",
+        gpu_memory_utilization=0.3,
+        tensor_parallel_size=2,
+    )
+    engine = AsyncLLMEngine.from_engine_args(engine_args)
+    yield engine
+    engine.shutdown()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module")
+async def vllm_model_pp2():
+    """Pipeline-parallel (PP=2) engine for cross-stage steering coverage."""
+    engine_args = AsyncEngineArgs(
+        model=MODEL_NAME,
+        dtype="auto",
+        gpu_memory_utilization=0.3,
+        pipeline_parallel_size=2,
+    )
+    engine = AsyncLLMEngine.from_engine_args(engine_args)
+    yield engine
+    engine.shutdown()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
@@ -77,6 +109,59 @@ def _make_steering_vector(
             position_indices=position_indices,
         )
     ]
+
+
+async def _assert_norm_match_residual(
+    engine,
+    request_prefix: str,
+    scale: float = 4.0,
+    rel_tol: float = 0.05,
+) -> None:
+    """Assert the ``norm_match`` self-consistency property on ``engine``.
+
+    Captures the residual ``R`` at ``LAYER_IDX`` before steering and ``R'``
+    after steering the last position with ``norm_match=True``, and checks
+    ``‖R' − R‖ / ‖R‖ == scale``.  Shared by the TP=1 / TP=2 / PP=2 variants so
+    the fused-residual fix is exercised under each parallelism layout.
+    """
+    baseline = await _generate(
+        engine,
+        PROMPT,
+        f"{request_prefix}-baseline",
+        max_tokens=1,
+        extra_args={"output_residual_stream": [LAYER_IDX]},
+    )
+    base_acts = baseline.activations["residual_stream"][0].float()  # type: ignore[reportAttributeAccessIssue]
+    seq_len, hidden_dim = base_acts.shape
+    pos = seq_len - 1
+
+    vectors = _make_steering_vector(
+        hidden_dim,
+        [LAYER_IDX],
+        scale=scale,
+        norm_match=True,
+        position_indices=[pos],
+        n_positions=1,
+    )
+    steered = await _generate(
+        engine,
+        PROMPT,
+        f"{request_prefix}-steered",
+        max_tokens=1,
+        extra_args={
+            "output_residual_stream": [LAYER_IDX],
+            "apply_steering_vectors": vectors,
+        },
+    )
+    steered_acts = steered.activations["residual_stream"][0].float()  # type: ignore[reportAttributeAccessIssue]
+
+    ratio = (steered_acts[pos] - base_acts[pos]).norm().item() / base_acts[
+        pos
+    ].norm().item()
+    assert abs(ratio - scale) <= rel_tol * scale, (
+        f"norm_match should scale the steering vector to the full residual norm: "
+        f"expected ‖R'-R‖/‖R‖ == scale = {scale}, got {ratio:.4f}"
+    )
 
 
 # ------------------------------------------------------------------
@@ -317,3 +402,25 @@ class TestSteering:
             f"means steering referenced output[0] (hidden_states) instead of the "
             f"full residual output[0]+output[1]."
         )
+
+
+class TestSteeringParallel:
+    """norm_match fix under tensor/pipeline parallelism.
+
+    The fused-residual bug (steering referenced ``output[0]`` instead of the
+    full ``output[0] + output[1]``) is layout-independent, but capture runs on
+    TP rank 0 while steering runs on every rank, and under PP the steered layer
+    lives on one stage — so verify the invariant holds in each layout.
+    """
+
+    @pytest.mark.skipif(
+        torch.cuda.device_count() < 2, reason="TP=2 requires at least 2 GPUs"
+    )
+    async def test_norm_match_scales_to_residual_stream_tp2(self, vllm_model_tp2):
+        await _assert_norm_match_residual(vllm_model_tp2, "normmatch-tp2")
+
+    @pytest.mark.skipif(
+        torch.cuda.device_count() < 2, reason="PP=2 requires at least 2 GPUs"
+    )
+    async def test_norm_match_scales_to_residual_stream_pp2(self, vllm_model_pp2):
+        await _assert_norm_match_residual(vllm_model_pp2, "normmatch-pp2")
