@@ -215,6 +215,14 @@ python examples/jacobian_lens.py run \
 
 This prints the (layer × position) top-1 concept grid — e.g. *Paris* emerges several layers before the model's actual next token. Pass `--baseline` to drop the `J_l` transport (plain logit-lens comparison). `run` also accepts a pre-fitted lens from the Hub (e.g. [Neuronpedia](https://huggingface.co/neuronpedia/jacobian-lens)) in place of a locally-fit one; its `d_model` must match the served model.
 
+**Does it work?** Tracking the rank of the answer token at each layer, the Jacobian lens drives the answer to rank 1 in the mid/late layers — earlier and more decisively than the plain logit lens (a lens fit on Qwen3-0.6B; readouts are bit-identical whether residuals are captured via vLLM or HF):
+
+![Jacobian lens vs logit lens: rank of the answer token by layer](docs/jacobian_lens/jlens_vs_logitlens.png)
+
+The same readout across every (layer, position) shows *where* a concept lives — *Paris* crystallizes at the final `of`/`in` positions in the upper layers, and, strikingly, at the **"Eiffel"** token in the middle layers (the model is disposed toward *Paris* there without emitting it):
+
+![Where 'Paris' emerges: layer × position rank map](docs/jacobian_lens/jlens_layer_position_grid.png)
+
 ### Inspect AI provider
 
 An [Inspect AI](https://inspect.ai-safety-institute.org.uk/) model provider is auto-registered as `vllm-lens`, when you install this package. This model provider extends the built-in vLLM provider to serialize `torch.Tensor` steering vectors for HTTP transport and decode base64-encoded activations from responses into `ModelOutput.metadata["activations"]`. It also supports LoRA adaptors.
