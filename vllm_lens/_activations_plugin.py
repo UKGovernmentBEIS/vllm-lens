@@ -86,6 +86,20 @@ def _merge_hook_results(
     return merged or None
 
 
+def _decode_rank_payload(payload: bytes) -> Any:
+    """Decode a rank payload, transparently handling the zstd-or-raw split.
+
+    Worker-side payloads are zstd-compressed when shipped over the network
+    (HTTP / OpenAI path) and raw when shipped over a local subprocess pipe.
+    The magic-byte prefix lets us pick the right decoder without a flag.
+    """
+    return pickle.loads(
+        _ZSTD_DECOMPRESSOR.decompress(payload)
+        if payload[:4] == _ZSTD_MAGIC
+        else payload
+    )
+
+
 def _merge_captured_states(
     states: list[bytes | None] | None,
 ) -> dict[str, Any] | None:
@@ -100,9 +114,7 @@ def _merge_captured_states(
     if not states:
         return None
     parts: list[dict[str, Any]] = [
-        pickle.loads(_ZSTD_DECOMPRESSOR.decompress(s) if s[:4] == _ZSTD_MAGIC else s)
-        for s in states
-        if s is not None
+        _decode_rank_payload(s) for s in states if s is not None
     ]
     if not parts:
         return None
@@ -110,6 +122,47 @@ def _merge_captured_states(
         return parts[0]["activations"]
     merged = torch.cat([p["activations"]["residual_stream"] for p in parts], dim=0)
     return {"residual_stream": merged}
+
+
+def _merge_captured_states_batch(
+    states_per_rank: list[bytes | None] | None,
+    external_req_ids: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    """Merge a batched ``get_captured_states_batch`` response across PP ranks.
+
+    Each rank returns either ``None`` or pickled bytes encoding
+    ``{external_req_id → {"activations": {"residual_stream": Tensor}}}``.
+
+    For PP > 1 we concatenate the per-id residual streams along dim 0 in
+    rank order — same convention as :func:`_merge_captured_states`, just
+    done per request.
+
+    The output is keyed by ``external_req_id`` and contains the inner
+    dict shape ``{"residual_stream": Tensor}`` that callers already
+    expect. Requests with no captured data (no rank emitted a payload
+    for that id) are simply absent from the returned dict.
+    """
+    if not states_per_rank:
+        return {}
+    rank_dicts: list[dict[str, dict[str, Any]]] = [
+        _decode_rank_payload(s) for s in states_per_rank if s is not None
+    ]
+    if not rank_dicts:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for req_id in external_req_ids:
+        per_rank = [d[req_id] for d in rank_dicts if req_id in d]
+        if not per_rank:
+            continue
+        if len(per_rank) == 1:
+            out[req_id] = per_rank[0]["activations"]
+        else:
+            merged = torch.cat(
+                [p["activations"]["residual_stream"] for p in per_rank],
+                dim=0,
+            )
+            out[req_id] = {"residual_stream": merged}
+    return out
 
 
 def _trim_activations(
@@ -383,10 +436,13 @@ def _patched_llm_generate(
     outputs = _original_llm_generate(self, prompts, sampling_params, **kwargs)
 
     if wants_activations:
+        req_ids = [output.request_id for output in outputs]
+        states_per_rank = self.collective_rpc(
+            "get_captured_states_batch", args=(req_ids,)
+        )
+        activations_by_id = _merge_captured_states_batch(states_per_rank, req_ids)
         for output in outputs:
-            req_id = output.request_id
-            states = self.collective_rpc("get_captured_states", args=(req_id,))
-            activations = _merge_captured_states(states)
+            activations = activations_by_id.get(output.request_id)
             if activations is not None:
                 n_prompt = len(output.prompt_token_ids)
                 n_gen = len(output.outputs[0].token_ids)
