@@ -254,3 +254,66 @@ class TestSteering:
         # We can't assert they're identical since the steering at pos 0
         # propagates through attention, but the direct delta should only
         # be at pos 0.
+
+    async def test_norm_match_scales_to_residual_stream(self, vllm_model):
+        """``norm_match=True`` must scale the steering vector to the L2 norm of
+        the *full residual stream*.
+
+        With ``norm_match=True`` the added vector is ``v/||v|| * ||residual|| *
+        scale``, so capturing the residual ``R`` before steering and ``R'``
+        after steering (same request) must satisfy, at the steered position::
+
+            ||R' - R|| / ||R||  ==  scale
+
+        This is a self-consistency property of norm_match and a regression guard
+        for fused-residual architectures (Qwen, Gemma, Llama, ...), whose decoder
+        layers return ``(hidden_states, residual)``: steering must reference the
+        full residual ``hidden_states + residual``, not just the ``hidden_states``
+        (MLP-delta) half — otherwise the injected magnitude is
+        ``scale * ||hidden_states|| / ||R||`` instead of ``scale``.
+        """
+        scale = 4.0
+        rel_tol = 0.05
+
+        baseline = await _generate(
+            vllm_model,
+            PROMPT,
+            "normmatch-baseline",
+            max_tokens=1,
+            extra_args={"output_residual_stream": [LAYER_IDX]},
+        )
+        base_acts = baseline.activations["residual_stream"][0].float()  # type: ignore[reportAttributeAccessIssue]
+        seq_len, hidden_dim = base_acts.shape
+        pos = seq_len - 1
+
+        vectors = _make_steering_vector(
+            hidden_dim,
+            [LAYER_IDX],
+            scale=scale,
+            norm_match=True,
+            position_indices=[pos],
+            n_positions=1,
+        )
+        steered = await _generate(
+            vllm_model,
+            PROMPT,
+            "normmatch-steered",
+            max_tokens=1,
+            extra_args={
+                "output_residual_stream": [LAYER_IDX],
+                "apply_steering_vectors": vectors,
+            },
+        )
+        steered_acts = steered.activations["residual_stream"][0].float()  # type: ignore[reportAttributeAccessIssue]
+
+        R = base_acts[pos]
+        R_prime = steered_acts[pos]
+        ratio = (R_prime - R).norm().item() / R.norm().item()
+
+        assert abs(ratio - scale) <= rel_tol * scale, (
+            f"norm_match should scale the steering vector to the full residual "
+            f"norm: expected ||R'-R||/||R|| == scale = {scale}, got {ratio:.4f} "
+            f"(ratio/scale = {ratio / scale:.3f}). On a fused-residual model this "
+            f"means steering referenced output[0] (hidden_states) instead of the "
+            f"full residual output[0]+output[1]."
+        )
