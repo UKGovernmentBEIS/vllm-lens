@@ -13,6 +13,8 @@ activations for both online (async) and offline (sync) usage.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import pickle
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import TYPE_CHECKING, Any
@@ -26,6 +28,8 @@ from vllm_lens._helpers._serialize import (
     serialize_hook_results,
 )
 from vllm_lens._helpers.types import Hook, SteeringVector
+
+logger = logging.getLogger(__name__)
 
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 _ZSTD_DECOMPRESSOR = zstd.ZstdDecompressor()
@@ -584,7 +588,23 @@ def register() -> None:
 
     Use ``extra_args={"output_residual_stream": True | list[int]}`` in
     SamplingParams to request activations.
+
+    Opt-out: set ``VLLM_LENS_DISABLE=1`` to make this a no-op. This plugin
+    auto-loads in *every* vLLM process via the ``vllm.general_plugins`` entry
+    point, and its patches force ``enforce_eager=True`` (disabling CUDA graphs)
+    on all engines. The kill switch lets vllm-lens be installed alongside a
+    trainer's inference server (e.g. prime-rl rollouts) without perturbing it.
+    Unset => unchanged default-on behaviour.
     """
+    if os.environ.get("VLLM_LENS_DISABLE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        logger.info("VLLM_LENS_DISABLE set; vllm-lens activation plugin inactive.")
+        return
+
     global _original_create_engine_config
     global _original_generate, _original_llm_generate
     global _original_completion_response, _original_chat_full_generator
