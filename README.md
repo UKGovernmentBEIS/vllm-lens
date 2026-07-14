@@ -71,6 +71,57 @@ up its own in-process engine. The notebooks are self-contained.
 | [`inspect-demo.ipynb`](examples/inspect-demo.ipynb) | Notebook — Activation Oracle via the vllm-lens Inspect provider. |
 | [`benchmark.ipynb`](examples/benchmark.ipynb) | Notebook — overhead of activation capture and steering. |
 
+### Activation capture
+
+Capture the residual stream at chosen layers by passing `output_residual_stream` (a list of layer indices) in `extra_args`:
+
+```python
+from vllm import LLM, SamplingParams
+
+llm = LLM("meta-llama/Llama-3.1-8B-Instruct")
+sp = SamplingParams(max_tokens=1, extra_args={"output_residual_stream": [15, 20]})
+out = llm.generate(["Hello world"], sp)
+acts = out[0].activations["residual_stream"]  # (n_layers, n_positions, hidden_dim)
+```
+
+Over the HTTP server, pass it in `vllm_xargs` — or use the client's `capture_layers`:
+
+```python
+from vllm_lens.client import VLLMLensClient
+
+client = VLLMLensClient("http://localhost:8000")
+out = client.generate("Hello world", capture_layers=[15, 20])
+print(out.activations["residual_stream"].shape)
+```
+
+Layers are stacked in ascending order along dim 0. Capture runs on TP rank 0 only (residual streams are identical across TP ranks after all-reduce).
+
+### Steering vectors
+
+Add activation vectors to the residual stream in-flight with `apply_steering_vectors`. A `SteeringVector` carries the activations plus how to apply them:
+
+```python
+import torch
+from vllm import LLM, SamplingParams
+from vllm_lens import SteeringVector
+
+sv = SteeringVector(
+    activations=torch.randn(1, 4096),  # (n_layers, hidden) or (n_layers, n_positions, hidden)
+    layer_indices=[15],
+    scale=4.0,
+    norm_match=True,        # scale the added vector so its magnitude is ‖residual‖ · scale
+    position_indices=None,  # None = all positions (2D) or sequential 0..n-1 (3D)
+)
+sp = SamplingParams(max_tokens=20, extra_args={"apply_steering_vectors": [sv]})
+llm.generate(["I think the best dessert is"], sp)
+```
+
+Via the client (or `vllm_xargs` over HTTP):
+
+```python
+client.generate("I think the best dessert is", steering_vectors=[sv])
+```
+
 ### Generic hooks
 
 Hooks let you run arbitrary Python functions on hidden states at specific layers during inference. They can capture data (via `ctx.saved`) and/or modify hidden states (by returning a tensor).
@@ -253,7 +304,7 @@ vllm-lens registers as a [vLLM plugin](https://docs.vllm.ai/en/stable/design/plu
 
 1. **Intercepting generate calls.** To utilise the plugin, you can pass [extra args](https://docs.vllm.ai/en/stable/api/vllm/sampling_params/#vllm.sampling_params.SamplingParams.extra_args) such as `output_residual_stream`, `apply_steering_vectors`, or `apply_hooks` in the sampling parameters. The plugin extracts these, initialises relevant [PyTorch hooks](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.register_hook.html) if they're not already setup (by adding a [worker extension](https://docs.vllm.ai/en/stable/cli/run-batch/?h=worker+extension#-worker-extension-cls)) and sends steering vectors and hook definitions directly to workers (vLLM typically has one worker per GPU).
 2. **Per-sample hook operations**. vLLM dynamically batches tokens from multiple concurrent requests into a single forward pass, so a core challenge is "book-keeping" - working out which operations (e.g., activation extraction) should be applied to which parts of the request. To do this we read the `forward_context` metadata, utilising the `query_start_loc` (a tensor of token boundaries per request) and `req_ids` (mapping batch index to request ID). We then, for example, apply hooks to just the slices that correspond to the request. Any extracted activations are moved to CPU ram and compressed (lossless), ready to be requested by the vLLM scheduler process. Steering runs on all tensor-parallel ranks (since it modifies the forward pass), but capture only runs on TP rank 0 (residual streams are identical across TP replicas after all-reduce).
-3. **Response collation.** The plugin intercepts the response before it is sent to the client, at which point it queries the relevant vLLM processes for any requested activations. If trims surplus activations, as vLLM does under the hook with tokens (the scheduler often gets ahead of the number of tokens it needs to generate, before stopping). Activations are then returned to the client.
+3. **Response collation.** The plugin intercepts the response before it is sent to the client, at which point it queries the relevant vLLM processes for any requested activations. It trims surplus activations, since vLLM can run an extra forward pass under the hood (the scheduler often gets ahead of the number of tokens it needs to generate, before stopping). Activations are then returned to the client.
 
 ## Running tests
 
