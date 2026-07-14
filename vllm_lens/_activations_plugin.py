@@ -149,8 +149,27 @@ def _patched_create_engine_config(self, *args, **kwargs):
         self.worker_extension_cls = _WORKER_EXT
     self.enforce_eager = True
 
+    # Our capture/steering hooks read V1 model-runner internals (input_batch,
+    # requests). vLLM's V2 runner — the default for dense models on vLLM 0.23+ —
+    # has a different layout, so the hooks silently capture nothing there. Default
+    # to the V1 runner. setdefault => an explicit VLLM_USE_V2_MODEL_RUNNER still wins
+    # (and is caught below); no-op on older vLLM that ignores this env var.
+    os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
+
     assert _original_create_engine_config is not None
-    return _original_create_engine_config(self, *args, **kwargs)
+    config = _original_create_engine_config(self, *args, **kwargs)
+
+    # Fail loudly rather than silently no-op if the V2 runner ended up active anyway
+    # (e.g. the user explicitly set VLLM_USE_V2_MODEL_RUNNER=1). getattr keeps this a
+    # no-op on vLLM versions with no such property (pre-V2, e.g. 0.19).
+    if getattr(config, "use_v2_model_runner", False):
+        raise RuntimeError(
+            "vllm-lens requires vLLM's V1 model runner, but the V2 model runner is "
+            "active (VLLM_USE_V2_MODEL_RUNNER=1). Activation capture and steering rely "
+            "on V1 runner internals and would silently no-op on V2. Unset "
+            "VLLM_USE_V2_MODEL_RUNNER (vllm-lens defaults it to 0) or set it to 0."
+        )
+    return config
 
 
 # ---------------------------------------------------------------------------
