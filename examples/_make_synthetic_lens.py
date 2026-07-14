@@ -21,6 +21,12 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--noise", type=float, default=0.02)
+    ap.add_argument(
+        "--layers",
+        default=None,
+        help="comma-separated layers only (keeps the file small for large models; "
+        "default = all source layers)",
+    )
     args = ap.parse_args()
 
     from transformers import AutoConfig
@@ -29,7 +35,10 @@ def main():
     cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
     d = cfg.hidden_size
     n = cfg.num_hidden_layers
-    source_layers = list(range(n - 1))
+    if args.layers:
+        source_layers = [int(x) for x in args.layers.split(",")]
+    else:
+        source_layers = list(range(n - 1))
 
     g = torch.Generator().manual_seed(0)
     eye = torch.eye(d)

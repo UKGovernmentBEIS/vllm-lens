@@ -379,6 +379,14 @@ def main():
     else:
         layers = _default_layers(source_layers, n_layers)
 
+    # The lens ships to the worker inside the hook closure, so only send the J_l
+    # for the layers we actually read out (a full lens is d_model^2 per layer —
+    # ~5.8 GB for GLM-5.2). --baseline needs no lens at all.
+    if args.baseline:
+        jacobians = {}
+    else:
+        jacobians = {lyr: jacobians[lyr] for lyr in layers if lyr in jacobians}
+
     tok = AutoTokenizer.from_pretrained(client.model)
     tokens, results = run_jlens(
         client, args.prompt, jacobians, layers, k=args.k, use_jacobian=not args.baseline
