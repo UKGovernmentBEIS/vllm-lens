@@ -186,8 +186,21 @@ def run_jlens(client, prompt, jacobians, layers, *, k=6, use_jacobian=True):
     the live vLLM worker. Returns (prompt_tokens, {layer: (ids[seq,k], probs)})."""
     from vllm_lens import Hook
 
+    # Only the requested layers' J_l are shipped to the worker in the hook closure
+    # (the full lens can be GBs on large models).
+    jacobians = {lyr: jacobians[lyr] for lyr in layers if lyr in jacobians}
+
+    # Tied-embedding models (e.g. Gemma) have no separate `lm_head`; the unembed
+    # weight is the input embedding. Pick by model family up front (a failed RPC
+    # can poison the worker, so don't try-then-fallback).
+    model_id = getattr(client, "model", "").lower()
+    unembed_name = (
+        "model.embed_tokens.weight" if "gemma" in model_id else "lm_head.weight"
+    )
+    client.prefetch_params([unembed_name])
+
     def project_hook(ctx, h):
-        weight = ctx.get_parameter("lm_head.weight")
+        weight = ctx.get_parameter(unembed_name)
         norm = _find_norm(ctx.model)
         with torch.no_grad():
             transported = h.float()
@@ -202,7 +215,6 @@ def run_jlens(client, prompt, jacobians, layers, *, k=6, use_jacobian=True):
         return None
 
     hook = Hook(fn=project_hook, layer_indices=layers)
-    client.prefetch_params(["lm_head.weight"])
     output = client.generate(prompt, max_tokens=1, hooks=[hook], logprobs=1, echo=True)
     tokens = output.logprobs["tokens"][:-1] if output.logprobs else []
     assert output.hook_results is not None, "no hook results returned"
