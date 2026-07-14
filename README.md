@@ -215,17 +215,17 @@ python examples/jacobian_lens.py run \
 
 This prints the (layer × position) top-1 concept grid — e.g. *Paris* emerges several layers before the model's actual next token. Pass `--baseline` to drop the `J_l` transport (plain logit-lens comparison). `run` also accepts a pre-fitted lens from the Hub (e.g. [Neuronpedia](https://huggingface.co/neuronpedia/jacobian-lens)) in place of a locally-fit one; its `d_model` must match the served model.
 
-**What does the model have "in mind"?** Reading the top-1 Jacobian-lens token at every (layer, position) shows concepts the model is *disposed toward* but hasn't emitted, forming with depth. On Qwen3-1.7B, *Paris*/*France* crystallize at the final positions in the upper layers — and appear at the **"Eiffel"** token itself in the middle layers (early layers are noise; rare non-Latin tokens render as boxes):
+**What does the model have "in mind"?** The top-k Jacobian-lens tokens at each prompt position are the concepts the model is *disposed toward* but hasn't emitted. Shown across three layers of Qwen3-1.7B, they sharpen with depth: on *"The Eiffel Tower is located in the city of"*, mid-layers hold fuzzy country candidates (Germany/France/America/Spain), and by the upper layers the ` of` position reads out **Paris, France, Marseille, Berlin** — the model's candidate cities — while ` in`/` the` lock onto *Paris*/*France* (early positions/subword tokens are noisy; rare non-Latin tokens render as boxes):
 
-![Top-1 Jacobian-lens token per layer × position](docs/jacobian_lens/token_grid_by_layer.png)
+![Top-k Jacobian-lens tokens per position, across layers](docs/jacobian_lens/token_grid.png)
 
-Reproduce it (and parametrize the layer) with [`docs/jacobian_lens/make_token_grid.py`](docs/jacobian_lens/make_token_grid.py):
+Reproduce it with [`docs/jacobian_lens/make_token_grid.py`](docs/jacobian_lens/make_token_grid.py); `--layers` selects which layers to show (one subplot each):
 
 ```bash
 python docs/jacobian_lens/make_token_grid.py --model Qwen/Qwen3-1.7B --lens qwen3-1.7b-lens.pt \
-    --prompt "The Eiffel Tower is located in the city of" --out token_grid_by_layer.png
-# top-k tokens per position at a single layer:
-python docs/jacobian_lens/make_token_grid.py --model ... --lens ... --layer 22 --k 6 --out topk.png
+    --prompt "The Eiffel Tower is located in the city of" --out token_grid.png
+# a single layer, deeper top-k:
+python docs/jacobian_lens/make_token_grid.py --model ... --lens ... --layers 22 --k 8 --out one.png
 ```
 
 (Residuals here come from HF; they're bit-identical to what vllm-lens captures during vLLM inference, so the grid is the same either way.)
