@@ -13,8 +13,6 @@ activations for both online (async) and offline (sync) usage.
 from __future__ import annotations
 
 import json
-import logging
-import os
 import pickle
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import TYPE_CHECKING, Any
@@ -28,8 +26,6 @@ from vllm_lens._helpers._serialize import (
     serialize_hook_results,
 )
 from vllm_lens._helpers.types import Hook, SteeringVector
-
-logger = logging.getLogger(__name__)
 
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 _ZSTD_DECOMPRESSOR = zstd.ZstdDecompressor()
@@ -46,6 +42,7 @@ _original_generate: Callable | None = None
 _original_llm_generate: Callable | None = None
 _original_completion_response: Callable | None = None
 _original_chat_full_generator: Callable | None = None
+_original_chat_stream_generator: Callable | None = None
 _original_register_routers: Callable | None = None
 
 
@@ -452,6 +449,44 @@ async def _patched_chat_full_generator(
     return response
 
 
+async def _patched_chat_stream_generator(
+    self, request, result_generator, *args, **kwargs
+):
+    """Wrap the streaming chat generator to append hook results as a final SSE chunk.
+
+    Captures the final ``RequestOutput`` (which has ``.hook_results``
+    attached by ``_patched_generate``), then yields an extra
+    ``data: {...}`` chunk with serialized hook results before ``[DONE]``.
+    """
+    assert _original_chat_stream_generator is not None
+
+    last_output = None
+
+    async def _capturing(gen: AsyncIterator) -> AsyncIterator:
+        nonlocal last_output
+        async for output in gen:
+            last_output = output
+            yield output
+
+    # Buffer the last chunk so we can inject hook results before [DONE].
+    async for chunk in _original_chat_stream_generator(
+        self, request, _capturing(result_generator), *args, **kwargs
+    ):
+        if chunk.strip() == "data: [DONE]" and last_output is not None:
+            import json as _json
+
+            extra: dict[str, Any] = {}
+            activations = getattr(last_output, "activations", None)
+            if activations is not None:
+                extra["activations"] = serialize_activations(activations)
+            hook_results = getattr(last_output, "hook_results", None)
+            if hook_results is not None:
+                extra["hook_results"] = serialize_hook_results(hook_results)
+            if extra:
+                yield f"data: {_json.dumps(extra)}\n\n"
+        yield chunk
+
+
 # ---------------------------------------------------------------------------
 # Persistent hooks — HTTP router
 # ---------------------------------------------------------------------------
@@ -530,26 +565,11 @@ def register() -> None:
 
     Use ``extra_args={"output_residual_stream": True | list[int]}`` in
     SamplingParams to request activations.
-
-    Opt-out: set ``VLLM_LENS_DISABLE=1`` to make this a no-op. This plugin
-    auto-loads in *every* vLLM process via the ``vllm.general_plugins`` entry
-    point, and its patches force ``enforce_eager=True`` (disabling CUDA graphs)
-    on all engines. The kill switch lets vllm-lens be installed alongside a
-    trainer's inference server (e.g. prime-rl rollouts) without perturbing it.
-    Unset => unchanged default-on behaviour.
     """
-    if os.environ.get("VLLM_LENS_DISABLE", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ):
-        logger.info("VLLM_LENS_DISABLE set; vllm-lens activation plugin inactive.")
-        return
-
     global _original_create_engine_config
     global _original_generate, _original_llm_generate
     global _original_completion_response, _original_chat_full_generator
+    global _original_chat_stream_generator
     global _original_register_routers
 
     from vllm import LLM
@@ -596,6 +616,12 @@ def register() -> None:
 
         _original_chat_full_generator = OpenAIServingChat.chat_completion_full_generator
         OpenAIServingChat.chat_completion_full_generator = _patched_chat_full_generator
+        _original_chat_stream_generator = (
+            OpenAIServingChat.chat_completion_stream_generator
+        )
+        OpenAIServingChat.chat_completion_stream_generator = (
+            _patched_chat_stream_generator
+        )
     except Exception:
         pass
 
