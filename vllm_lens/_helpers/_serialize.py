@@ -1,10 +1,12 @@
-"""Tensor serialization helpers for vllm-lens activations."""
+"""Tensor serialization helpers for vllm-lens activations and hook results."""
 
 from __future__ import annotations
 
 import base64
+import json
 from typing import Any
 
+import cloudpickle
 import numpy as np
 import torch
 import zstandard as zstd
@@ -110,3 +112,61 @@ def decode_activations(response_json: dict[str, Any]) -> dict[str, Any]:
     if raw is None:
         return {}
     return {name: deserialize_tensor(encoded) for name, encoded in raw.items()}
+
+
+_JSON_SAFE_TYPES = (str, int, float, bool, type(None))
+
+
+def _serialize_value(v: Any) -> Any:
+    """Serialize a single value from ``ctx.saved`` for JSON transport."""
+    if isinstance(v, torch.Tensor):
+        return {"__type__": "tensor", **serialize_tensor(v)}
+    if isinstance(v, _JSON_SAFE_TYPES):
+        return v
+    if isinstance(v, (list, dict)):
+        # Recurse for containers — fall through to cloudpickle if nested
+        # values aren't JSON-safe.
+        try:
+            json.dumps(v)
+            return v
+        except (TypeError, ValueError):
+            pass
+    return {
+        "__type__": "cloudpickle",
+        "data": base64.b64encode(cloudpickle.dumps(v)).decode("ascii"),
+    }
+
+
+def _deserialize_value(v: Any) -> Any:
+    """Deserialize a single value from serialized hook results."""
+    if isinstance(v, dict) and "__type__" in v:
+        if v["__type__"] == "tensor":
+            return deserialize_tensor(v)
+        if v["__type__"] == "cloudpickle":
+            return cloudpickle.loads(base64.b64decode(v["data"]))
+    return v
+
+
+def serialize_hook_results(
+    results: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Serialize hook results for JSON transport.
+
+    Input (from worker): ``{hook_index_str: ctx.saved_dict}``.
+    Tensors are serialized via :func:`serialize_tensor`, JSON-safe values
+    pass through, and other types are cloudpickle'd.
+    """
+    return {
+        hook_idx: {k: _serialize_value(v) for k, v in saved.items()}
+        for hook_idx, saved in results.items()
+    }
+
+
+def deserialize_hook_results(
+    raw: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Deserialize hook results from JSON transport."""
+    return {
+        hook_idx: {k: _deserialize_value(v) for k, v in saved.items()}
+        for hook_idx, saved in raw.items()
+    }

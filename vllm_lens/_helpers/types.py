@@ -1,9 +1,12 @@
-"""Pydantic models for vllm-lens steering vectors."""
+"""Pydantic models for vllm-lens steering vectors and hooks."""
 
 from __future__ import annotations
 
+import base64
+from collections.abc import Callable
 from typing import Any, Self
 
+import cloudpickle
 import torch
 from pydantic import (
     BaseModel,
@@ -92,4 +95,146 @@ class SteeringVector(BaseModel):
     @property
     def layer_index_map(self) -> dict[int, int]:
         """Maps actual model layer index to index into ``activations`` dim-0."""
-        return {li: i for i, li in enumerate(self.layer_indices)}
+        if not hasattr(self, "_layer_index_map_cache"):
+            object.__setattr__(
+                self,
+                "_layer_index_map_cache",
+                {li: i for i, li in enumerate(self.layer_indices)},
+            )
+        return self._layer_index_map_cache  # type: ignore[reportAttributeAccessIssue]
+
+
+class HookContext:
+    """Mutable context passed to hook functions during forward passes.
+
+    Created per (hook, request) pair.  ``saved`` persists across layers
+    for the same hook, so hooks can accumulate data as each layer fires.
+    ``layer_idx`` and ``seq_len`` are updated by the dispatcher before
+    each call.
+    """
+
+    __slots__ = ("layer_idx", "seq_len", "saved", "model", "_prefetched")
+
+    def __init__(self) -> None:
+        self.layer_idx: int = 0
+        self.seq_len: int = 0
+        self.saved: dict[str, Any] = {}
+        self.model: Any = None
+        self._prefetched: dict[str, torch.Tensor] = {}
+
+    def get_parameter(self, name: str) -> torch.Tensor:
+        """Get a model parameter by name, handling TP and PP.
+
+        If the parameter was pre-fetched (via ``prefetch_parameters``
+        RPC at registration time), returns the cached copy — this works
+        across PP stages.  Otherwise falls back to a local TP gather
+        (parameter must be on this PP stage).
+
+        Example::
+
+            weight = ctx.get_parameter("lm_head.weight")
+            logits = hidden_states @ weight.T
+        """
+        if name in self._prefetched:
+            return self._prefetched[name]
+
+        import torch.distributed as dist
+
+        from vllm.distributed.parallel_state import get_tp_group
+        from vllm.model_executor.models.utils import PPMissingLayer
+
+        obj: Any = self.model
+        parts = name.split(".")
+        for attr in parts:
+            obj = getattr(obj, attr)
+            if isinstance(obj, PPMissingLayer):
+                raise AttributeError(
+                    f"Parameter {name!r} is not on this pipeline-parallel "
+                    f"stage. Pass prefetch_params=[{name!r}] to "
+                    f"register_hooks() to make it available on all ranks."
+                )
+
+        param = torch.as_tensor(obj)
+
+        # TP gather if sharded.
+        tp_group = get_tp_group()
+        module: Any = self.model
+        for attr in parts[:-1]:
+            module = getattr(module, attr)
+        tp_size = getattr(module, "tp_size", 1)
+        if tp_size > 1:
+            gathered = [torch.empty_like(param) for _ in range(tp_size)]
+            dist.all_gather(gathered, param, group=tp_group.device_group)
+            gather_dim = getattr(module, "gather_dim", 0)
+            param = torch.cat(gathered, dim=gather_dim)
+
+        return param
+
+
+class Hook(BaseModel):
+    """A user-defined hook that runs on specified layers during inference.
+
+    The callable ``fn`` receives a :class:`HookContext` and the per-request
+    hidden-states slice (shape ``(seq_len, hidden_dim)``).  Return a tensor
+    to modify hidden states, or ``None`` to leave them unchanged.
+
+    ``fn`` must be deterministic across TP ranks — non-deterministic ops
+    (e.g. ``torch.randn``) will cause divergence.
+
+    Example::
+
+        def ablate_neuron(ctx, h):
+            ctx.saved[f"pre_L{ctx.layer_idx}"] = h[:, 42].cpu()
+            h = h.clone()
+            h[:, 42] = 0
+            return h
+
+        hook = Hook(fn=ablate_neuron, layer_indices=[15, 16])
+
+    For HTTP transport, ``fn`` is serialized via cloudpickle.  This means
+    **arbitrary code execution** on the server — only use with trusted clients.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    fn: Callable[[HookContext, torch.Tensor], torch.Tensor | None]
+    """Hook function.  Signature: ``(ctx, hidden_states) -> Tensor | None``."""
+
+    layer_indices: list[int]
+    """Which model layers this hook runs on."""
+
+    pre: bool = False
+    """If True, run as a pre-hook (before the layer forward pass) instead of
+    a post-hook (after).  Pre-hooks receive the layer's input hidden states
+    and can modify them before the layer processes them.  Useful for
+    corrupting embeddings or patching inputs to specific layers."""
+
+    @field_validator("fn", mode="before")
+    @classmethod
+    def _deserialize_fn(cls, v: Any) -> Callable:
+        """Accept cloudpickle base64 dicts (from JSON transport) or raw callables."""
+        if isinstance(v, dict) and "cloudpickle" in v:
+            return cloudpickle.loads(base64.b64decode(v["cloudpickle"]))
+        if isinstance(v, (bytes, bytearray)):
+            return cloudpickle.loads(v)
+        if callable(v):
+            return v
+        raise ValueError(f"fn must be a callable or a cloudpickle dict, got {type(v)}")
+
+    @field_serializer("fn")
+    def _serialize_fn(self, v: Callable, _info: Any) -> dict[str, str]:
+        """Serialize callable to cloudpickle base64 dict for JSON transport."""
+        return {"cloudpickle": base64.b64encode(cloudpickle.dumps(v)).decode("ascii")}
+
+    @model_validator(mode="after")
+    def _check_layers(self) -> Self:
+        """Validate layer_indices is non-empty and cache as a set."""
+        if not self.layer_indices:
+            raise ValueError("layer_indices must be non-empty")
+        # Cache as frozenset for O(1) membership tests on the hot path.
+        object.__setattr__(self, "_layer_set", frozenset(self.layer_indices))
+        return self
+
+    def has_layer(self, layer_idx: int) -> bool:
+        """O(1) layer membership test (uses cached frozenset)."""
+        return layer_idx in self._layer_set  # type: ignore[reportAttributeAccessIssue]

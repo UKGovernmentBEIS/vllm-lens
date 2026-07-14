@@ -12,23 +12,42 @@ capture, and reads from ``_steering_data`` to apply any steering vectors.
 
 from __future__ import annotations
 
+import json
 import logging
 import pickle
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+import cloudpickle
 import torch
 import zstandard as zstd
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.models.utils import PPMissingLayer
 
-from vllm_lens._helpers.types import SteeringVector
+from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
 
 if TYPE_CHECKING:
     from jaxtyping import Float, Int
     from vllm.config import ParallelConfig
 
 logger = logging.getLogger(__name__)
+
+_DTYPE_LIST = [
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+    torch.int64,
+    torch.int32,
+    torch.int16,
+    torch.int8,
+    torch.float64,
+]
+_DTYPE_TO_IDX_MAP = {d: i for i, d in enumerate(_DTYPE_LIST)}
+
+
+def _dtype_to_idx(dtype: torch.dtype) -> int:
+    return _DTYPE_TO_IDX_MAP.get(dtype, 0)
+
 
 _ZSTD_COMPRESSOR = zstd.ZstdCompressor(level=1)
 
@@ -75,6 +94,40 @@ def _find_steering_configs(
         steering_id = extra_args.get("_steering_id")
         if steering_id and steering_id in extension._steering_data:
             results.extend(extension._steering_data[steering_id])
+    return results
+
+
+def _find_hook_configs(
+    extension: HiddenStatesExtension,
+    internal_req_id: str,
+    extra_args: dict[str, Any] | None,
+) -> list[Hook]:
+    """Find all hook definitions that apply to an internal request ID.
+
+    Checks three sources (in order):
+    1. Per-request hooks keyed by external ID prefix (async path).
+    2. Per-request hooks keyed by ``_hook_id`` sentinel (offline path).
+    3. Persistent hooks (apply to every request).
+    """
+    results = _find_hook_configs_no_persistent(extension, internal_req_id, extra_args)
+    results.extend(extension._persistent_hooks)
+    return results
+
+
+def _find_hook_configs_no_persistent(
+    extension: HiddenStatesExtension,
+    internal_req_id: str,
+    extra_args: dict[str, Any] | None,
+) -> list[Hook]:
+    """Find per-request hook definitions only (excludes persistent hooks)."""
+    results: list[Hook] = []
+    for external_id, hooks in extension._hook_data.items():
+        if internal_req_id.startswith(f"{external_id}-"):
+            results.extend(hooks)
+    if extra_args:
+        hook_id = extra_args.get("_hook_id")
+        if hook_id and hook_id in extension._hook_data:
+            results.extend(extension._hook_data[hook_id])
     return results
 
 
@@ -144,6 +197,36 @@ def _apply_steering(
                 if cfg.norm_match:
                     v = norm_match(target[rel], v)
                 target[rel] = target[rel] + v * cfg.scale
+
+
+def _apply_hook_delta(
+    output: torch.Tensor | tuple[torch.Tensor, ...],
+    modified_output: torch.Tensor | tuple[torch.Tensor, ...] | None,
+    hook_hidden: torch.Tensor,
+    start: int,
+    end: int,
+    result: torch.Tensor,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    """Write a post-hook's modification into the layer output.
+
+    Applies ``result - hook_hidden[start:end]`` as a delta onto
+    ``modified_output`` (cloning the original ``output`` lazily on first
+    write) and updates ``hook_hidden`` in place so later hooks in the same
+    forward pass observe the change.  Returns the (possibly newly created)
+    ``modified_output``.
+    """
+    delta = result - hook_hidden[start:end]
+    if modified_output is None:
+        if isinstance(output, tuple):
+            modified_output = (output[0].clone(), output[1])
+        else:
+            modified_output = output.clone()
+    if isinstance(modified_output, tuple):
+        modified_output[0][start:end] = modified_output[0][start:end] + delta
+    else:
+        modified_output[start:end] = modified_output[start:end] + delta
+    hook_hidden[start:end] = result
+    return modified_output
 
 
 def _hook_inner(
@@ -233,6 +316,93 @@ def _hook_inner(
                 per_req_steering[i], layer_idx, target, start, end, abs_start
             )
 
+    # --- Phase 2.5: run generic (post) hooks -------------------------
+    # Per-request and persistent hooks are stored in separate context
+    # dicts (per-request contexts are cleaned up after each request;
+    # persistent ones accumulate).  Within each dict, contexts are keyed
+    # by the hook's position in its category list — so a pre-hook and a
+    # post-hook at different positions never share a HookContext, and the
+    # returned result index ("0", "1", ...) is stable regardless of how
+    # many pre/post hooks a request mixes.  Pre-hooks are handled in
+    # _pre_hook_inner using the same position keys.
+    per_req_hooks: list[list[Hook]] = []
+    needs_hooks = False
+    persistent_hooks = extension._persistent_hooks
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        req_state = runner.requests.get(req_id)
+        extra = (
+            req_state.sampling_params.extra_args
+            if req_state and req_state.sampling_params
+            else None
+        )
+        hooks = _find_hook_configs_no_persistent(extension, req_id, extra)
+        per_req_hooks.append(hooks)
+        if hooks or persistent_hooks:
+            needs_hooks = True
+
+    if needs_hooks:
+        # Compute hidden_states (summed if tuple) same as Phase 3 does.
+        hook_src = modified_output if modified_output is not None else output
+        if isinstance(hook_src, tuple):
+            hook_hidden = (
+                hook_src[0] + hook_src[1] if hook_src[1] is not None else hook_src[0]
+            )
+        else:
+            hook_hidden = hook_src
+        # Clone to avoid aliasing — hooks read/write this independently.
+        hook_hidden = hook_hidden.clone()
+
+        def _run_post_category(
+            hooks: list[Hook],
+            store: dict[str, dict[int, HookContext]],
+            req_id: str,
+            start: int,
+            end: int,
+        ) -> None:
+            """Run the post-hooks in one category list at this layer.
+
+            Contexts live in ``store[req_id][position]``, created lazily.
+            """
+            nonlocal modified_output
+            for pos, hook in enumerate(hooks):
+                if hook.pre or not hook.has_layer(layer_idx):
+                    continue
+                ctxs = store.setdefault(req_id, {})
+                ctx = ctxs.get(pos)
+                if ctx is None:
+                    ctx = HookContext()
+                    ctxs[pos] = ctx
+                ctx.layer_idx = layer_idx
+                ctx.seq_len = end - start
+                ctx.model = runner.model
+                ctx._prefetched = extension._prefetched_params
+
+                result = hook.fn(ctx, hook_hidden[start:end])
+                if result is not None:
+                    modified_output = _apply_hook_delta(
+                        output, modified_output, hook_hidden, start, end, result
+                    )
+
+        for i in range(num_reqs):
+            if not (persistent_hooks or per_req_hooks[i]):
+                continue
+            req_id = req_ids[i]
+            start = int(query_start_loc[i].item())
+            end = int(query_start_loc[i + 1].item())
+            # Persistent hooks fire first (base layer); per-request hooks
+            # see the persistent-modified state.
+            _run_post_category(
+                persistent_hooks,
+                extension._persistent_hook_contexts,
+                req_id,
+                start,
+                end,
+            )
+            _run_post_category(
+                per_req_hooks[i], extension._hook_contexts, req_id, start, end
+            )
+
     # --- Phase 3: capture activations (rank 0 only) -----------------
     if getattr(extension, "_should_capture", True):
         capture_src = modified_output if modified_output is not None else output
@@ -257,6 +427,12 @@ def _hook_inner(
             output_residual_stream = extra.get("output_residual_stream")
             if output_residual_stream is None:
                 continue
+            # vllm_xargs passes values as strings; parse JSON lists.
+            if isinstance(output_residual_stream, str):
+                try:
+                    output_residual_stream = json.loads(output_residual_stream)
+                except (json.JSONDecodeError, ValueError):
+                    pass  # treat as truthy (capture all layers)
             if (
                 isinstance(output_residual_stream, list)
                 and layer_idx not in output_residual_stream
@@ -280,6 +456,100 @@ def _hook_inner(
     return modified_output
 
 
+def _pre_hook_inner(
+    extension: HiddenStatesExtension,
+    layer_idx: int,
+    input_tensor: torch.Tensor,
+) -> torch.Tensor | None:
+    """Run pre-hooks (hook.pre=True) on the layer input.
+
+    Only runs generic hooks — steering and activation capture are
+    post-hook operations and are not affected.
+    """
+    if not is_forward_context_available():
+        return None
+
+    runner = extension.model_runner
+    num_reqs = runner.input_batch.num_reqs
+    if num_reqs == 0:
+        return None
+
+    req_ids = runner.input_batch.req_ids
+    ctx = get_forward_context()
+    attn_metadata = ctx.attn_metadata
+    if attn_metadata is None:
+        return None
+    if isinstance(attn_metadata, list):
+        attn_metadata = attn_metadata[0]
+        if attn_metadata is None:
+            return None
+    query_start_loc: torch.Tensor | None = None
+    for _meta in attn_metadata.values():
+        if hasattr(_meta, "query_start_loc"):
+            query_start_loc = getattr(_meta, "query_start_loc")
+            break
+    if query_start_loc is None:
+        return None
+
+    # Pre-hooks share the same context stores as post-hooks, keyed by the
+    # hook's position in its category list.  A hook at a given position is
+    # either pre or post (never both), so pre and post never collide on the
+    # same key — this is what lets a request mix pre- and post-hooks safely.
+    persistent_hooks = extension._persistent_hooks
+    modified = False
+    working = input_tensor
+
+    def _run_pre_category(
+        hooks: list[Hook],
+        store: dict[str, dict[int, HookContext]],
+        req_id: str,
+        start: int,
+        end: int,
+    ) -> None:
+        """Run the pre-hooks in one category list at this layer."""
+        nonlocal working, modified
+        for pos, hook in enumerate(hooks):
+            if not hook.pre or not hook.has_layer(layer_idx):
+                continue
+            ctxs = store.setdefault(req_id, {})
+            hctx = ctxs.get(pos)
+            if hctx is None:
+                hctx = HookContext()
+                ctxs[pos] = hctx
+            hctx.layer_idx = layer_idx
+            hctx.seq_len = end - start
+            hctx.model = runner.model
+            hctx._prefetched = extension._prefetched_params
+
+            result = hook.fn(hctx, working[start:end])
+            if result is not None:
+                if not modified:
+                    working = input_tensor.clone()
+                    modified = True
+                working[start:end] = result
+
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        req_state = runner.requests.get(req_id)
+        extra = (
+            req_state.sampling_params.extra_args
+            if req_state and req_state.sampling_params
+            else None
+        )
+        per_req = _find_hook_configs_no_persistent(extension, req_id, extra)
+        if not any(h.pre for h in persistent_hooks) and not any(h.pre for h in per_req):
+            continue
+
+        start = int(query_start_loc[i].item())
+        end = int(query_start_loc[i + 1].item())
+        _run_pre_category(
+            persistent_hooks, extension._persistent_hook_contexts, req_id, start, end
+        )
+        _run_pre_category(per_req, extension._hook_contexts, req_id, start, end)
+
+    return working if modified else None
+
+
 def _make_hook(extension: HiddenStatesExtension, layer_idx: int) -> Callable:
     """Create a forward hook closure for a specific layer index."""
 
@@ -298,6 +568,37 @@ def _make_hook(extension: HiddenStatesExtension, layer_idx: int) -> Callable:
         except Exception:
             logger.warning(
                 "vllm-lens hook error on layer %d, skipping", layer_idx, exc_info=True
+            )
+            return None
+
+    return hook
+
+
+def _make_pre_hook(extension: HiddenStatesExtension, layer_idx: int) -> Callable:
+    """Create a forward pre-hook closure for a specific layer index.
+
+    vLLM decoder layers have signature
+    ``forward(positions, hidden_states, residual)`` — the hidden states
+    are at ``args[1]``, not ``args[0]``.
+    """
+
+    def hook(
+        _module: torch.nn.Module,
+        args: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, ...] | None:
+        """Forward pre-hook: run user pre-hooks on the layer input."""
+        try:
+            # hidden_states is args[1] (args[0] is positions).
+            hidden = args[1]
+            result = _pre_hook_inner(extension, layer_idx, hidden)
+            if result is not None:
+                return args[:1] + (result,) + args[2:]
+            return None
+        except Exception:
+            logger.warning(
+                "vllm-lens pre-hook error on layer %d, skipping",
+                layer_idx,
+                exc_info=True,
             )
             return None
 
@@ -333,6 +634,23 @@ class HiddenStatesExtension:
     # key (external_req_id or _steering_id) → list of SteeringVector
     _steering_data: dict[str, list[SteeringVector]] = {}
 
+    # Per-request hook definitions:
+    # key (external_req_id or _hook_id) → list of Hook
+    _hook_data: dict[str, list[Hook]] = {}
+
+    # Persistent hooks (apply to every request, not auto-cleaned):
+    _persistent_hooks: list[Hook] = []
+
+    # Per-request hook contexts, keyed by internal request ID then by the
+    # hook's position in the per-request hook list:
+    # internal_req_id → { hook_position → HookContext }
+    _hook_contexts: dict[str, dict[int, HookContext]] = {}
+
+    # Persistent hook contexts (separate from per-request to avoid cleanup
+    # conflicts), keyed the same way by position in the persistent hook list:
+    # internal_req_id → { hook_position → HookContext }
+    _persistent_hook_contexts: dict[str, dict[int, HookContext]] = {}
+
     # Whether this rank should capture activations (only TP rank 0).
     _should_capture: bool = True
 
@@ -350,9 +668,16 @@ class HiddenStatesExtension:
         if self._hooks_installed:
             return
         self._hooks_installed = True
-        # Reset to instance-level dicts (class-level defaults are shared)
+        # Reset to instance-level dicts (class-level defaults are shared).
+        # Do NOT reset _persistent_hooks — they may have been set via
+        # set_persistent_hooks() before the first generate call.
         self._captured_states = {}
         self._steering_data = {}
+        self._hook_data = {}
+        if not isinstance(self.__dict__.get("_persistent_hooks"), list):
+            self._persistent_hooks = []
+        self._hook_contexts = {}
+        self._persistent_hook_contexts = {}
 
         # Only rank 0 captures — residual streams are replicated across
         # TP ranks after all-reduce, so the data is identical.
@@ -365,6 +690,7 @@ class HiddenStatesExtension:
         for layer_idx, layer in enumerate(layers):
             if isinstance(layer, PPMissingLayer):
                 continue
+            layer.register_forward_pre_hook(_make_pre_hook(self, layer_idx))
             layer.register_forward_hook(_make_hook(self, layer_idx))
 
     # ------------------------------------------------------------------
@@ -469,3 +795,196 @@ class HiddenStatesExtension:
     def _debug_captured_states_count(self) -> int:
         """Return the number of entries in _captured_states (for testing)."""
         return len(self._captured_states)
+
+    # ------------------------------------------------------------------
+    # Hook data management (called via collective_rpc)
+    # ------------------------------------------------------------------
+
+    def set_hook_data(self, key: str, pickled_data: bytes) -> None:
+        """Receive and store hook definitions for a request.
+
+        Called via ``collective_rpc`` before generation begins.  Unpickles
+        the list of ``Hook`` instances (using cloudpickle for the callable
+        ``fn``), validates layer indices against the model, and stores them
+        keyed by *key* (an external request ID or ``_hook_id`` sentinel).
+        """
+        hooks: list[Hook] = cloudpickle.loads(pickled_data)
+        num_layers = len(_get_layers(self.model_runner.model))
+        for hook in hooks:
+            for idx in hook.layer_indices:
+                if idx < 0 or idx >= num_layers:
+                    raise ValueError(
+                        f"layer_index {idx} out of range [0, {num_layers})"
+                    )
+        self._hook_data[key] = hooks
+
+    def get_hook_results(self, external_req_id: str) -> bytes | None:
+        """Retrieve hook results (``ctx.saved`` dicts) for a request.
+
+        Returns from ALL ranks (including PP ranks that own different
+        layers).  The plugin merges results across ranks.
+        Matches by ``"{external_req_id}-"`` prefix on ``_hook_contexts``.
+        Returns ``{str(hook_position): ctx.saved}`` pickled, where
+        ``hook_position`` indexes the per-request hook list.
+        """
+        prefix = f"{external_req_id}-"
+        for req_id in list(self._hook_contexts):
+            if req_id.startswith(prefix):
+                contexts = self._hook_contexts.pop(req_id)
+                saved_dicts = {str(pos): ctx.saved for pos, ctx in contexts.items()}
+                return pickle.dumps(saved_dicts)
+        return None
+
+    def clear_hook_data(self, key: str) -> None:
+        """Remove hook definitions for a completed request."""
+        self._hook_data.pop(key, None)
+
+    def clear_hook_contexts(self, external_req_id: str) -> None:
+        """Remove hook contexts for a completed or aborted request.
+
+        Prefix-match cleanup, same pattern as ``clear_captured_states``.
+        """
+        prefix = f"{external_req_id}-"
+        for req_id in list(self._hook_contexts):
+            if req_id.startswith(prefix):
+                del self._hook_contexts[req_id]
+
+    # ------------------------------------------------------------------
+    # Persistent hook management (called via collective_rpc)
+    # ------------------------------------------------------------------
+
+    def set_persistent_hooks(self, pickled_data: bytes) -> None:
+        """Append hooks that apply to every subsequent request.
+
+        Accepts cloudpickle'd ``list[Hook]``.  Validates layer indices.
+        Appends to existing persistent hooks (call ``clear_persistent_hooks``
+        first for a clean slate).  Also ensures forward hooks are installed
+        on the model layers.
+        """
+        self.install_hooks()
+        hooks: list[Hook] = cloudpickle.loads(pickled_data)
+        num_layers = len(_get_layers(self.model_runner.model))
+        for hook in hooks:
+            for idx in hook.layer_indices:
+                if idx < 0 or idx >= num_layers:
+                    raise ValueError(
+                        f"layer_index {idx} out of range [0, {num_layers})"
+                    )
+        self._persistent_hooks.extend(hooks)
+
+    def get_all_hook_results(self) -> bytes | None:
+        """Retrieve accumulated persistent hook contexts from all requests.
+
+        Returns from ALL ranks (for PP support).  Does NOT clear — call
+        ``clear_persistent_hooks`` explicitly.
+
+        Returns pickled ``{internal_req_id: {hook_idx_str: ctx.saved}}``.
+        """
+        if not self._persistent_hook_contexts:
+            return None
+        results: dict[str, dict[str, dict[str, Any]]] = {}
+        for req_id, contexts in self._persistent_hook_contexts.items():
+            results[req_id] = {str(pos): ctx.saved for pos, ctx in contexts.items()}
+        return pickle.dumps(results)
+
+    def clear_persistent_hooks(self) -> None:
+        """Remove persistent hooks and all accumulated contexts."""
+        self._persistent_hooks = []
+        self._persistent_hook_contexts = {}
+
+    # ------------------------------------------------------------------
+    # Parameter prefetch (called via collective_rpc — all ranks in sync)
+    # ------------------------------------------------------------------
+
+    _prefetched_params: dict[str, torch.Tensor] = {}
+
+    def prefetch_parameters(self, names: list[str]) -> None:
+        """Pre-fetch and gather parameters across TP and PP ranks.
+
+        Safe to call PP collectives here because ``collective_rpc``
+        runs on all ranks simultaneously.  Results are stored in
+        ``_prefetched_params`` for use by ``HookContext.get_parameter``.
+        """
+        import torch.distributed as dist
+
+        from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+        from vllm.model_executor.models.utils import PPMissingLayer
+
+        model = self.model_runner.model
+        tp_group = get_tp_group()
+        pp_group = get_pp_group()
+
+        for name in names:
+            # Traverse to find the parameter.
+            obj: Any = model
+            parts = name.split(".")
+            is_local = True
+            for attr in parts:
+                obj = getattr(obj, attr)
+                if isinstance(obj, PPMissingLayer):
+                    is_local = False
+                    break
+
+            param: torch.Tensor | None = None
+            if is_local:
+                local_t = torch.as_tensor(obj)
+
+                # TP gather if sharded; otherwise reuse the existing tensor.
+                module: Any = model
+                for attr in parts[:-1]:
+                    module = getattr(module, attr)
+                tp_size = getattr(module, "tp_size", 1)
+                if tp_size > 1:
+                    gathered = [torch.empty_like(local_t) for _ in range(tp_size)]
+                    dist.all_gather(gathered, local_t, group=tp_group.device_group)
+                    gather_dim = getattr(module, "gather_dim", 0)
+                    param = torch.cat(gathered, dim=gather_dim)
+                else:
+                    param = local_t  # no copy — reference to existing parameter
+
+            # PP broadcast — safe here because all ranks are in this RPC.
+            if pp_group.world_size > 1:
+                has_it = torch.tensor(
+                    [1 if is_local else 0], device="cuda", dtype=torch.int32
+                )
+                all_has = [torch.zeros_like(has_it) for _ in range(pp_group.world_size)]
+                dist.all_gather(all_has, has_it, group=pp_group.device_group)
+                source_pp = next(i for i, t in enumerate(all_has) if t.item() == 1)
+                source_global = pp_group.ranks[source_pp]
+
+                if param is None:
+                    # Receive shape + dtype.
+                    meta = torch.zeros(3, device="cuda", dtype=torch.int64)
+                    dist.broadcast(meta, src=source_global, group=pp_group.device_group)
+                    ndim = int(meta[0].item())
+                    dtype = _DTYPE_LIST[int(meta[1].item())]
+                    shape_t = torch.zeros(ndim, device="cuda", dtype=torch.int64)
+                    dist.broadcast(
+                        shape_t, src=source_global, group=pp_group.device_group
+                    )
+                    shape = tuple(int(s) for s in shape_t.tolist())
+                    param = torch.empty(shape, device="cuda", dtype=dtype)
+                else:
+                    meta = torch.tensor(
+                        [param.ndim, _dtype_to_idx(param.dtype), 0],
+                        device="cuda",
+                        dtype=torch.int64,
+                    )
+                    dist.broadcast(meta, src=source_global, group=pp_group.device_group)
+                    shape_t = torch.tensor(
+                        list(param.shape),
+                        device="cuda",
+                        dtype=torch.int64,
+                    )
+                    dist.broadcast(
+                        shape_t, src=source_global, group=pp_group.device_group
+                    )
+
+                dist.broadcast(param, src=source_global, group=pp_group.device_group)
+
+            assert param is not None, f"Parameter {name!r} not found on any rank"
+            self._prefetched_params[name] = param
+
+    def clear_prefetched_params(self) -> None:
+        """Remove all pre-fetched parameters."""
+        self._prefetched_params = {}
