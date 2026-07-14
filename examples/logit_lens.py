@@ -8,7 +8,7 @@ final answer crystallizing in later layers.
 Reference: https://www.lesswrong.com/posts/AcKRB8wDds238WkfB
 
 Usage:
-    python -m vllm_lens._examples.logit_lens \\
+    python examples/logit_lens.py \\
         --base-url http://localhost:8000 \\
         --prompt "The Eiffel Tower is in the city of"
 
@@ -23,8 +23,8 @@ from typing import Any
 import torch
 from vllm_lens import Hook
 
-from ..client import VLLMLensClient
-from ._utils import find_norm, get_num_layers
+from vllm_lens.client import VLLMLensClient
+from _utils import find_norm, get_num_layers
 
 
 def run_logit_lens(

@@ -9,7 +9,7 @@ Locates where factual knowledge is stored in a transformer by:
 The output is a (n_layers, n_tokens) heatmap of causal importance.
 
 Usage:
-    python -m vllm_lens._examples.causal_tracing \\
+    python examples/causal_tracing.py \\
         --base-url http://localhost:8000 \\
         --prompt "The Eiffel Tower is in" \\
         --subject "Eiffel Tower" \\
@@ -26,8 +26,8 @@ from typing import Any
 import torch
 from vllm_lens import Hook
 
-from ..client import GenerateOutput, VLLMLensClient
-from ._utils import get_num_layers
+from vllm_lens.client import GenerateOutput, VLLMLensClient
+from _utils import get_num_layers
 
 
 def get_answer_logprob(output: GenerateOutput, answer_token: str) -> float:
