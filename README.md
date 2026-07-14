@@ -215,21 +215,20 @@ python examples/jacobian_lens.py run \
 
 This prints the (layer × position) top-1 concept grid — e.g. *Paris* emerges several layers before the model's actual next token. Pass `--baseline` to drop the `J_l` transport (plain logit-lens comparison). `run` also accepts a pre-fitted lens from the Hub (e.g. [Neuronpedia](https://huggingface.co/neuronpedia/jacobian-lens)) in place of a locally-fit one; its `d_model` must match the served model.
 
-**What does the model have "in mind"?** The top-k Jacobian-lens tokens at each prompt position (here at one mid/late layer of Qwen3-1.7B) surface concepts the model is *disposed toward* but hasn't emitted. On *"…the currency used in Japan is the"*, the ` in` position holds a slate of **countries** (France, Argentina, Japan, Italy, Brazil) and the final positions hold **yen** (with *Japanese*, *dollar*):
-
-![Top-k Jacobian-lens tokens per position — Japan / yen](docs/jacobian_lens/topk_tokens_japan.png)
-
-On *"The Eiffel Tower is located in the city of"*, the ` of` position reads out **Paris, France, Marseille, London** — the model's candidate cities — while ` in`/` the` are dominated by *Paris*/*France*:
-
-![Top-k Jacobian-lens tokens per position — Eiffel / Paris](docs/jacobian_lens/topk_tokens_eiffel.png)
-
-Reading the top-1 token across *every* (layer, position) shows the concept forming with depth — *Paris*/*France* crystallize at the final positions in the upper layers, and appear at the **"Eiffel"** token itself in the middle layers (early layers are noise; rare non-Latin tokens render as boxes):
+**What does the model have "in mind"?** Reading the top-1 Jacobian-lens token at every (layer, position) shows concepts the model is *disposed toward* but hasn't emitted, forming with depth. On Qwen3-1.7B, *Paris*/*France* crystallize at the final positions in the upper layers — and appear at the **"Eiffel"** token itself in the middle layers (early layers are noise; rare non-Latin tokens render as boxes):
 
 ![Top-1 Jacobian-lens token per layer × position](docs/jacobian_lens/token_grid_by_layer.png)
 
-**Quantitatively**, tracking the rank of the answer token by layer, the Jacobian lens drives it to rank 1 in the mid/late layers — earlier and more decisively than the plain logit lens (readouts are bit-identical whether residuals come from vLLM or HF):
+Reproduce it (and parametrize the layer) with [`docs/jacobian_lens/make_token_grid.py`](docs/jacobian_lens/make_token_grid.py):
 
-![Jacobian lens vs logit lens: rank of the answer token by layer](docs/jacobian_lens/jlens_vs_logitlens.png)
+```bash
+python docs/jacobian_lens/make_token_grid.py --model Qwen/Qwen3-1.7B --lens qwen3-1.7b-lens.pt \
+    --prompt "The Eiffel Tower is located in the city of" --out token_grid_by_layer.png
+# top-k tokens per position at a single layer:
+python docs/jacobian_lens/make_token_grid.py --model ... --lens ... --layer 22 --k 6 --out topk.png
+```
+
+(Residuals here come from HF; they're bit-identical to what vllm-lens captures during vLLM inference, so the grid is the same either way.)
 
 ### Inspect AI provider
 
