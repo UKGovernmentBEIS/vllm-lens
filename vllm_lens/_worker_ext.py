@@ -816,9 +816,7 @@ class HiddenStatesExtension:
                 return _ZSTD_COMPRESSOR.compress(pickle.dumps(payload))
         return None
 
-    def get_captured_states_batch(
-        self, external_req_ids: list[str]
-    ) -> bytes | None:
+    def get_captured_states_batch(self, external_req_ids: list[str]) -> bytes | None:
         """Retrieve captured activations for many requests in one RPC.
 
         Equivalent to calling :meth:`get_captured_states` once per id, but
