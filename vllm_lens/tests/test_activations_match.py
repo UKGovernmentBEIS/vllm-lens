@@ -8,6 +8,16 @@ from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 
 from .conftest import LAYER_IDX, MODEL_NAME, PROMPT, PROMPTS
 
+# The activation snapshot is bit-sensitive to the GPU architecture (bf16
+# accumulation order differs across devices), so the committed values are only
+# valid on the device they were recorded on.  Regenerate with
+# ``pytest --snapshot-update`` on a new device and update this substring.
+_SNAPSHOT_GPU = "NVIDIA L4"
+
+
+def _current_gpu() -> str:
+    return torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""
+
 
 @pytest.fixture(scope="module")
 async def vllm_model():
@@ -96,6 +106,14 @@ class TestMatchesTransformers:
 class TestSnapshotRegression:
     """Snapshot regression: assert extracted activations don't change."""
 
+    @pytest.mark.skipif(
+        _SNAPSHOT_GPU not in _current_gpu(),
+        reason=(
+            f"Activation snapshot was recorded on {_SNAPSHOT_GPU!r}; current GPU "
+            f"({_current_gpu() or 'none'!r}) differs, so bit-level values will not "
+            "match. Regenerate with `pytest --snapshot-update` to validate here."
+        ),
+    )
     async def test_activations_snapshot(self, vllm_model, snapshot: SnapshotAssertion):
         stream = await _get_vllm_acts(vllm_model, PROMPT, "snap", max_tokens=1)
         acts = stream.cpu().float()
