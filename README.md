@@ -57,6 +57,26 @@ client.clear_hooks()
 
 Hooks let you run arbitrary Python functions on hidden states at specific layers during inference. They can capture data (via `ctx.saved`) and/or modify hidden states (by returning a tensor).
 
+**Interface.** A hook is `Hook(fn, layer_indices, pre=False)`:
+
+| Field | Meaning |
+| --- | --- |
+| `fn(ctx, hidden_states) -> Tensor \| None` | Called once per hooked layer, per request. `hidden_states` is that request's slice, shape `(seq_len, hidden_dim)`. Return a tensor to **replace** it, or `None` to leave it unchanged. |
+| `layer_indices: list[int]` | Which layers to run on. |
+| `pre: bool` | If `True`, run as a *pre-hook* — before the layer forward pass, on its input — instead of after. |
+
+The `ctx` (a `HookContext`) passed to `fn` exposes:
+
+| Attribute | Meaning |
+| --- | --- |
+| `ctx.saved: dict[str, Any]` | Scratch dict that persists across layers **and** forward passes for this hook. Returned to the client as `hook_results["<hook_index>"]` (index = the hook's position in the list you passed). |
+| `ctx.layer_idx: int` | The layer index currently firing. |
+| `ctx.seq_len: int` | Number of tokens in this request's slice. |
+| `ctx.model` | The underlying model (for architecture-specific access). |
+| `ctx.get_parameter(name) -> Tensor` | Fetch a full model parameter, gathered across TP/PP ranks — e.g. `ctx.get_parameter("lm_head.weight")`. With pipeline parallelism, `prefetch_params` the name first (see below). |
+
+`fn` runs on **every** tensor-parallel rank, so it must be deterministic across ranks (seed any randomness). For HTTP transport `fn` is serialized with cloudpickle — i.e. **arbitrary code execution** on the server, so only use with trusted clients.
+
 ```python
 from vllm import LLM, SamplingParams
 from vllm_lens import Hook
