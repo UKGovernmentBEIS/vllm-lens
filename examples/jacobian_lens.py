@@ -170,39 +170,56 @@ def fit_lens(model_name, *, n_prompts=64, dim_batch=32, max_seq_len=128):
 # ─────────────────── (2) run J_l live in vLLM (forward) ───────────────────
 
 
-def _find_norm(model):
-    """Final layer norm of a vLLM model (Qwen/Llama/Gemma layouts). Defined here
-    (not imported from _utils) so it pickles by value into the worker-side hook."""
-    if hasattr(model, "model") and hasattr(model.model, "norm"):
-        return model.model.norm
-    lm = getattr(model, "language_model", None)
-    if lm is not None and hasattr(getattr(lm, "model", None), "norm"):
-        return lm.model.norm
-    return None
+def _norm_params(model_name):
+    """(rms_norm_eps, vocab_size) from a served model's text config."""
+    from transformers import AutoConfig
+
+    cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
+    return getattr(cfg, "rms_norm_eps", 1e-6), getattr(cfg, "vocab_size", None)
 
 
-def run_jlens(client, prompt, jacobians, layers, *, k=6, use_jacobian=True):
+def run_jlens(
+    client, prompt, jacobians, layers, *, k=6, use_jacobian=True,
+    norm_weight="model.norm.weight",
+):
     """Read out the top-k J-lens tokens at each (layer, position) via a hook on
-    the live vLLM worker. Returns (prompt_tokens, {layer: (ids[seq,k], probs)})."""
+    the live vLLM worker. Returns (prompt_tokens, {layer: (ids[seq,k], probs)}).
+
+    Correct under tensor/pipeline/expert parallelism: the final norm and lm_head
+    live only on the *last* PP stage (``PPMissingLayer`` elsewhere), so we
+    prefetch **both** their weights to every rank (``prefetch_params``
+    PP-broadcasts + TP-gathers) and apply the norm **manually** — a layer's hook
+    fires on whichever stage owns it, where those modules can't be called. We
+    also slice off the ``ParallelLMHead`` vocab padding. The manual norm is the
+    standard RMSNorm (Qwen/Llama/GLM/DeepSeek); a variant norm (e.g. Gemma's
+    ``1 + w`` gain, or a logit soft-cap) would need that variant here.
+    """
     from vllm_lens import Hook
 
+    rms_eps, vocab_size = _norm_params(client.model)
+
     def project_hook(ctx, h):
-        weight = ctx.get_parameter("lm_head.weight")
-        norm = _find_norm(ctx.model)
+        lm_w = ctx.get_parameter("lm_head.weight")  # [vocab_padded, d], TP-gathered
+        norm_w = ctx.get_parameter(norm_weight)  # [d], prefetched / PP-broadcast
         with torch.no_grad():
-            transported = h.float()
+            x = h.float()
             if use_jacobian and ctx.layer_idx in jacobians:
-                J = jacobians[ctx.layer_idx].to(h.device).float()
-                transported = transported @ J.T
-            normed = norm(transported) if norm is not None else transported
-            logits = normed.float() @ weight.float().T
+                J = jacobians[ctx.layer_idx].to(x.device).float()
+                x = x @ J.T
+            x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + rms_eps)
+            normed = x * norm_w.float()
+            logits = normed @ lm_w.float().T
+            if vocab_size is not None:
+                logits = logits[..., :vocab_size]  # drop ParallelLMHead padding
             probs, idx = logits.softmax(-1).topk(k, dim=-1)
         ctx.saved[f"ids_{ctx.layer_idx}"] = idx.cpu()
         ctx.saved[f"probs_{ctx.layer_idx}"] = probs.float().cpu()
         return None
 
     hook = Hook(fn=project_hook, layer_indices=layers)
-    client.prefetch_params(["lm_head.weight"])
+    # Prefetch to every rank so hooks on any PP stage can unembed.
+    client.prefetch_params(["lm_head.weight", norm_weight])
     output = client.generate(prompt, max_tokens=1, hooks=[hook], logprobs=1, echo=True)
     tokens = output.logprobs["tokens"][:-1] if output.logprobs else []
     assert output.hook_results is not None, "no hook results returned"
