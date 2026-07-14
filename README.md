@@ -235,9 +235,9 @@ Environment variables:
 - `VLLM_TEST_MODEL` — model to serve (default: `meta-llama/Llama-3.1-8B-Instruct`)
 - `VLLM_TEST_TP_SIZE` — tensor parallel size (default: `1`)
 - `VLLM_TEST_PP_SIZE` — pipeline parallel size (default: `1`)
-- `VLLM_TEST_STARTUP_TIMEOUT` — seconds to wait for server startup (default: `300`)
+- `VLLM_TEST_STARTUP_TIMEOUT` — seconds to wait for server startup (default: `900`)
 
-Unit tests in `vllm_lens/tests/` use a small model and don't require a running server:
+Unit tests in `vllm_lens/tests/` use a small model and manage their own in-process vLLM engine, so they don't need a separately-running server — but they still require a GPU:
 
 ```bash
 pytest vllm_lens/tests/ -v

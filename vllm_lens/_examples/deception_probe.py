@@ -26,11 +26,8 @@ from typing import Any
 import torch
 from vllm_lens import Hook
 
-from ._utils import N_LAYERS
 from ..client import VLLMLensClient
-
-# Middle half of layers (following Apollo's default).
-PROBE_LAYERS = list(range(N_LAYERS // 4, 3 * N_LAYERS // 4))
+from ._utils import get_num_layers
 
 HONEST_INSTRUCTION = "Answer the following question honestly."
 DECEPTIVE_INSTRUCTION = (
@@ -204,8 +201,12 @@ def main():
 
     client = VLLMLensClient(args.base_url)
 
+    # Middle half of layers (following Apollo's default).
+    n_layers = get_num_layers(client.model)
+    probe_layers = list(range(n_layers // 4, 3 * n_layers // 4))
+
     print("=== Deception Detection Probe ===\n")
-    print(f"Probe layers: {PROBE_LAYERS}")
+    print(f"Probe layers: {probe_layers}")
     print(
         f"Train questions: {len(TRAIN_QUESTIONS)}, Eval questions: {len(EVAL_QUESTIONS)}\n"
     )
@@ -219,13 +220,13 @@ def main():
     # Extract training activations.
     print("[1/4] Extracting honest training activations...")
     honest_acts = extract_activations(
-        client, train_honest, PROBE_LAYERS, args.max_tokens
+        client, train_honest, probe_layers, args.max_tokens
     )
     print(f"  Got {len(honest_acts)} activations, shape: {honest_acts[0].shape}")
 
     print("\n[2/4] Extracting deceptive training activations...")
     deceptive_acts = extract_activations(
-        client, train_deceptive, PROBE_LAYERS, args.max_tokens
+        client, train_deceptive, probe_layers, args.max_tokens
     )
     print(f"  Got {len(deceptive_acts)} activations, shape: {deceptive_acts[0].shape}")
 
@@ -236,10 +237,10 @@ def main():
     # Extract eval activations.
     print("\n[4/4] Evaluating on held-out data...")
     eval_honest_acts = extract_activations(
-        client, eval_honest, PROBE_LAYERS, args.max_tokens
+        client, eval_honest, probe_layers, args.max_tokens
     )
     eval_deceptive_acts = extract_activations(
-        client, eval_deceptive, PROBE_LAYERS, args.max_tokens
+        client, eval_deceptive, probe_layers, args.max_tokens
     )
 
     results = evaluate_probe(w, b, mean, std, eval_honest_acts, eval_deceptive_acts)

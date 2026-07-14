@@ -27,7 +27,7 @@ import torch
 from vllm_lens import Hook
 
 from ..client import GenerateOutput, VLLMLensClient
-from ._utils import N_LAYERS
+from ._utils import get_num_layers
 
 
 def get_answer_logprob(output: GenerateOutput, answer_token: str) -> float:
@@ -100,7 +100,8 @@ def run_causal_trace(
 
     # --- Step 1: Clean run — capture all hidden states ---
     print("\n[1/3] Clean run with activation capture...")
-    all_layers = list(range(N_LAYERS))
+    n_layers = get_num_layers(client.model)
+    all_layers = list(range(n_layers))
 
     def capture_all(ctx, h):
         # Key by layer index for correct ordering with PP.
@@ -118,7 +119,7 @@ def run_causal_trace(
     assert clean_output.hook_results is not None
     saved = clean_output.hook_results["0"]
     n_tokens = saved["L0"].shape[0]
-    print(f"  Captured {n_tokens} token positions across {N_LAYERS} layers")
+    print(f"  Captured {n_tokens} token positions across {n_layers} layers")
 
     # Get tokens and subject positions.
     subject_positions, all_tokens = find_subject_positions(client, prompt, subject)
@@ -158,11 +159,11 @@ def run_causal_trace(
     print(f"  Generated: {corrupted_output.text!r}")
 
     # --- Step 3: Patch runs — restore clean state at each (layer, pos) ---
-    print(f"\n[3/3] Patching {N_LAYERS} layers × {n_tokens} positions...")
+    print(f"\n[3/3] Patching {n_layers} layers × {n_tokens} positions...")
 
-    patch_logprobs = torch.zeros(N_LAYERS, n_tokens)
+    patch_logprobs = torch.zeros(n_layers, n_tokens)
 
-    for layer_idx in range(N_LAYERS):
+    for layer_idx in range(n_layers):
         clean_layer_acts = saved[f"L{layer_idx}"]  # (n_tokens, hidden_dim)
 
         for token_pos in range(n_tokens):
@@ -194,7 +195,7 @@ def run_causal_trace(
             patch_logprobs[layer_idx, token_pos] = lp
 
         print(
-            f"  Layer {layer_idx:2d}/{N_LAYERS}: "
+            f"  Layer {layer_idx:2d}/{n_layers}: "
             f"max recovery = {patch_logprobs[layer_idx].max():.4f}"
         )
 

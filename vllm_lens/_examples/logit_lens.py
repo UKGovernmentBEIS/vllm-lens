@@ -24,7 +24,7 @@ import torch
 from vllm_lens import Hook
 
 from ..client import VLLMLensClient
-from ._utils import N_LAYERS, find_norm
+from ._utils import find_norm, get_num_layers
 
 
 def run_logit_lens(
@@ -39,7 +39,8 @@ def run_logit_lens(
     """
     print(f"Prompt: {prompt!r}\n")
 
-    all_layers = list(range(N_LAYERS))
+    n_layers = get_num_layers(client.model)
+    all_layers = list(range(n_layers))
 
     def project_hook(ctx, h):
         """Project hidden states through norm + unembed weight, save top-k."""
@@ -75,15 +76,15 @@ def run_logit_lens(
     assert output.hook_results is not None, "No hook results returned"
     saved = output.hook_results["0"]
     # Reconstruct ordered lists from layer-keyed results.
-    top_ids = [saved[f"ids_{i}"] for i in range(N_LAYERS)]
-    top_logits = [saved[f"logits_{i}"] for i in range(N_LAYERS)]
+    top_ids = [saved[f"ids_{i}"] for i in range(n_layers)]
+    top_logits = [saved[f"logits_{i}"] for i in range(n_layers)]
 
     return {
         "tokens": tokens,
         "generated": output.text,
         "top_ids": top_ids,
         "top_logits": top_logits,
-        "n_layers": N_LAYERS,
+        "n_layers": n_layers,
     }
 
 

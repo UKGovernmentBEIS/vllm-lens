@@ -77,9 +77,11 @@ class VLLMLensClient:
         base_url: str,
         model: str | None = None,
         api_key: str | None = None,
+        timeout: float | None = 600.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._model = model
+        self._timeout = timeout
         self._session = requests.Session()
         if api_key:
             self._session.headers["Authorization"] = f"Bearer {api_key}"
@@ -88,7 +90,9 @@ class VLLMLensClient:
     def model(self) -> str:
         """The model name served by the server."""
         if self._model is None:
-            resp = self._session.get(f"{self.base_url}/v1/models").json()
+            resp = self._session.get(
+                f"{self.base_url}/v1/models", timeout=self._timeout
+            ).json()
             self._model = resp["data"][0]["id"]
         return self._model
 
@@ -111,7 +115,9 @@ class VLLMLensClient:
 
     def _parse_response(self, resp: dict[str, Any]) -> GenerateOutput:
         if "error" in resp:
-            raise RuntimeError(resp["error"].get("message", resp["error"]))
+            error = resp["error"]
+            message = error.get("message", error) if isinstance(error, dict) else error
+            raise RuntimeError(str(message))
 
         choice = resp["choices"][0]
         text = choice.get("message", {}).get("content") or choice.get("text", "")
@@ -170,7 +176,9 @@ class VLLMLensClient:
         if xargs:
             body["vllm_xargs"] = xargs
 
-        resp = self._session.post(f"{self.base_url}/v1/completions", json=body).json()
+        resp = self._session.post(
+            f"{self.base_url}/v1/completions", json=body, timeout=self._timeout
+        ).json()
         return self._parse_response(resp)
 
     def chat(
@@ -207,7 +215,7 @@ class VLLMLensClient:
             body["vllm_xargs"] = xargs
 
         resp = self._session.post(
-            f"{self.base_url}/v1/chat/completions", json=body
+            f"{self.base_url}/v1/chat/completions", json=body, timeout=self._timeout
         ).json()
         return self._parse_response(resp)
 
@@ -233,6 +241,7 @@ class VLLMLensClient:
         resp = self._session.post(
             f"{self.base_url}/v1/hooks/register",
             json=body,
+            timeout=self._timeout,
         ).json()
         if resp.get("status") != "ok":
             raise RuntimeError(f"Failed to register hooks: {resp}")
@@ -243,7 +252,9 @@ class VLLMLensClient:
         Returns ``{request_id: {hook_index: ctx.saved}}``.
         Non-destructive — call :meth:`clear_hooks` to clean up.
         """
-        resp = self._session.post(f"{self.base_url}/v1/hooks/collect").json()
+        resp = self._session.post(
+            f"{self.base_url}/v1/hooks/collect", timeout=self._timeout
+        ).json()
         results = resp.get("results", {})
         return {
             req_id: deserialize_hook_results(hook_data)
@@ -252,7 +263,7 @@ class VLLMLensClient:
 
     def clear_hooks(self) -> None:
         """Remove all persistent hooks and accumulated results."""
-        self._session.post(f"{self.base_url}/v1/hooks/clear")
+        self._session.post(f"{self.base_url}/v1/hooks/clear", timeout=self._timeout)
 
     # ------------------------------------------------------------------
     # Parameter prefetch
@@ -268,10 +279,13 @@ class VLLMLensClient:
         resp = self._session.post(
             f"{self.base_url}/v1/hooks/prefetch",
             json={"params": names},
+            timeout=self._timeout,
         ).json()
         if resp.get("status") != "ok":
             raise RuntimeError(f"Failed to prefetch parameters: {resp}")
 
     def clear_prefetched(self) -> None:
         """Remove all pre-fetched parameters."""
-        self._session.post(f"{self.base_url}/v1/hooks/clear_prefetched")
+        self._session.post(
+            f"{self.base_url}/v1/hooks/clear_prefetched", timeout=self._timeout
+        )

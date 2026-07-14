@@ -25,9 +25,15 @@ def _engine_client(request: Request):
 @router.post("/register")
 async def register_hooks(raw_request: Request):
     body = await raw_request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Request body must be a JSON object")
     hooks_raw = body.get("hooks")
     if hooks_raw is None:
         raise HTTPException(400, "Missing 'hooks' in request body")
+    if not isinstance(hooks_raw, list) or any(
+        not isinstance(h, dict) for h in hooks_raw
+    ):
+        raise HTTPException(400, "'hooks' must be a list of objects")
     hooks = [Hook.model_validate(h) for h in hooks_raw]
     payload = cloudpickle.dumps(hooks)
     engine = _engine_client(raw_request)
@@ -82,9 +88,13 @@ async def clear_hooks(raw_request: Request):
 @router.post("/prefetch")
 async def prefetch_params(raw_request: Request):
     body = await raw_request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Request body must be a JSON object")
     names = body.get("params")
     if names is None:
         raise HTTPException(400, "Missing 'params' in request body")
+    if not isinstance(names, list) or any(not isinstance(n, str) for n in names):
+        raise HTTPException(400, "'params' must be a list of strings")
     await _engine_client(raw_request).collective_rpc(
         "prefetch_parameters", args=(names,)
     )

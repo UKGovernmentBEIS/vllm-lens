@@ -14,8 +14,10 @@ TP_SIZE = int(os.environ.get("VLLM_TEST_TP_SIZE", "1"))
 PP_SIZE = int(os.environ.get("VLLM_TEST_PP_SIZE", "1"))
 BASE_URL = f"http://localhost:{SERVER_PORT}"
 
-# How long to wait for the server to start (seconds).
-_STARTUP_TIMEOUT = int(os.environ.get("VLLM_TEST_STARTUP_TIMEOUT", "300"))
+# How long to wait for the server to start (seconds).  Large models
+# (weight download + load + CUDA-graph capture) can take well over five
+# minutes on a cold cache, so default generously and allow overriding.
+_STARTUP_TIMEOUT = int(os.environ.get("VLLM_TEST_STARTUP_TIMEOUT", "900"))
 
 
 def _server_healthy(url: str) -> bool:

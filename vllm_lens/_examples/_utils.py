@@ -2,32 +2,28 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any
 
-import requests
-
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-N_LAYERS = 32
+from transformers import AutoConfig
 
 
-def completions(
-    base_url: str,
-    prompt: str,
-    max_tokens: int = 1,
-    vllm_xargs: dict[str, Any] | None = None,
-    **kwargs: Any,
-) -> dict:
-    """Send a completion request to the vLLM server."""
-    body: dict[str, Any] = {
-        "model": MODEL,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
-        **kwargs,
-    }
-    if vllm_xargs:
-        body["vllm_xargs"] = vllm_xargs
-    return requests.post(f"{base_url}/v1/completions", json=body).json()
+@lru_cache(maxsize=None)
+def get_num_layers(model_name: str) -> int:
+    """Return the number of transformer layers for a model.
+
+    Reads the HuggingFace config so the examples work on any model, not
+    just the default 32-layer Llama-3.1-8B.  Pass the served model id
+    (e.g. ``client.model``).
+    """
+    config = AutoConfig.from_pretrained(model_name)
+    # Multimodal models nest the language-model config under text_config.
+    text_config = getattr(config, "text_config", config)
+    for attr in ("num_hidden_layers", "n_layer", "num_layers"):
+        n = getattr(text_config, attr, None)
+        if n is not None:
+            return int(n)
+    raise ValueError(f"Could not determine layer count for {model_name!r}")
 
 
 def find_norm(model: Any) -> Any:

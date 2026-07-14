@@ -199,6 +199,36 @@ def _apply_steering(
                 target[rel] = target[rel] + v * cfg.scale
 
 
+def _apply_hook_delta(
+    output: torch.Tensor | tuple[torch.Tensor, ...],
+    modified_output: torch.Tensor | tuple[torch.Tensor, ...] | None,
+    hook_hidden: torch.Tensor,
+    start: int,
+    end: int,
+    result: torch.Tensor,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    """Write a post-hook's modification into the layer output.
+
+    Applies ``result - hook_hidden[start:end]`` as a delta onto
+    ``modified_output`` (cloning the original ``output`` lazily on first
+    write) and updates ``hook_hidden`` in place so later hooks in the same
+    forward pass observe the change.  Returns the (possibly newly created)
+    ``modified_output``.
+    """
+    delta = result - hook_hidden[start:end]
+    if modified_output is None:
+        if isinstance(output, tuple):
+            modified_output = (output[0].clone(), output[1])
+        else:
+            modified_output = output.clone()
+    if isinstance(modified_output, tuple):
+        modified_output[0][start:end] = modified_output[0][start:end] + delta
+    else:
+        modified_output[start:end] = modified_output[start:end] + delta
+    hook_hidden[start:end] = result
+    return modified_output
+
+
 def _hook_inner(
     extension: HiddenStatesExtension,
     layer_idx: int,
@@ -286,12 +316,16 @@ def _hook_inner(
                 per_req_steering[i], layer_idx, target, start, end, abs_start
             )
 
-    # --- Phase 2.5: run generic hooks --------------------------------
-    # Collect per-request hooks and persistent hooks separately so their
-    # contexts are stored in different dicts (per-request contexts get
-    # cleaned up after each request; persistent ones accumulate).
+    # --- Phase 2.5: run generic (post) hooks -------------------------
+    # Per-request and persistent hooks are stored in separate context
+    # dicts (per-request contexts are cleaned up after each request;
+    # persistent ones accumulate).  Within each dict, contexts are keyed
+    # by the hook's position in its category list — so a pre-hook and a
+    # post-hook at different positions never share a HookContext, and the
+    # returned result index ("0", "1", ...) is stable regardless of how
+    # many pre/post hooks a request mixes.  Pre-hooks are handled in
+    # _pre_hook_inner using the same position keys.
     per_req_hooks: list[list[Hook]] = []
-    per_req_persistent: list[list[Hook]] = []
     needs_hooks = False
     persistent_hooks = extension._persistent_hooks
     for i in range(num_reqs):
@@ -302,11 +336,8 @@ def _hook_inner(
             if req_state and req_state.sampling_params
             else None
         )
-        # _find_hook_configs returns per-request hooks only (persistent
-        # hooks are handled separately below).
         hooks = _find_hook_configs_no_persistent(extension, req_id, extra)
         per_req_hooks.append(hooks)
-        per_req_persistent.append(persistent_hooks)
         if hooks or persistent_hooks:
             needs_hooks = True
 
@@ -322,74 +353,55 @@ def _hook_inner(
         # Clone to avoid aliasing — hooks read/write this independently.
         hook_hidden = hook_hidden.clone()
 
-        for i in range(num_reqs):
-            # Persistent hooks fire first (base layer); per-request hooks
-            # see the persistent-modified state.
-            all_hooks = per_req_persistent[i] + per_req_hooks[i]
-            if not all_hooks:
-                continue
-            req_id = req_ids[i]
-            start = int(query_start_loc[i].item())
-            end = int(query_start_loc[i + 1].item())
-            seq_len = end - start
+        def _run_post_category(
+            hooks: list[Hook],
+            store: dict[str, dict[int, HookContext]],
+            req_id: str,
+            start: int,
+            end: int,
+        ) -> None:
+            """Run the post-hooks in one category list at this layer.
 
-            # Get-or-create contexts: persistent first, then per-request
-            # (matching all_hooks order above).  Only count post-hooks
-            # (pre-hooks have their own contexts in _pre_hook_inner).
-            n_persistent_post = sum(1 for h in per_req_persistent[i] if not h.pre)
-            n_per_req_post = sum(1 for h in per_req_hooks[i] if not h.pre)
-
-            if n_persistent_post > 0:
-                if req_id not in extension._persistent_hook_contexts:
-                    extension._persistent_hook_contexts[req_id] = [
-                        HookContext() for _ in range(n_persistent_post)
-                    ]
-                ps_ctxs = extension._persistent_hook_contexts[req_id]
-            else:
-                ps_ctxs = []
-
-            if n_per_req_post > 0:
-                if req_id not in extension._hook_contexts:
-                    extension._hook_contexts[req_id] = [
-                        HookContext() for _ in range(n_per_req_post)
-                    ]
-                pr_ctxs = extension._hook_contexts[req_id]
-            else:
-                pr_ctxs = []
-
-            contexts = ps_ctxs + pr_ctxs
-
-            ctx_idx = 0
-            for hook in all_hooks:
+            Contexts live in ``store[req_id][position]``, created lazily.
+            """
+            nonlocal modified_output
+            for pos, hook in enumerate(hooks):
                 if hook.pre or not hook.has_layer(layer_idx):
-                    if not hook.pre:
-                        ctx_idx += 1
                     continue
-                ctx = contexts[ctx_idx]
-                ctx_idx += 1
+                ctxs = store.setdefault(req_id, {})
+                ctx = ctxs.get(pos)
+                if ctx is None:
+                    ctx = HookContext()
+                    ctxs[pos] = ctx
                 ctx.layer_idx = layer_idx
-                ctx.seq_len = seq_len
+                ctx.seq_len = end - start
                 ctx.model = runner.model
                 ctx._prefetched = extension._prefetched_params
 
                 result = hook.fn(ctx, hook_hidden[start:end])
-
                 if result is not None:
-                    # Apply delta so Phase 3 captures the modified state.
-                    delta = result - hook_hidden[start:end]
-                    if modified_output is None:
-                        if isinstance(output, tuple):
-                            modified_output = (output[0].clone(), output[1])
-                        else:
-                            modified_output = output.clone()
-                    if isinstance(modified_output, tuple):
-                        modified_output[0][start:end] = (
-                            modified_output[0][start:end] + delta
-                        )
-                    else:
-                        modified_output[start:end] = modified_output[start:end] + delta
-                    # Update hook_hidden so subsequent hooks see the change.
-                    hook_hidden[start:end] = result
+                    modified_output = _apply_hook_delta(
+                        output, modified_output, hook_hidden, start, end, result
+                    )
+
+        for i in range(num_reqs):
+            if not (persistent_hooks or per_req_hooks[i]):
+                continue
+            req_id = req_ids[i]
+            start = int(query_start_loc[i].item())
+            end = int(query_start_loc[i + 1].item())
+            # Persistent hooks fire first (base layer); per-request hooks
+            # see the persistent-modified state.
+            _run_post_category(
+                persistent_hooks,
+                extension._persistent_hook_contexts,
+                req_id,
+                start,
+                end,
+            )
+            _run_post_category(
+                per_req_hooks[i], extension._hook_contexts, req_id, start, end
+            )
 
     # --- Phase 3: capture activations (rank 0 only) -----------------
     if getattr(extension, "_should_capture", True):
@@ -479,60 +491,33 @@ def _pre_hook_inner(
     if query_start_loc is None:
         return None
 
-    # Collect pre-hooks from per-request and persistent sources.
+    # Pre-hooks share the same context stores as post-hooks, keyed by the
+    # hook's position in its category list.  A hook at a given position is
+    # either pre or post (never both), so pre and post never collide on the
+    # same key — this is what lets a request mix pre- and post-hooks safely.
     persistent_hooks = extension._persistent_hooks
     modified = False
     working = input_tensor
 
-    for i in range(num_reqs):
-        req_id = req_ids[i]
-        req_state = runner.requests.get(req_id)
-        extra = (
-            req_state.sampling_params.extra_args
-            if req_state and req_state.sampling_params
-            else None
-        )
-        all_hooks = [h for h in persistent_hooks if h.pre]
-        per_req = _find_hook_configs_no_persistent(extension, req_id, extra)
-        all_hooks.extend(h for h in per_req if h.pre)
-        if not all_hooks:
-            continue
-
-        start = int(query_start_loc[i].item())
-        end = int(query_start_loc[i + 1].item())
-        seq_len = end - start
-
-        # Get-or-create contexts under the same req_id as post-hooks
-        # (no prefix) so get_hook_results / clear_hook_contexts can find them.
-        n_persistent_pre = sum(1 for h in persistent_hooks if h.pre)
-        n_per_req_pre = sum(1 for h in per_req if h.pre)
-
-        if n_persistent_pre > 0:
-            if req_id not in extension._persistent_hook_contexts:
-                extension._persistent_hook_contexts[req_id] = [
-                    HookContext() for _ in range(n_persistent_pre)
-                ]
-            ps_ctxs = extension._persistent_hook_contexts[req_id]
-        else:
-            ps_ctxs = []
-
-        if n_per_req_pre > 0:
-            if req_id not in extension._hook_contexts:
-                extension._hook_contexts[req_id] = [
-                    HookContext() for _ in range(n_per_req_pre)
-                ]
-            pr_ctxs = extension._hook_contexts[req_id]
-        else:
-            pr_ctxs = []
-
-        contexts = ps_ctxs + pr_ctxs
-
-        for hi, hook in enumerate(all_hooks):
-            if not hook.has_layer(layer_idx):
+    def _run_pre_category(
+        hooks: list[Hook],
+        store: dict[str, dict[int, HookContext]],
+        req_id: str,
+        start: int,
+        end: int,
+    ) -> None:
+        """Run the pre-hooks in one category list at this layer."""
+        nonlocal working, modified
+        for pos, hook in enumerate(hooks):
+            if not hook.pre or not hook.has_layer(layer_idx):
                 continue
-            hctx = contexts[hi]
+            ctxs = store.setdefault(req_id, {})
+            hctx = ctxs.get(pos)
+            if hctx is None:
+                hctx = HookContext()
+                ctxs[pos] = hctx
             hctx.layer_idx = layer_idx
-            hctx.seq_len = seq_len
+            hctx.seq_len = end - start
             hctx.model = runner.model
             hctx._prefetched = extension._prefetched_params
 
@@ -542,6 +527,25 @@ def _pre_hook_inner(
                     working = input_tensor.clone()
                     modified = True
                 working[start:end] = result
+
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        req_state = runner.requests.get(req_id)
+        extra = (
+            req_state.sampling_params.extra_args
+            if req_state and req_state.sampling_params
+            else None
+        )
+        per_req = _find_hook_configs_no_persistent(extension, req_id, extra)
+        if not any(h.pre for h in persistent_hooks) and not any(h.pre for h in per_req):
+            continue
+
+        start = int(query_start_loc[i].item())
+        end = int(query_start_loc[i + 1].item())
+        _run_pre_category(
+            persistent_hooks, extension._persistent_hook_contexts, req_id, start, end
+        )
+        _run_pre_category(per_req, extension._hook_contexts, req_id, start, end)
 
     return working if modified else None
 
@@ -637,13 +641,15 @@ class HiddenStatesExtension:
     # Persistent hooks (apply to every request, not auto-cleaned):
     _persistent_hooks: list[Hook] = []
 
-    # Per-request hook contexts (one HookContext per hook per internal request):
-    # internal_req_id → list[HookContext]
-    _hook_contexts: dict[str, list[HookContext]] = {}
+    # Per-request hook contexts, keyed by internal request ID then by the
+    # hook's position in the per-request hook list:
+    # internal_req_id → { hook_position → HookContext }
+    _hook_contexts: dict[str, dict[int, HookContext]] = {}
 
-    # Persistent hook contexts (separate from per-request to avoid cleanup conflicts):
-    # internal_req_id → list[HookContext]
-    _persistent_hook_contexts: dict[str, list[HookContext]] = {}
+    # Persistent hook contexts (separate from per-request to avoid cleanup
+    # conflicts), keyed the same way by position in the persistent hook list:
+    # internal_req_id → { hook_position → HookContext }
+    _persistent_hook_contexts: dict[str, dict[int, HookContext]] = {}
 
     # Whether this rank should capture activations (only TP rank 0).
     _should_capture: bool = True
@@ -818,13 +824,14 @@ class HiddenStatesExtension:
         Returns from ALL ranks (including PP ranks that own different
         layers).  The plugin merges results across ranks.
         Matches by ``"{external_req_id}-"`` prefix on ``_hook_contexts``.
-        Returns ``{str(hook_index): ctx.saved}`` pickled.
+        Returns ``{str(hook_position): ctx.saved}`` pickled, where
+        ``hook_position`` indexes the per-request hook list.
         """
         prefix = f"{external_req_id}-"
         for req_id in list(self._hook_contexts):
             if req_id.startswith(prefix):
                 contexts = self._hook_contexts.pop(req_id)
-                saved_dicts = {str(i): ctx.saved for i, ctx in enumerate(contexts)}
+                saved_dicts = {str(pos): ctx.saved for pos, ctx in contexts.items()}
                 return pickle.dumps(saved_dicts)
         return None
 
@@ -877,7 +884,7 @@ class HiddenStatesExtension:
             return None
         results: dict[str, dict[str, dict[str, Any]]] = {}
         for req_id, contexts in self._persistent_hook_contexts.items():
-            results[req_id] = {str(i): ctx.saved for i, ctx in enumerate(contexts)}
+            results[req_id] = {str(pos): ctx.saved for pos, ctx in contexts.items()}
         return pickle.dumps(results)
 
     def clear_persistent_hooks(self) -> None:

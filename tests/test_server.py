@@ -372,6 +372,59 @@ def test_pre_hook_capture_is_returned(vllm_server):
     )
 
 
+def test_pre_and_post_hooks_do_not_share_contexts(vllm_server):
+    """A request mixing one pre-hook with several post-hooks must give each
+    hook its own isolated ``ctx.saved``, indexed by its position.
+
+    Regression: pre- and post-hook contexts were stored in the same
+    per-request list, sized independently by each path.  With unequal
+    pre/post counts the post path reused the (shorter) pre-sized list and
+    indexed out of bounds — the error was swallowed and later hooks' data
+    was silently dropped.
+    """
+
+    def capture_pre(ctx, h):
+        ctx.saved["pre_marker"] = float(h.shape[0])  # seq length
+        return None
+
+    def capture_post_a(ctx, h):
+        ctx.saved["post_a"] = 1.0
+        return None
+
+    def capture_post_b(ctx, h):
+        ctx.saved["post_b"] = 2.0
+        return None
+
+    hooks = [
+        Hook(fn=capture_pre, layer_indices=[0], pre=True),
+        Hook(fn=capture_post_a, layer_indices=[1]),
+        Hook(fn=capture_post_b, layer_indices=[2]),
+    ]
+    resp = requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": "Hello world",
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "vllm_xargs": {
+                "apply_hooks": json.dumps([h.model_dump() for h in hooks]),
+            },
+        },
+    ).json()
+
+    assert "error" not in resp, resp
+    results = deserialize_hook_results(resp["hook_results"])
+
+    # Each hook is keyed by its position in the passed hook list, and no
+    # hook's saved data leaks into another's.
+    assert set(results) == {"0", "1", "2"}, results
+    assert set(results["0"]) == {"pre_marker"}, results["0"]
+    assert results["1"] == {"post_a": 1.0}, results["1"]
+    assert results["2"] == {"post_b": 2.0}, results["2"]
+    assert results["0"]["pre_marker"] > 0
+
+
 def test_layer_filtering_respects_list(vllm_server):
     """output_residual_stream=[15] should capture only 1 layer, not all 32.
 
