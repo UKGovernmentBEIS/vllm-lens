@@ -51,6 +51,14 @@ results = client.collect_hook_results()
 client.clear_hooks()
 ```
 
+## Disabling the plugin
+
+vllm-lens auto-loads in **every** vLLM process (via the `vllm.general_plugins` entry point) and forces `enforce_eager=True` (disabling CUDA graphs) so its hooks can fire. To install it alongside another inference server without perturbing that server, set `VLLM_LENS_DISABLE=1` to make the plugin a complete no-op:
+
+```bash
+VLLM_LENS_DISABLE=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
+```
+
 ## Examples
 
 Runnable examples live in [`examples/`](examples/) — each is standalone; run any
