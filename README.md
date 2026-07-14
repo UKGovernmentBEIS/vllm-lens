@@ -64,6 +64,7 @@ up its own in-process engine. The notebooks are self-contained.
 | --- | --- |
 | [`causal_tracing.py`](examples/causal_tracing.py) | ROME-style causal tracing — pre-hook embedding corruption + post-hook clean-state patching, rendered as a (layer × token) heatmap. |
 | [`logit_lens.py`](examples/logit_lens.py) | Logit lens — project each layer's hidden states through the final norm + unembedding via `ctx.get_parameter("lm_head.weight")`. |
+| [`jacobian_lens.py`](examples/jacobian_lens.py) | Jacobian lens / J-space ([Anthropic global-workspace](https://transformer-circuits.pub/2026/workspace)) — like the logit lens, but transports each layer's residual through a pre-fitted average Jacobian `J_l` before unembedding, reading out what the model is "disposed to say". |
 | [`deception_probe.py`](examples/deception_probe.py) | Apollo-style linear deception probe — contrastive activation extraction with persistent hooks, then a pure-torch logistic-regression probe. |
 | [`emotion_tracker.py`](examples/emotion_tracker.py) | Anthropic emotion-concepts replication — emotion direction vectors + per-token projection tracking, with an interactive HTML visualization. |
 | [`activation_oracle.py`](examples/activation_oracle.py) | Activation Oracle steering (arXiv:2512.15674) — capture activations and steer a LoRA oracle to describe them. |
@@ -193,6 +194,26 @@ python examples/causal_tracing.py \
 ```
 
 This produces a (layers × tokens) heatmap showing which hidden states are causally important for factual recall.
+
+### Jacobian lens / J-space
+
+The [`jacobian_lens.py`](examples/jacobian_lens.py) example extends the logit lens: it transports each layer's residual through the average input-output Jacobian `J_l = E[∂h_final/∂h_l]` before the norm + unembedding, reading out what the model is *disposed to say*. Because `J_l` captures where a representation is headed, concepts surface in the mid/late layers — before the model's own output.
+
+It has two subcommands. `fit` computes `J_l` for a model in PyTorch (this needs the backward pass, so it runs under HF, once per model — the lens is prompt-independent and cached):
+
+```bash
+python examples/jacobian_lens.py fit --model Qwen/Qwen3-0.6B --out qwen3-0.6b-lens.pt
+```
+
+`run` reads the fitted lens out live in vLLM — forward-only, so the only addition over the logit lens is `J_l @ h` in the hook:
+
+```bash
+python examples/jacobian_lens.py run \
+    --base-url http://localhost:8000 --lens qwen3-0.6b-lens.pt \
+    --prompt "The Eiffel Tower is located in the city of"
+```
+
+This prints the (layer × position) top-1 concept grid — e.g. *Paris* emerges several layers before the model's actual next token. Pass `--baseline` to drop the `J_l` transport (plain logit-lens comparison). `run` also accepts a pre-fitted lens from the Hub (e.g. [Neuronpedia](https://huggingface.co/neuronpedia/jacobian-lens)) in place of a locally-fit one; its `d_model` must match the served model.
 
 ### Inspect AI provider
 
