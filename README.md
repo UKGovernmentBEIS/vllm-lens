@@ -197,38 +197,26 @@ This produces a (layers × tokens) heatmap showing which hidden states are causa
 
 ### Jacobian lens / J-space
 
-The [`jacobian_lens.py`](examples/jacobian_lens.py) example extends the logit lens: it transports each layer's residual through the average input-output Jacobian `J_l = E[∂h_final/∂h_l]` before the norm + unembedding, reading out what the model is *disposed to say*. Because `J_l` captures where a representation is headed, concepts surface in the mid/late layers — before the model's own output.
-
-It has two subcommands. `fit` computes `J_l` for a model in PyTorch (this needs the backward pass, so it runs under HF, once per model — the lens is prompt-independent and cached):
+[`jacobian_lens.py`](examples/jacobian_lens.py) extends the logit lens: it transports each layer's residual through a pre-fitted average Jacobian `J_l = E[∂h_final/∂h_l]` before the norm + unembedding, reading out the tokens a model is *disposed toward*. Fitting `J_l` needs the backward pass (HF, once per model); applying it is forward-only and runs in a hook on the vLLM worker.
 
 ```bash
-python examples/jacobian_lens.py fit --model Qwen/Qwen3-0.6B --out qwen3-0.6b-lens.pt
+# 1. fit J_l for a model (once; cached to a .pt). Needs transformers + datasets.
+python examples/jacobian_lens.py fit --model Qwen/Qwen3-1.7B --out lens.pt
+
+# 2. serve it (V1 runner so hooks work)
+VLLM_USE_V2_MODEL_RUNNER=0 vllm serve Qwen/Qwen3-1.7B
+
+# 3. read the lens out live against the server
+python examples/jacobian_lens.py run --lens lens.pt \
+    --prompt "The Eiffel Tower is located in the city of" \
+    --layers 14,20,24 --grid-out token_grid.png
 ```
 
-`run` reads the fitted lens out live in vLLM — forward-only, so the only addition over the logit lens is `J_l @ h` in the hook:
+`run` prints the top-1 J-lens token at each (layer, position). With `--grid-out FILE` it also writes the top-k tokens per position, one subplot per layer (needs matplotlib):
 
-```bash
-python examples/jacobian_lens.py run \
-    --base-url http://localhost:8000 --lens qwen3-0.6b-lens.pt \
-    --prompt "The Eiffel Tower is located in the city of"
-```
+![Jacobian-lens token grid](docs/jacobian_lens/token_grid.png)
 
-This prints the (layer × position) top-1 concept grid — e.g. *Paris* emerges several layers before the model's actual next token. Pass `--baseline` to drop the `J_l` transport (plain logit-lens comparison). `run` also accepts a pre-fitted lens from the Hub (e.g. [Neuronpedia](https://huggingface.co/neuronpedia/jacobian-lens)) in place of a locally-fit one; its `d_model` must match the served model.
-
-**What does the model have "in mind"?** The top-k Jacobian-lens tokens at each prompt position are the concepts the model is *disposed toward* but hasn't emitted. Shown across three layers of Qwen3-1.7B, they sharpen with depth: on *"The Eiffel Tower is located in the city of"*, mid-layers hold fuzzy country candidates (Germany/France/America/Spain), and by the upper layers the ` of` position reads out **Paris, France, Marseille, Berlin** — the model's candidate cities — while ` in`/` the` lock onto *Paris*/*France* (early positions/subword tokens are noisy; rare non-Latin tokens render as boxes):
-
-![Top-k Jacobian-lens tokens per position, across layers](docs/jacobian_lens/token_grid.png)
-
-Reproduce it with [`docs/jacobian_lens/make_token_grid.py`](docs/jacobian_lens/make_token_grid.py); `--layers` selects which layers to show (one subplot each):
-
-```bash
-python docs/jacobian_lens/make_token_grid.py --model Qwen/Qwen3-1.7B --lens qwen3-1.7b-lens.pt \
-    --prompt "The Eiffel Tower is located in the city of" --out token_grid.png
-# a single layer, deeper top-k:
-python docs/jacobian_lens/make_token_grid.py --model ... --lens ... --layers 22 --k 8 --out one.png
-```
-
-(Residuals here come from HF; they're bit-identical to what vllm-lens captures during vLLM inference, so the grid is the same either way.)
+`--layers` picks which layers to read out (the lens is shipped to the worker, so keep it modest on large models); `--k` sets how many tokens per position; `--baseline` drops the `J_l` transport for a logit-lens comparison. `run --lens` also loads a pre-fitted Hub lens (e.g. [Neuronpedia](https://huggingface.co/neuronpedia/jacobian-lens)).
 
 ### Inspect AI provider
 

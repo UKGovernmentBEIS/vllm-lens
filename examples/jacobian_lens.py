@@ -1,34 +1,35 @@
 """Jacobian lens / J-space: read out what a model is "disposed to say".
 
 Like the logit lens, but first transports each layer's residual into the
-final-layer basis with the average input-output Jacobian
+final-layer basis with a pre-fitted average input-output Jacobian
 ``J_l = E[dh_final/dh_l]`` before the norm + unembedding::
 
     jacobian_lens_l(h) = unembed( J_l @ h )
 
-Concepts the model will emit surface in the mid/late layers, before the output
-(e.g. "...Eiffel Tower...city of" reads "Paris" well before the final token).
+Concepts the model will emit surface in the mid/late layers, before the output.
 
 Reference: Anthropic, "Verbalizable Representations Form a Global Workspace in
 Language Models" (https://transformer-circuits.pub/2026/workspace); reference
 implementation: https://github.com/anthropics/jacobian-lens (Apache-2.0), from
-which the estimator below is adapted.
+which the fitting estimator below is adapted.
 
-Two steps — fit once, then run:
+Workflow — fit once (PyTorch), serve, then read out live in vLLM:
 
-    # (1) compute J_l for a model in PyTorch (needs the backward pass; run under
-    #     HF, once per model — the lens is prompt-independent and cached):
-    python examples/jacobian_lens.py fit \\
-        --model Qwen/Qwen3-0.6B --out qwen3-0.6b-lens.pt
+    # (1) compute J_l for a model (needs the backward pass; HF, once per model):
+    python examples/jacobian_lens.py fit --model Qwen/Qwen3-1.7B --out lens.pt
 
-    # (2) run it live in vLLM (forward-only; the only addition over logit_lens
-    #     is J_l @ h in the hook). Needs a running vllm-lens server with
-    #     VLLM_USE_V2_MODEL_RUNNER=0:
-    python examples/jacobian_lens.py run \\
-        --base-url http://localhost:8000 --lens qwen3-0.6b-lens.pt \\
-        --prompt "The Eiffel Tower is located in the city of"
+    # (2) start a vllm-lens server (V1 runner so hooks work):
+    VLLM_USE_V2_MODEL_RUNNER=0 vllm serve Qwen/Qwen3-1.7B
 
-You can also `run --lens` a pre-fitted lens from the Hub (e.g. Neuronpedia).
+    # (3) read the lens out live — prints the concept grid, and with --grid-out
+    #     saves the top-k "tokens in mind" figure (one subplot per layer):
+    python examples/jacobian_lens.py run --lens lens.pt \\
+        --prompt "The Eiffel Tower is located in the city of" \\
+        --layers 14,20,24 --grid-out token_grid.png
+
+`run` also accepts a pre-fitted lens from the Hub (e.g. Neuronpedia). The lens is
+sent to the worker in the hook closure, so pass a modest set of `--layers` for
+large models. `--grid-out` needs matplotlib.
 """
 
 from __future__ import annotations
@@ -61,10 +62,10 @@ def load_lens(path: str) -> tuple[dict[int, torch.Tensor], list[int]]:
 
 
 # ─────────────────── (1) fit J_l in PyTorch (backward) ───────────────────
-# Adapted from github.com/anthropics/jacobian-lens (Apache-2.0). Estimator: for
-# each output dim, inject a one-hot cotangent at every valid target position and
-# backprop; the gradient at source position p is sum_{p'>=p} dh_final[p']/dh_l[p],
-# meaned over source positions p, averaged over prompts.
+# Adapted from github.com/anthropics/jacobian-lens (Apache-2.0). For each output
+# dim, inject a one-hot cotangent at every valid target position and backprop;
+# the gradient at source position p is sum_{p'>=p} dh_final[p']/dh_l[p], meaned
+# over source positions p, averaged over prompts.
 
 SKIP_FIRST = 16  # early positions are attention sinks with atypical statistics
 
@@ -84,21 +85,18 @@ def _hf_decoder(hf):
     raise ValueError(f"could not locate decoder layers on {type(hf).__name__}")
 
 
-def fit_lens(
-    model_name: str,
-    *,
-    n_prompts: int = 64,
-    dim_batch: int = 32,
-    max_seq_len: int = 128,
-) -> tuple[dict[int, torch.Tensor], int]:
+def fit_lens(model_name, *, n_prompts=64, dim_batch=32, max_seq_len=128):
     """Compute the average-Jacobian lens for every layer of an HF model."""
     import transformers
     from datasets import load_dataset
 
-    hf = transformers.AutoModelForCausalLM.from_pretrained(
-        model_name, dtype=torch.bfloat16
-    ).cuda()
-    hf.eval()
+    hf = (
+        transformers.AutoModelForCausalLM.from_pretrained(
+            model_name, dtype=torch.bfloat16
+        )
+        .cuda()
+        .eval()
+    )
     for p in hf.parameters():
         p.requires_grad_(False)
     tok = transformers.AutoTokenizer.from_pretrained(model_name)
@@ -119,7 +117,6 @@ def fit_lens(
         if seq_len <= SKIP_FIRST + 1:
             continue
         valid = torch.arange(SKIP_FIRST, seq_len - 1, device=ids.device)
-
         acts: dict[int, torch.Tensor] = {}
         handles = []
         min_src = min(source_layers)
@@ -138,7 +135,7 @@ def fit_lens(
         try:
             with torch.enable_grad():
                 text_module(input_ids=ids.expand(dim_batch, -1), use_cache=False)
-                target = acts[target_layer]  # [dim_batch, seq, d]
+                target = acts[target_layer]
                 srcs = [acts[lyr] for lyr in source_layers]
                 cot = torch.zeros_like(target)
                 b = torch.arange(dim_batch, device=target.device)
@@ -154,7 +151,7 @@ def fit_lens(
                         retain_graph=(pass_i < n_passes - 1),
                     )
                     for lyr, g in zip(source_layers, grads):
-                        rows = g[:n][:, valid, :].float().mean(dim=1)  # [n, d]
+                        rows = g[:n][:, valid, :].float().mean(dim=1)
                         jac_sum[lyr][start : start + n] += rows.cpu()
                     del grads
         finally:
@@ -184,12 +181,10 @@ def _find_norm(model):
     return None
 
 
-def run_jacobian_lens(
-    client, prompt, jacobians, source_layers, *, top_k=5, use_jacobian=True
-):
+def run_jlens(client, prompt, jacobians, layers, *, k=6, use_jacobian=True):
+    """Read out the top-k J-lens tokens at each (layer, position) via a hook on
+    the live vLLM worker. Returns (prompt_tokens, {layer: (ids[seq,k], probs)})."""
     from vllm_lens import Hook
-
-    print(f"Prompt: {prompt!r}")
 
     def project_hook(ctx, h):
         weight = ctx.get_parameter("lm_head.weight")
@@ -201,42 +196,112 @@ def run_jacobian_lens(
                 transported = transported @ J.T
             normed = norm(transported) if norm is not None else transported
             logits = normed.float() @ weight.float().T
-            topk = logits.topk(top_k, dim=-1)
-        ctx.saved[f"ids_{ctx.layer_idx}"] = topk.indices.cpu()
+            probs, idx = logits.softmax(-1).topk(k, dim=-1)
+        ctx.saved[f"ids_{ctx.layer_idx}"] = idx.cpu()
+        ctx.saved[f"probs_{ctx.layer_idx}"] = probs.float().cpu()
         return None
 
-    hook = Hook(fn=project_hook, layer_indices=source_layers)
+    hook = Hook(fn=project_hook, layer_indices=layers)
     client.prefetch_params(["lm_head.weight"])
-    output = client.generate(prompt, max_tokens=1, hooks=[hook], logprobs=5, echo=True)
+    output = client.generate(prompt, max_tokens=1, hooks=[hook], logprobs=1, echo=True)
     tokens = output.logprobs["tokens"][:-1] if output.logprobs else []
     assert output.hook_results is not None, "no hook results returned"
     saved = output.hook_results["0"]
-    return {
-        "tokens": tokens,
-        "top_ids": {i: saved[f"ids_{i}"] for i in source_layers},
-        "source_layers": source_layers,
-    }
+    results = {lyr: (saved[f"ids_{lyr}"], saved[f"probs_{lyr}"]) for lyr in layers}
+    return tokens, results
 
 
-def print_grid(results, model_name, layer_step=4):
-    from transformers import AutoTokenizer
-
-    tok = AutoTokenizer.from_pretrained(model_name)
-    tokens = results["tokens"]
-    layers = [lyr for lyr in results["source_layers"] if lyr % layer_step == 0]
+def print_grid(tokens, results, layers, tok, layer_step=1):
+    """Text: top-1 J-lens token at each (layer, position)."""
+    shown = [lyr for i, lyr in enumerate(layers) if i % layer_step == 0]
     header = "layer\\pos | " + " | ".join(f"{t!r:>12}" for t in tokens)
-    print("\nEach cell = Jacobian-lens top-1 token at (layer, position).\n")
+    print("\nTop-1 Jacobian-lens token per (layer, position):\n")
     print(header)
     print("-" * len(header))
-    for layer in layers:
-        top1 = results["top_ids"][layer][:, 0]
+    for lyr in shown:
+        ids = results[lyr][0][:, 0]
         cells = " | ".join(
-            f"{tok.decode([int(top1[p])])!r:>12}" for p in range(len(tokens))
+            f"{tok.decode([int(ids[p])])!r:>12}" for p in range(len(tokens))
         )
-        print(f"L{layer:>2}      | {cells}")
+        print(f"L{lyr:>2}      | {cells}")
 
 
-# ──────────────────────────────── CLI ────────────────────────────────
+def save_token_grid(tokens, results, layers, tok, out, k=6):
+    """Figure: top-k J-lens tokens per position, one subplot per layer."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+
+    ink, muted = "#0b0b0b", "#52514e"
+    blues = LinearSegmentedColormap.from_list("bb", ["#fcfcfb", "#2a78d6", "#0e2747"])
+    seq = len(tokens)
+    fig, axes = plt.subplots(
+        len(layers),
+        1,
+        figsize=(max(7, seq * 1.15), (0.5 * k + 0.7) * len(layers) + 1.2),
+        squeeze=False,
+    )
+    for ax, lyr in zip(axes[:, 0], layers):
+        ids, probs = results[lyr]
+        for c in range(seq):
+            for r in range(k):
+                word = tok.decode([int(ids[c, r])]).strip() or "·"
+                prob = float(probs[c, r])
+                y = k - 1 - r
+                ax.add_patch(
+                    plt.Rectangle(
+                        (c, y),
+                        1,
+                        1,
+                        facecolor=blues(min(prob * 2.0, 1.0)),
+                        edgecolor="#fcfcfb",
+                        linewidth=1.5,
+                    )
+                )
+                surfaced = word.lower() != tokens[c].strip().lower() and any(
+                    ch.isalpha() for ch in word
+                )
+                ax.text(
+                    c + 0.5,
+                    y + 0.5,
+                    word[:10],
+                    ha="center",
+                    va="center",
+                    fontsize=8 if len(word) > 6 else 9,
+                    color="#ffffff" if prob > 0.3 else ink,
+                    fontweight="bold" if (surfaced and r == 0) else "normal",
+                )
+        ax.set_xlim(0, seq)
+        ax.set_ylim(0, k)
+        ax.set_yticks([k - 0.5 - i for i in range(k)])
+        ax.set_yticklabels([f"top-{i + 1}" for i in range(k)], fontsize=8, color=muted)
+        ax.set_ylabel(f"layer {lyr}", fontsize=10, color=ink)
+        ax.tick_params(length=0)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+    bottom = axes[-1, 0]
+    bottom.set_xticks([i + 0.5 for i in range(seq)])
+    bottom.set_xticklabels(
+        [t.strip() or "·" for t in tokens],
+        rotation=40,
+        ha="right",
+        fontsize=10,
+        color=ink,
+    )
+    bottom.set_xlabel("prompt position", color=muted, fontsize=9)
+    for ax in axes[:-1, 0]:
+        ax.set_xticks([])
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight", facecolor="#fcfcfb")
+    print(f"wrote {out}")
+
+
+def _default_layers(source_layers, n_layers):
+    """A spread across depth (keeps the shipped lens small on large models)."""
+    want = [int(0.55 * n_layers), int(0.72 * n_layers), int(0.88 * n_layers)]
+    return sorted({min(source_layers, key=lambda f: abs(f - w)) for w in want})
 
 
 def main():
@@ -244,17 +309,27 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     f = sub.add_parser("fit", help="compute J_l for a model in PyTorch (backward)")
-    f.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    f.add_argument("--model", default="Qwen/Qwen3-1.7B")
     f.add_argument("--out", default="lens.pt")
     f.add_argument("--n-prompts", type=int, default=64)
     f.add_argument("--dim-batch", type=int, default=32)
     f.add_argument("--max-seq-len", type=int, default=128)
 
-    r = sub.add_parser("run", help="read out a fitted lens live in vLLM")
+    r = sub.add_parser("run", help="read a fitted lens out live in vLLM")
     r.add_argument("--base-url", default="http://localhost:8000")
     r.add_argument("--lens", required=True)
     r.add_argument("--prompt", default="The Eiffel Tower is located in the city of")
-    r.add_argument("--layer-step", type=int, default=4)
+    r.add_argument(
+        "--layers",
+        default=None,
+        help="comma-separated layers to read out; default spreads across depth",
+    )
+    r.add_argument("--k", type=int, default=6)
+    r.add_argument(
+        "--grid-out",
+        default=None,
+        help="save the top-k token grid PNG here (needs matplotlib)",
+    )
     r.add_argument(
         "--baseline", action="store_true", help="skip J_l (logit-lens baseline)"
     )
@@ -272,17 +347,29 @@ def main():
         print(f"saved lens -> {args.out} ({len(jacobians)} layers, d_model={d_model})")
         return
 
+    from transformers import AutoTokenizer
+
     from vllm_lens.client import VLLMLensClient
 
     jacobians, source_layers = load_lens(args.lens)
     client = VLLMLensClient(args.base_url)
     from _utils import get_num_layers
 
-    source_layers = [lyr for lyr in source_layers if lyr < get_num_layers(client.model)]
-    results = run_jacobian_lens(
-        client, args.prompt, jacobians, source_layers, use_jacobian=not args.baseline
+    n_layers = get_num_layers(client.model)
+    source_layers = [lyr for lyr in source_layers if lyr < n_layers]
+    if args.layers:
+        layers = [int(x) for x in args.layers.split(",")]
+    else:
+        layers = _default_layers(source_layers, n_layers)
+
+    tok = AutoTokenizer.from_pretrained(client.model)
+    tokens, results = run_jlens(
+        client, args.prompt, jacobians, layers, k=args.k, use_jacobian=not args.baseline
     )
-    print_grid(results, client.model, layer_step=args.layer_step)
+    print(f"Prompt: {args.prompt!r}")
+    print_grid(tokens, results, layers, tok)
+    if args.grid_out:
+        save_token_grid(tokens, results, layers, tok, args.grid_out, k=args.k)
 
 
 if __name__ == "__main__":
