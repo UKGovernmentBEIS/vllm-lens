@@ -10,13 +10,20 @@ Concepts the model will emit surface in the mid/late layers, before the output.
 
 Reference: Anthropic, "Verbalizable Representations Form a Global Workspace in
 Language Models" (https://transformer-circuits.pub/2026/workspace); reference
-implementation: https://github.com/anthropics/jacobian-lens (Apache-2.0), from
-which the fitting estimator below is adapted.
+implementation: https://github.com/anthropics/jacobian-lens (Apache-2.0).
 
-Workflow — fit once (PyTorch), serve, then read out live in vLLM:
+This script is the READOUT + VISUALIZATION half of the flow, and runs in the
+vllm-lens env. Fitting the lens is done ONCE by ``jacobian_lens_fit.py`` (in the
+separate prime-rl fit env — see ``jacobian_lens_fit_env.sh``); it scales from
+small dense models up to large MoE (e.g. GLM-4.5-Air) across GPUs/nodes and
+writes a ``lens.pt`` that this script reads back.
 
-    # (1) compute J_l for a model (needs the backward pass; HF, once per model):
-    python examples/jacobian_lens.py fit --model Qwen/Qwen3-1.7B --out lens.pt
+Workflow — fit once, serve, then read out live in vLLM:
+
+    # (1) fit J_l for a model (prime-rl fit env; single- or multi-node):
+    #     see jacobian_lens_fit.py / jacobian_lens_fit_env.sh
+    uv run --no-sync torchrun --nproc-per-node=8 \\
+        examples/jacobian_lens_fit.py --model Qwen/Qwen3-1.7B --out lens.pt
 
     # (2) start a vllm-lens server (V1 runner so hooks work):
     VLLM_USE_V2_MODEL_RUNNER=0 vllm serve Qwen/Qwen3-1.7B
@@ -35,22 +42,10 @@ large models. `--grid-out` needs matplotlib.
 from __future__ import annotations
 
 import argparse
-import math
 
 import torch
 
 # ────────────────────────────── lens I/O ──────────────────────────────
-
-
-def save_lens(jacobians: dict[int, torch.Tensor], d_model: int, out: str) -> None:
-    torch.save(
-        {
-            "J": {lyr: J.to(torch.float16) for lyr, J in jacobians.items()},
-            "source_layers": sorted(jacobians),
-            "d_model": d_model,
-        },
-        out,
-    )
 
 
 def load_lens(path: str) -> tuple[dict[int, torch.Tensor], list[int]]:
@@ -61,128 +56,7 @@ def load_lens(path: str) -> tuple[dict[int, torch.Tensor], list[int]]:
     return jacobians, sorted(jacobians)
 
 
-# ─────────────────── (1) fit J_l in PyTorch (backward) ───────────────────
-# Adapted from github.com/anthropics/jacobian-lens (Apache-2.0). For each output
-# dim, inject a one-hot cotangent at every valid target position and backprop;
-# the gradient at source position p is sum_{p'>=p} dh_final[p']/dh_l[p], meaned
-# over source positions p, averaged over prompts.
-
-SKIP_FIRST = 16  # early positions are attention sinks with atypical statistics
-
-
-def _hf_decoder(hf):
-    """Return (text_module, layers, n_layers, d_model).
-
-    Prefer the standard transformers accessors: ``get_decoder()`` unwraps
-    multimodal/composite wrappers to the callable decoder stack (invokable with
-    ``input_ids=``), and ``config.get_text_config()`` gives the text-tower dims.
-    Fall back to a small attribute-path guess-list only if ``get_decoder()`` is
-    unavailable or exposes no ``.layers`` — so this needs no per-model map.
-    """
-    cfg = hf.config.get_text_config()
-    get_decoder = getattr(hf, "get_decoder", None)
-    if callable(get_decoder):
-        try:
-            mod = get_decoder()
-        except (AttributeError, NotImplementedError):
-            mod = None
-        if mod is not None and hasattr(mod, "layers"):
-            return mod, mod.layers, cfg.num_hidden_layers, cfg.hidden_size
-    for path in ("model", "model.language_model", "language_model"):
-        mod = hf
-        try:
-            for part in path.split("."):
-                mod = getattr(mod, part)
-        except AttributeError:
-            continue
-        if hasattr(mod, "layers"):
-            return mod, mod.layers, cfg.num_hidden_layers, cfg.hidden_size
-    raise ValueError(f"could not locate decoder layers on {type(hf).__name__}")
-
-
-def fit_lens(model_name, *, n_prompts=64, dim_batch=32, max_seq_len=128):
-    """Compute the average-Jacobian lens for every layer of an HF model."""
-    import transformers
-    from datasets import load_dataset
-
-    hf = (
-        transformers.AutoModelForCausalLM.from_pretrained(
-            model_name, dtype=torch.bfloat16
-        )
-        .cuda()
-        .eval()
-    )
-    for p in hf.parameters():
-        p.requires_grad_(False)
-    tok = transformers.AutoTokenizer.from_pretrained(model_name)
-    text_module, layers, n_layers, d_model = _hf_decoder(hf)
-    source_layers = list(range(n_layers - 1))
-    target_layer = n_layers - 1
-
-    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
-    corpus = [r for r in ds["text"] if len(r) > 500 and not r.strip().startswith("=")]
-    corpus = corpus[:n_prompts]
-
-    jac_sum = {lyr: torch.zeros(d_model, d_model) for lyr in source_layers}
-    n_done = 0
-    for pi, prompt in enumerate(corpus):
-        ids = tok(prompt, return_tensors="pt", truncation=True, max_length=max_seq_len)
-        ids = ids.input_ids.cuda()
-        seq_len = ids.shape[1]
-        if seq_len <= SKIP_FIRST + 1:
-            continue
-        valid = torch.arange(SKIP_FIRST, seq_len - 1, device=ids.device)
-        acts: dict[int, torch.Tensor] = {}
-        handles = []
-        min_src = min(source_layers)
-
-        def make_hook(idx):
-            def hook(_m, _in, out):
-                t = out if torch.is_tensor(out) else out[0]
-                if idx == min_src:
-                    t.requires_grad_(True)  # root the graph at the earliest source
-                acts[idx] = t
-
-            return hook
-
-        for idx in {*source_layers, target_layer}:
-            handles.append(layers[idx].register_forward_hook(make_hook(idx)))
-        try:
-            with torch.enable_grad():
-                text_module(input_ids=ids.expand(dim_batch, -1), use_cache=False)
-                target = acts[target_layer]
-                srcs = [acts[lyr] for lyr in source_layers]
-                cot = torch.zeros_like(target)
-                b = torch.arange(dim_batch, device=target.device)
-                n_passes = math.ceil(d_model / dim_batch)
-                for pass_i, start in enumerate(range(0, d_model, dim_batch)):
-                    n = min(dim_batch, d_model - start)
-                    cot.zero_()
-                    cot[b[:n, None], valid[None, :], start + b[:n, None]] = 1.0
-                    grads = torch.autograd.grad(
-                        target,
-                        srcs,
-                        grad_outputs=cot,
-                        retain_graph=(pass_i < n_passes - 1),
-                    )
-                    for lyr, g in zip(source_layers, grads):
-                        rows = g[:n][:, valid, :].float().mean(dim=1)
-                        jac_sum[lyr][start : start + n] += rows.cpu()
-                    del grads
-        finally:
-            for h in handles:
-                h.remove()
-        n_done += 1
-        print(f"  fit prompt {pi + 1}/{len(corpus)} (seq_len={seq_len})")
-
-    if n_done == 0:
-        raise ValueError("no prompts were long enough to fit on")
-    jacobians = {lyr: jac_sum[lyr] / n_done for lyr in source_layers}
-    print(f"fit done over {n_done} prompts")
-    return jacobians, d_model
-
-
-# ─────────────────── (2) run J_l live in vLLM (forward) ───────────────────
+# ─────────────────── run J_l live in vLLM (forward) ───────────────────
 
 
 def _norm_params(model_name):
@@ -254,7 +128,13 @@ def _probe_norm_name(client, prompt):
 
 
 def run_jlens(
-    client, prompt, jacobians, layers, *, k=6, use_jacobian=True,
+    client,
+    prompt,
+    jacobians,
+    layers,
+    *,
+    k=6,
+    use_jacobian=True,
     norm_weight=None,
 ):
     """Read out the top-k J-lens tokens at each (layer, position) via a hook on
@@ -403,15 +283,11 @@ def _default_layers(source_layers, n_layers):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Jacobian lens / J-space via vllm-lens")
+    ap = argparse.ArgumentParser(
+        description="Jacobian lens / J-space readout + visualization via vllm-lens. "
+        "Fit the lens first with jacobian_lens_fit.py (prime-rl fit env)."
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
-
-    f = sub.add_parser("fit", help="compute J_l for a model in PyTorch (backward)")
-    f.add_argument("--model", default="Qwen/Qwen3-1.7B")
-    f.add_argument("--out", default="lens.pt")
-    f.add_argument("--n-prompts", type=int, default=64)
-    f.add_argument("--dim-batch", type=int, default=32)
-    f.add_argument("--max-seq-len", type=int, default=128)
 
     r = sub.add_parser("run", help="read a fitted lens out live in vLLM")
     r.add_argument("--base-url", default="http://localhost:8000")
@@ -440,17 +316,6 @@ def main():
 
     args = ap.parse_args()
 
-    if args.cmd == "fit":
-        jacobians, d_model = fit_lens(
-            args.model,
-            n_prompts=args.n_prompts,
-            dim_batch=args.dim_batch,
-            max_seq_len=args.max_seq_len,
-        )
-        save_lens(jacobians, d_model, args.out)
-        print(f"saved lens -> {args.out} ({len(jacobians)} layers, d_model={d_model})")
-        return
-
     from transformers import AutoTokenizer
 
     from vllm_lens.client import VLLMLensClient
@@ -476,8 +341,13 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(client.model)
     tokens, results = run_jlens(
-        client, args.prompt, jacobians, layers, k=args.k,
-        use_jacobian=not args.baseline, norm_weight=args.norm_weight,
+        client,
+        args.prompt,
+        jacobians,
+        layers,
+        k=args.k,
+        use_jacobian=not args.baseline,
+        norm_weight=args.norm_weight,
     )
     print(f"Prompt: {args.prompt!r}")
     print_grid(tokens, results, layers, tok)

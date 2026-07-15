@@ -68,8 +68,9 @@ def save(args):
 
     hook = Hook(fn=project_hook, layer_indices=source_layers)
     client.prefetch_params(["lm_head.weight", norm_weight])
-    output = client.generate(args.prompt, max_tokens=1, hooks=[hook],
-                             logprobs=5, echo=True)
+    output = client.generate(
+        args.prompt, max_tokens=1, hooks=[hook], logprobs=5, echo=True
+    )
     tokens = output.logprobs["tokens"][:-1] if output.logprobs else []
     saved = output.hook_results["0"]
     blob = {
@@ -82,9 +83,11 @@ def save(args):
         "model": client.model,
     }
     torch.save(blob, args.out)
-    print(f"saved {args.tag} -> {args.out}  "
-          f"({len(source_layers)} layers, {len(tokens)} tokens, "
-          f"baseline={args.baseline})")
+    print(
+        f"saved {args.tag} -> {args.out}  "
+        f"({len(source_layers)} layers, {len(tokens)} tokens, "
+        f"baseline={args.baseline})"
+    )
 
 
 def cmp(args):
@@ -109,27 +112,35 @@ def cmp(args):
             gapA = float(va[p, 0] - va[p, 1])  # top1-top2 gap in A
             gapB = float(vb[p, 0] - vb[p, 1])
             flips.append((lyr, p, gapA, gapB))
-    print(f"\ntop-1 agreement: {total - top1_bad}/{total} "
-          f"({100 * (total - top1_bad) / total:.1f}%)")
+    print(
+        f"\ntop-1 agreement: {total - top1_bad}/{total} "
+        f"({100 * (total - top1_bad) / total:.1f}%)"
+    )
     print(f"max |logit(top1_A) - logit(top1_B)| drift: {max_logit_drift:.4f}")
     # A flip is explainable by fp non-determinism if the (smaller) top1-top2 gap
     # is below the observed cross-config logit drift: noise of that magnitude can
     # reorder the top-2. A flip whose gap EXCEEDS the drift is a real
     # disagreement and would signal a readout bug.
     thresh = max(max_logit_drift, 0.05)
-    unexplained = [(lyr, p, gA, gB) for lyr, p, gA, gB in flips
-                   if min(gA, gB) >= thresh]
+    unexplained = [
+        (lyr, p, gA, gB) for lyr, p, gA, gB in flips if min(gA, gB) >= thresh
+    ]
     if flips:
         print(f"\ntop-1 flips (explainable if min(gap) < drift={thresh:.3f}):")
         for lyr, p, gA, gB in sorted(flips, key=lambda x: min(x[2], x[3]))[:20]:
             tag = "REAL-DISAGREEMENT" if min(gA, gB) >= thresh else "noise"
             print(f"  L{lyr:>2} pos{p:>2}: gapA={gA:.4f} gapB={gB:.4f}  {tag}")
-        print(f"\n{len(flips) - len(unexplained)}/{len(flips)} flips explained by "
-              f"fp noise; {len(unexplained)} unexplained")
-    verdict = ("IDENTICAL top-1" if top1_bad == 0 else
-               "EQUIVALENT (all flips within fp-noise drift)"
-               if not unexplained else
-               "DIVERGENT (flips exceed drift => real disagreement)")
+        print(
+            f"\n{len(flips) - len(unexplained)}/{len(flips)} flips explained by "
+            f"fp noise; {len(unexplained)} unexplained"
+        )
+    verdict = (
+        "IDENTICAL top-1"
+        if top1_bad == 0
+        else "EQUIVALENT (all flips within fp-noise drift)"
+        if not unexplained
+        else "DIVERGENT (flips exceed drift => real disagreement)"
+    )
     print(f"\nVERDICT: {verdict}")
 
 
