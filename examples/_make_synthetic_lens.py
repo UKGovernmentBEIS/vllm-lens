@@ -47,9 +47,7 @@ def main():
         # I + small noise: well-conditioned, non-trivial transport.
         jac[lyr] = (eye + args.noise * torch.randn(d, d, generator=g)).to(torch.float16)
 
-    torch.save(
-        {"J": jac, "source_layers": source_layers, "d_model": d}, args.out
-    )
+    torch.save({"J": jac, "source_layers": source_layers, "d_model": d}, args.out)
     print(f"saved synthetic lens -> {args.out} ({len(jac)} layers, d_model={d})")
 
 
