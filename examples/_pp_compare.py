@@ -40,7 +40,9 @@ def save(args):
     source_layers = [lyr for lyr in source_layers if lyr < n]
     top_k = args.top_k
     use_jacobian = not args.baseline
-    norm_weight = "model.norm.weight"
+    # Auto-detect the final-norm weight name from the served model (same
+    # resolver the run path uses), instead of a hardcoded default.
+    norm_weight = jacobian_lens._probe_norm_name(client, args.prompt)
     cfg = AutoConfig.from_pretrained(client.model)
     cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
     rms_eps = getattr(cfg, "rms_norm_eps", 1e-6)

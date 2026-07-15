@@ -71,7 +71,23 @@ SKIP_FIRST = 16  # early positions are attention sinks with atypical statistics
 
 
 def _hf_decoder(hf):
-    """Return (text_module, layers, n_layers, d_model) across common layouts."""
+    """Return (text_module, layers, n_layers, d_model).
+
+    Prefer the standard transformers accessors: ``get_decoder()`` unwraps
+    multimodal/composite wrappers to the callable decoder stack (invokable with
+    ``input_ids=``), and ``config.get_text_config()`` gives the text-tower dims.
+    Fall back to a small attribute-path guess-list only if ``get_decoder()`` is
+    unavailable or exposes no ``.layers`` — so this needs no per-model map.
+    """
+    cfg = hf.config.get_text_config()
+    get_decoder = getattr(hf, "get_decoder", None)
+    if callable(get_decoder):
+        try:
+            mod = get_decoder()
+        except (AttributeError, NotImplementedError):
+            mod = None
+        if mod is not None and hasattr(mod, "layers"):
+            return mod, mod.layers, cfg.num_hidden_layers, cfg.hidden_size
     for path in ("model", "model.language_model", "language_model"):
         mod = hf
         try:
@@ -80,7 +96,6 @@ def _hf_decoder(hf):
         except AttributeError:
             continue
         if hasattr(mod, "layers"):
-            cfg = hf.config.get_text_config()
             return mod, mod.layers, cfg.num_hidden_layers, cfg.hidden_size
     raise ValueError(f"could not locate decoder layers on {type(hf).__name__}")
 
@@ -179,9 +194,68 @@ def _norm_params(model_name):
     return getattr(cfg, "rms_norm_eps", 1e-6), getattr(cfg, "vocab_size", None)
 
 
+def _resolve_norm_name(model):
+    """Dotted param name of the final RMSNorm weight, relative to the top-level
+    vLLM ``*ForCausalLM``.
+
+    Runs **on the worker** against the served model. Unwraps multimodal /
+    composite wrappers via ``get_language_model()`` and descends the standard
+    ``.model.norm`` (or bare ``.norm``) tree, so it covers nested/multimodal
+    layouts without a per-model attribute map. ``PPMissingLayer`` placeholders
+    keep the same submodule names on every pipeline stage, so this resolves to
+    the same dotted name on all ranks even though the weight tensor itself lives
+    only on the last PP stage.
+    """
+    parts: list[str] = []
+    m = model
+    get_lm = getattr(m, "get_language_model", None)
+    if callable(get_lm):
+        try:
+            lm = get_lm()
+        except (AttributeError, NotImplementedError):
+            lm = None
+        if lm is not None and lm is not m:
+            # Locate the (possibly nested) attribute path holding the text LM.
+            for name, mod in m.named_modules():
+                if mod is lm:
+                    parts.append(name)
+                    m = lm
+                    break
+    inner = getattr(m, "model", None)
+    if inner is not None and hasattr(inner, "norm"):
+        parts += ["model", "norm", "weight"]
+    elif hasattr(m, "norm"):
+        parts += ["norm", "weight"]
+    else:
+        raise ValueError(f"could not locate final norm on {type(model).__name__}")
+    return ".".join(parts)
+
+
+def _probe_norm_name(client, prompt):
+    """Resolve the served model's final-norm weight name via a one-shot probe.
+
+    The HTTP client can't introspect the worker's module tree, and the PP-safe
+    prefetch needs the dotted name up front — so we fire a tiny hook that walks
+    ``ctx.model`` on the worker (:func:`_resolve_norm_name`) and returns the
+    name. Works under TP/PP/EP since the module names are identical on every
+    rank; the probe only reads structure, never a (possibly missing) weight.
+    """
+    from vllm_lens import Hook
+
+    def probe(ctx, h):
+        ctx.saved["norm_name"] = _resolve_norm_name(ctx.model)
+        return None
+
+    out = client.generate(
+        prompt, max_tokens=1, hooks=[Hook(fn=probe, layer_indices=[0])]
+    )
+    assert out.hook_results is not None, "norm-name probe returned no hook results"
+    return out.hook_results["0"]["norm_name"]
+
+
 def run_jlens(
     client, prompt, jacobians, layers, *, k=6, use_jacobian=True,
-    norm_weight="model.norm.weight",
+    norm_weight=None,
 ):
     """Read out the top-k J-lens tokens at each (layer, position) via a hook on
     the live vLLM worker. Returns (prompt_tokens, {layer: (ids[seq,k], probs)}).
@@ -194,10 +268,17 @@ def run_jlens(
     also slice off the ``ParallelLMHead`` vocab padding. The manual norm is the
     standard RMSNorm (Qwen/Llama/GLM/DeepSeek); a variant norm (e.g. Gemma's
     ``1 + w`` gain, or a logit soft-cap) would need that variant here.
+
+    ``norm_weight`` is the dotted name of the final-norm weight relative to the
+    served ``*ForCausalLM``. When ``None`` it is auto-detected from the served
+    model's structure (:func:`_probe_norm_name`), so no hardcoded default is
+    baked in; pass an explicit name to override for exotic layouts.
     """
     from vllm_lens import Hook
 
     rms_eps, vocab_size = _norm_params(client.model)
+    if norm_weight is None:
+        norm_weight = _probe_norm_name(client, prompt)
 
     def project_hook(ctx, h):
         lm_w = ctx.get_parameter("lm_head.weight")  # [vocab_padded, d], TP-gathered
@@ -350,6 +431,12 @@ def main():
     r.add_argument(
         "--baseline", action="store_true", help="skip J_l (logit-lens baseline)"
     )
+    r.add_argument(
+        "--norm-weight",
+        default=None,
+        help="dotted name of the final-norm weight (default: auto-detect from "
+        "the served model's structure)",
+    )
 
     args = ap.parse_args()
 
@@ -389,7 +476,8 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(client.model)
     tokens, results = run_jlens(
-        client, args.prompt, jacobians, layers, k=args.k, use_jacobian=not args.baseline
+        client, args.prompt, jacobians, layers, k=args.k,
+        use_jacobian=not args.baseline, norm_weight=args.norm_weight,
     )
     print(f"Prompt: {args.prompt!r}")
     print_grid(tokens, results, layers, tok)
