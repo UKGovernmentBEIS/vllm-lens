@@ -170,6 +170,14 @@ def _parse_args():
         "the default, tripping the collective watchdog. Raise this for the "
         "cache-building run (the converted 'prime/' dir is reused afterwards).",
     )
+    ap.add_argument(
+        "--per-node-convert",
+        action="store_true",
+        help="run the one-time HF->prime weight conversion on EACH node's local "
+        "rank 0 (writing a node-local 'prime/'), instead of only global rank 0. "
+        "Set this when --model is on node-local storage (e.g. /opt/dlami/nvme/...) "
+        "not shared across nodes, so every node produces its own converted cache.",
+    )
     args = ap.parse_args()
     args.ep = args.ep if args.ep == "auto" else int(args.ep)
     return args
@@ -233,6 +241,7 @@ def _build_model_config(args) -> ModelConfig:
         ac=None,
         ac_offloading=None,
         fp8=fp8,
+        per_node_convert=args.per_node_convert,
         fused_lm_head_token_chunk_size="disabled",
     )
 
