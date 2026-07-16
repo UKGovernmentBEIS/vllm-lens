@@ -171,6 +171,15 @@ def _parse_args():
         "cache-building run (the converted 'prime/' dir is reused afterwards).",
     )
     ap.add_argument(
+        "--prompts-file",
+        default=None,
+        help="JSONL file (one JSON-encoded string per line) of prompts to fit on, "
+        "instead of streaming FineWeb. Use for fully offline / reproducible runs. "
+        "When omitted, rank 0 streams FineWeb once and caches it to "
+        "'<out>.prompts.jsonl' (all ranks read that — 16 ranks streaming at once "
+        "trips HF Hub rate limits).",
+    )
+    ap.add_argument(
         "--per-node-convert",
         action="store_true",
         help="run the one-time HF->prime weight conversion on EACH node's local "
@@ -346,21 +355,44 @@ def fit(args):
     ]
 
     # --- Prompts: generic web-text matching the reference lens's
-    # "pretraining-like corpus" (FineWeb sample-10BT), streamed and tokenized
-    # directly (no dataloader/renderer). Streaming yields a deterministic order
-    # (no shuffle), so every rank sees the same prompts -> identical J per rank.
-    from datasets import load_dataset
+    # "pretraining-like corpus" (FineWeb sample-10BT). Multinode-safe: only rank 0
+    # hits the HF Hub (16 ranks streaming at once => HTTP 429), writing the chosen
+    # prompts to a shared JSONL cache; every rank then reads that file, so all
+    # ranks fit the identical corpus in a deterministic order. --prompts-file
+    # skips the fetch entirely (fully offline / reproducible).
+    import json
+    from pathlib import Path
 
-    ds = load_dataset(
-        "HuggingFaceFW/fineweb", name="sample-10BT", split="train", streaming=True
-    )
-    corpus = []
-    for row in ds:
-        text = row["text"]
-        if len(text) > 500:
-            corpus.append(text)
-            if len(corpus) >= args.n_prompts:
-                break
+    if args.prompts_file:
+        prompts_path = Path(args.prompts_file)
+    else:
+        prompts_path = Path(f"{args.out}.prompts.jsonl")
+        if world.is_master and not prompts_path.exists():
+            from datasets import load_dataset
+
+            ds = load_dataset(
+                "HuggingFaceFW/fineweb",
+                name="sample-10BT",
+                split="train",
+                streaming=True,
+            )
+            n = 0
+            tmp = Path(f"{prompts_path}.tmp")
+            with open(tmp, "w") as f:
+                for row in ds:
+                    if len(row["text"]) > 500:
+                        f.write(json.dumps(row["text"]) + "\n")
+                        n += 1
+                        if n >= args.n_prompts:
+                            break
+            os.replace(tmp, prompts_path)
+            logger.info(f"cached {n} FineWeb prompts -> {prompts_path}")
+        if dist.is_initialized():
+            dist.barrier()  # ranks wait for rank 0 to materialize the corpus
+
+    with open(prompts_path) as f:
+        corpus = [json.loads(line) for line in f if line.strip()][: args.n_prompts]
+    logger.info(f"loaded {len(corpus)} prompts from {prompts_path}")
 
     jac_sum = {lyr: torch.zeros(d_model, d_model) for lyr in source_layers}
     n_done = 0
