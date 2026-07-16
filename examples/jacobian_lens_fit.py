@@ -159,6 +159,17 @@ def _parse_args():
         default="jacobian-lens.pt",
         help="output path for the fitted lens (torch.save: J, source_layers, d_model).",
     )
+    ap.add_argument(
+        "--dist-timeout",
+        type=int,
+        default=600,
+        help="process-group (NCCL) collective timeout in seconds. The first load "
+        "of an HF checkpoint whose weights need format conversion to prime-rl's "
+        "layout is a one-time single-rank step while other ranks wait at a "
+        "barrier; for very large models (e.g. 753B) that conversion can exceed "
+        "the default, tripping the collective watchdog. Raise this for the "
+        "cache-building run (the converted 'prime/' dir is reused afterwards).",
+    )
     args = ap.parse_args()
     args.ep = args.ep if args.ep == "auto" else int(args.ep)
     return args
@@ -198,6 +209,14 @@ def _build_model_config(args) -> ModelConfig:
     blockwise_linear``) whose autograd.Function backprops grad_x, so the
     activation->activation backward flows through fp8 layers. ``--fp8 auto``
     turns it on exactly when the checkpoint declares ``quant_method == 'fp8'``.
+
+    When fp8 is enabled we also force ``optimization_dtype='bfloat16'``.
+    ``Float8BlockwiseLinear`` stores its weight in bf16 and casts to fp8 per
+    matmul (it does NOT keep fp8 weights), and prime-rl's FSDP mixed-precision
+    policy computes in bf16 regardless — so bf16 storage matches the compute
+    dtype. It is also required for memory: the default float32 storage
+    materializes a 753B model at 4 bytes/param (~188 GB per GPU at ep=16),
+    OOMing in ``model.to_empty`` before any weights load; bf16 halves that.
     """
     if args.fp8 == "auto":
         fp8 = _detect_fp8(args.model)
@@ -209,6 +228,7 @@ def _build_model_config(args) -> ModelConfig:
         ep=args.ep,
         ep_comm_backend="torch",
         attn="sdpa",
+        optimization_dtype="bfloat16" if fp8 else "float32",
         compile=None,
         ac=None,
         ac_offloading=None,
@@ -234,7 +254,7 @@ def fit(args):
     logger.info(f"Starting Jacobian-lens fitter in {world}")
 
     # --- Distributed + parallel dims (reused verbatim from the SFT trainer) ---
-    setup_torch_distributed(timeout=timedelta(seconds=600))
+    setup_torch_distributed(timeout=timedelta(seconds=args.dist_timeout))
     torch.set_float32_matmul_precision("high")
     # The cuDNN SDPA backend fails to load in some environments; disable it so
     # SDPA falls back to flash / mem-efficient / math kernels, which handle the
