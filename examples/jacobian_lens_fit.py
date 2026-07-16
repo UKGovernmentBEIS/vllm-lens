@@ -146,6 +146,15 @@ def _parse_args():
         "min(world_size, 8)). No-op for dense models.",
     )
     ap.add_argument(
+        "--fp8",
+        default="auto",
+        choices=["auto", "on", "off"],
+        help="fit an FP8-quantized checkpoint (prime-rl's blockwise FP8 linear, "
+        "whose autograd.Function backprops grad_x so activation->activation flows "
+        "through fp8 layers). 'auto' (default) enables it iff the HF config's "
+        "quantization_config.quant_method == 'fp8'. Requires SM90 (Hopper).",
+    )
+    ap.add_argument(
         "--out",
         default="jacobian-lens.pt",
         help="output path for the fitted lens (torch.save: J, source_layers, d_model).",
@@ -153,6 +162,21 @@ def _parse_args():
     args = ap.parse_args()
     args.ep = args.ep if args.ep == "auto" else int(args.ep)
     return args
+
+
+def _detect_fp8(model_name: str) -> bool:
+    """True iff the HF checkpoint is FP8-quantized.
+
+    Reads only the raw ``config.json`` (via ``get_config_dict``, which does NOT
+    instantiate the model-specific config class), so it works for custom
+    ``model_type``s without ``trust_remote_code``. ``quantization_config`` is a
+    standard top-level field.
+    """
+    from transformers import PretrainedConfig
+
+    cfg_dict, _ = PretrainedConfig.get_config_dict(model_name)
+    quant = cfg_dict.get("quantization_config") or {}
+    return quant.get("quant_method") == "fp8"
 
 
 def _build_model_config(args) -> ModelConfig:
@@ -169,7 +193,16 @@ def _build_model_config(args) -> ModelConfig:
     ``ac_offloading`` must be passed as ``None`` at construction: it defaults to
     enabled, and a ModelConfig validator re-enables ``ac`` whenever
     ``ac_offloading`` is set — so leaving it on would silently turn AC back on.
+
+    ``fp8`` enables prime-rl's blockwise FP8 linear (``replace_linear_with_fp8_
+    blockwise_linear``) whose autograd.Function backprops grad_x, so the
+    activation->activation backward flows through fp8 layers. ``--fp8 auto``
+    turns it on exactly when the checkpoint declares ``quant_method == 'fp8'``.
     """
+    if args.fp8 == "auto":
+        fp8 = _detect_fp8(args.model)
+    else:
+        fp8 = args.fp8 == "on"
     return ModelConfig(
         name=args.model,
         impl="custom",
@@ -179,6 +212,7 @@ def _build_model_config(args) -> ModelConfig:
         compile=None,
         ac=None,
         ac_offloading=None,
+        fp8=fp8,
         fused_lm_head_token_chunk_size="disabled",
     )
 
@@ -210,7 +244,9 @@ def fit(args):
     model_config = _build_model_config(args)
     resolve_ep(model_config)
     parallel_dims = get_parallel_dims(model_config, args.max_seq_len)
-    logger.info(f"Parallel dims: {parallel_dims} (ep={model_config.ep})")
+    logger.info(
+        f"Parallel dims: {parallel_dims} (ep={model_config.ep}, fp8={model_config.fp8})"
+    )
 
     # --- Model + tokenizer ---
     logger.info(f"Initializing model ({model_config.name})")
