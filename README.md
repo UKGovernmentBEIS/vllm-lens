@@ -252,7 +252,8 @@ The Jacobian lens extends the logit lens: it transports each layer's residual th
 
 1. **Fit** `J_l` with [`jacobian_lens_fit.py`](examples/jacobian_lens_fit.py) — the single source of truth for fitting. It needs the backward pass and runs in the **prime-rl fit env** (torch 2.11/cu128 + torchtitan; not the vllm-lens env), on prime-rl's FSDP2 + expert-parallel stack. This scales from small dense models on one GPU up to large MoE across many GPUs / nodes — GLM-4.5-Air (110B) is validated (cosine 1.0 vs a single-GPU reference), and the same path serves GLM-5.2. Build the env once with [`jacobian_lens_fit_env.sh`](examples/jacobian_lens_fit_env.sh).
 2. **Serve** the model under vllm-lens (the readout env).
-3. **Read out + visualize** with [`jacobian_lens.py`](examples/jacobian_lens.py) — forward-only, applied in a hook on the vLLM worker, correct under TP/PP/EP.
+3. **Read out** with [`jacobian_lens.py`](examples/jacobian_lens.py) — forward-only, applied in a hook on the vLLM worker, correct under TP/PP/EP.
+4. **Chat interactively** with [`jacobian_lens_chat.py`](examples/jacobian_lens_chat.py) — generates a self-contained HTML page where you chat with the served model and watch the top-k J-space readout at a layer you pick live.
 
 ```bash
 # 1. fit J_l (once; cached to lens.pt). In the prime-rl fit env — see
@@ -274,12 +275,14 @@ VLLM_USE_V2_MODEL_RUNNER=0 vllm serve zai-org/GLM-4.5-Air
 # 3. read the lens out live against the server (vllm-lens env)
 python examples/jacobian_lens.py run --lens lens.pt \
     --prompt "The Eiffel Tower is located in the city of" \
-    --layers 25,33,40 --grid-out token_grid.png
+    --layers 25,33,40
+
+# 4. or build an interactive HTML: chat + live J-space readout at a chosen layer
+python examples/jacobian_lens_chat.py --lens lens.pt \
+    --base-url http://localhost:8000 --out jacobian_lens_chat
 ```
 
-`run` prints the top-1 J-lens token at each (layer, position). With `--grid-out FILE` it also writes the top-k tokens per position, one subplot per layer (needs matplotlib):
-
-![Jacobian-lens token grid](docs/jacobian_lens/token_grid.png)
+`run` prints the top-1 J-lens token at each (layer, position); with `--grid-out FILE` it also writes a static top-k grid, one subplot per layer (needs matplotlib). `jacobian_lens_chat.py` writes a self-contained HTML page: send a message and the response's top-k J-space tokens are shown per position, with a dropdown to switch the readout layer instantly.
 
 `--layers` picks which layers to read out (the lens is shipped to the worker, so keep it modest on large models — and fit only the layers you'll read out); `--k` sets how many tokens per position; `--baseline` drops the `J_l` transport for a logit-lens comparison; `--norm-weight` overrides the auto-detected final-norm weight name. `run --lens` also loads a pre-fitted Hub lens (e.g. [Neuronpedia](https://huggingface.co/neuronpedia/jacobian-lens)).
 
