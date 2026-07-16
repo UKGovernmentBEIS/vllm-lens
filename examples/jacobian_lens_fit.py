@@ -255,6 +255,29 @@ def _build_model_config(args) -> ModelConfig:
     )
 
 
+def _needs_packed_batching(model: torch.nn.Module) -> bool:
+    """True for models whose forward requires a PACKED, batch-1 varlen layout.
+
+    DSA (DeepSeek Sparse Attention, e.g. GLM-5.2 ``model_type == 'glm_moe_dsa'``)
+    flattens ``position_ids`` to one sequence and builds per-token sparse-window
+    bounds ``ks = arange(S) - flat_position_ids``, ``ke = arange(1, S+1)``; its
+    ``compute_sparse_indices`` strips the batch dim (``hidden_states[0]``),
+    assuming batch=1. Feeding it the batched-VJP ``[dim_batch, seq]`` layout
+    crashes ("Tensors must have same number of dimensions: got 4 and 3").
+
+    For these models we instead PACK ``dim_batch`` identical copies into one flat
+    sequence with ``position_ids`` resetting to 0 at each segment boundary, which
+    the ks/ke formula turns into block-diagonal causal attention (each segment
+    attends only within itself => independent identical copies). Regular-attention
+    models are unaffected and keep the ``[dim_batch, seq]`` batched-VJP path.
+    """
+    try:
+        model_type = model.config.get_text_config().model_type
+    except Exception:
+        model_type = getattr(model.config, "model_type", None)
+    return model_type == "glm_moe_dsa"
+
+
 def _resolve_geometry(model: torch.nn.Module):
     """(decoder_layers, n_layers, d_model) on a (possibly FSDP2/EP-sharded) model.
 
@@ -332,9 +355,11 @@ def fit(args):
         f"source layers must be in [0, {target_layer}); got {source_layers}"
     )
     min_src = min(source_layers)
+    packed = _needs_packed_batching(model)
     logger.info(
         f"n_layers={n_layers} d_model={d_model} fitting {len(source_layers)} layers "
-        f"{source_layers} (target=L{target_layer}) dim_batch={args.dim_batch}"
+        f"{source_layers} (target=L{target_layer}) dim_batch={args.dim_batch} "
+        f"layout={'packed' if packed else 'batched'}"
     )
 
     # --- Forward hooks to capture residual-stream activations ---
@@ -410,13 +435,32 @@ def fit(args):
             if seq_len <= skip_first + 1:
                 continue
             valid = torch.arange(skip_first, seq_len - 1, device=device)
-            batched = ids.expand(args.dim_batch, -1)
-            position_ids = (
-                torch.arange(seq_len, device=device)
-                .unsqueeze(0)
-                .repeat(args.dim_batch, 1)
-            )
             b = torch.arange(args.dim_batch, device=device)
+
+            # Two input layouts produce the SAME per-block Jacobian rows and the
+            # SAME number of backwards (d_model/dim_batch); they differ only in how
+            # the dim_batch identical prompt copies are arranged so both regular
+            # and DSA (packed varlen) attention accept them.
+            #   * batched (regular attn): a real batch [dim_batch, seq]; row i's
+            #     one-hot cotangent selects output dim start+i.
+            #   * packed (DSA): ONE flat sequence [1, dim_batch*seq] with
+            #     position_ids resetting to 0 per segment => block-diagonal causal
+            #     attention (each segment independent+identical). Segment i's valid
+            #     positions (global i*seq + valid) seed output dim start+i.
+            if packed:
+                input_ids = ids.repeat(1, args.dim_batch)  # [1, dim_batch*seq]
+                position_ids = (
+                    torch.arange(seq_len, device=device)
+                    .repeat(args.dim_batch)
+                    .unsqueeze(0)
+                )  # [1, dim_batch*seq], resets to 0 per segment
+            else:
+                input_ids = ids.expand(args.dim_batch, -1)  # [dim_batch, seq]
+                position_ids = (
+                    torch.arange(seq_len, device=device)
+                    .unsqueeze(0)
+                    .repeat(args.dim_batch, 1)
+                )
 
             # ONE forward per prompt, then N = d_model/dim_batch backwards that
             # reuse the retained graph (each covers a different block of output
@@ -429,7 +473,7 @@ def fit(args):
             with torch.enable_grad():
                 # logits_to_keep=1 => lm_head runs on 1 position only (h_final is
                 # captured pre-norm by the hook, so lm_head output is unused).
-                model(input_ids=batched, position_ids=position_ids, logits_to_keep=1)
+                model(input_ids=input_ids, position_ids=position_ids, logits_to_keep=1)
             target = acts[target_layer]
             srcs = [acts[lyr] for lyr in source_layers]
             for s in srcs:
@@ -440,7 +484,12 @@ def fit(args):
                 for s in srcs:
                     s.grad = None  # backward accumulates into .grad; reset per block
                 cot = torch.zeros_like(target)
-                cot[b[:n, None], valid[None, :], start + b[:n, None]] = 1.0
+                if packed:
+                    # segment i (i<n): global positions i*seq + valid, dim start+i.
+                    seg = b[:n, None]  # [n, 1]
+                    cot[0, seg * seq_len + valid[None, :], start + seg] = 1.0
+                else:
+                    cot[b[:n, None], valid[None, :], start + b[:n, None]] = 1.0
                 torch.autograd.backward(
                     target,
                     grad_tensors=cot,
@@ -448,7 +497,13 @@ def fit(args):
                     inputs=srcs,
                 )
                 for lyr, s in zip(source_layers, srcs):
-                    rows = s.grad[:n][:, valid, :].float().mean(dim=1)  # [n, d_model]
+                    if packed:
+                        # [1, dim_batch*seq, d] -> [dim_batch, seq, d]; segment i's
+                        # grad is that segment's copy (block-diagonal => no leak).
+                        g = s.grad[0].reshape(args.dim_batch, seq_len, d_model)
+                        rows = g[:n][:, valid, :].float().mean(dim=1)  # [n, d_model]
+                    else:
+                        rows = s.grad[:n][:, valid, :].float().mean(dim=1)  # [n, d_model]
                     jac_sum[lyr][start : start + n] += rows.detach().cpu()
             n_done += 1
             logger.info(f"  fit prompt {pi + 1}/{len(corpus)} (seq_len={seq_len})")
