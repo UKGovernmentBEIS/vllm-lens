@@ -64,6 +64,7 @@ up its own in-process engine. The notebooks are self-contained.
 | --- | --- |
 | [`causal_tracing.py`](examples/causal_tracing.py) | ROME-style causal tracing — pre-hook embedding corruption + post-hook clean-state patching, rendered as a (layer × token) heatmap. |
 | [`logit_lens.py`](examples/logit_lens.py) | Logit lens — project each layer's hidden states through the final norm + unembedding via `ctx.get_parameter("lm_head.weight")`. |
+| [`jacobian_lens.py`](examples/jacobian_lens.py) | Jacobian lens / J-space ([Anthropic global-workspace](https://transformer-circuits.pub/2026/workspace)) — like the logit lens, but transports each layer's residual through a pre-fitted average Jacobian `J_l` before unembedding, reading out what the model is "disposed to say". Readout + visualization; the lens is fit by [`jacobian_lens_fit.py`](examples/jacobian_lens_fit.py). |
 | [`deception_probe.py`](examples/deception_probe.py) | Apollo-style linear deception probe — contrastive activation extraction with persistent hooks, then a pure-torch logistic-regression probe. |
 | [`emotion_tracker.py`](examples/emotion_tracker.py) | Anthropic emotion-concepts replication — emotion direction vectors + per-token projection tracking, with an interactive HTML visualization. |
 | [`activation_oracle.py`](examples/activation_oracle.py) | Activation Oracle steering (arXiv:2512.15674) — capture activations and steer a LoRA oracle to describe them. |
@@ -244,6 +245,43 @@ python examples/causal_tracing.py \
 ```
 
 This produces a (layers × tokens) heatmap showing which hidden states are causally important for factual recall.
+
+### Jacobian lens / J-space
+
+The Jacobian lens extends the logit lens: it transports each layer's residual through a pre-fitted average Jacobian `J_l = E[∂h_final/∂h_l]` before the norm + unembedding, reading out the tokens a model is *disposed toward*. The full flow is **fit → serve → read out + visualize**, and the fit and readout run in **two different environments** connected only by the fitted `lens.pt` (format: `{J, source_layers, d_model}`, identical in both):
+
+1. **Fit** `J_l` with [`jacobian_lens_fit.py`](examples/jacobian_lens_fit.py) — the single source of truth for fitting. It needs the backward pass and runs in the **prime-rl fit env** (torch 2.11/cu128 + torchtitan; not the vllm-lens env), on prime-rl's FSDP2 + expert-parallel stack. This scales from small dense models on one GPU up to large MoE across many GPUs / nodes — GLM-4.5-Air (110B) is validated (cosine 1.0 vs a single-GPU reference), and the same path serves GLM-5.2. Build the env once with [`jacobian_lens_fit_env.sh`](examples/jacobian_lens_fit_env.sh).
+2. **Serve** the model under vllm-lens (the readout env).
+3. **Read out + visualize** with [`jacobian_lens.py`](examples/jacobian_lens.py) — forward-only, applied in a hook on the vLLM worker, correct under TP/PP/EP.
+
+```bash
+# 1. fit J_l (once; cached to lens.pt). In the prime-rl fit env — see
+#    examples/jacobian_lens_fit_env.sh to build it. Single node:
+cd /path/to/prime-rl && unset VIRTUAL_ENV
+uv run --no-sync torchrun --nproc-per-node=8 \
+    /path/to/vllm-lens/examples/jacobian_lens_fit.py \
+    --model zai-org/GLM-4.5-Air --layers 25,33,40 --ep 8 --out lens.pt
+#    Multi-node (torchrun; run on each node, differing only in --node-rank):
+#    torchrun --nnodes=2 --node-rank=0 --nproc-per-node=8 \
+#        --rdzv-backend=c10d --rdzv-endpoint=$HEAD_IP:29500 \
+#        examples/jacobian_lens_fit.py --model ... --ep 16 --out lens.pt
+#    (SLURM: set --nnodes/--node-rank/--rdzv-endpoint from srun env — see the
+#    jacobian_lens_fit.py module docstring.)
+
+# 2. serve it under vllm-lens (V1 runner so hooks work)
+VLLM_USE_V2_MODEL_RUNNER=0 vllm serve zai-org/GLM-4.5-Air
+
+# 3. read the lens out live against the server (vllm-lens env)
+python examples/jacobian_lens.py run --lens lens.pt \
+    --prompt "The Eiffel Tower is located in the city of" \
+    --layers 25,33,40 --grid-out token_grid.png
+```
+
+`run` prints the top-1 J-lens token at each (layer, position). With `--grid-out FILE` it also writes the top-k tokens per position, one subplot per layer (needs matplotlib):
+
+![Jacobian-lens token grid](docs/jacobian_lens/token_grid.png)
+
+`--layers` picks which layers to read out (the lens is shipped to the worker, so keep it modest on large models — and fit only the layers you'll read out); `--k` sets how many tokens per position; `--baseline` drops the `J_l` transport for a logit-lens comparison; `--norm-weight` overrides the auto-detected final-norm weight name. `run --lens` also loads a pre-fitted Hub lens (e.g. [Neuronpedia](https://huggingface.co/neuronpedia/jacobian-lens)).
 
 ### Inspect AI provider
 
