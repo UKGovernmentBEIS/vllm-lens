@@ -116,8 +116,9 @@ def _parse_args():
     ap.add_argument(
         "--n-prompts",
         type=int,
-        default=32,
-        help="number of wikitext prompts to average the Jacobian over.",
+        default=1000,
+        help="number of web-text contexts to average the Jacobian over. The "
+        "reference lens uses 1000x128 tokens (~100 is usable, little gain beyond).",
     )
     ap.add_argument(
         "--dim-batch",
@@ -279,12 +280,22 @@ def fit(args):
         for idx in {*source_layers, target_layer}
     ]
 
-    # --- Prompts (wikitext, tokenized directly; no dataloader/renderer) ---
+    # --- Prompts: generic web-text matching the reference lens's
+    # "pretraining-like corpus" (FineWeb sample-10BT), streamed and tokenized
+    # directly (no dataloader/renderer). Streaming yields a deterministic order
+    # (no shuffle), so every rank sees the same prompts -> identical J per rank.
     from datasets import load_dataset
 
-    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
-    corpus = [r for r in ds["text"] if len(r) > 500 and not r.strip().startswith("=")]
-    corpus = corpus[: args.n_prompts]
+    ds = load_dataset(
+        "HuggingFaceFW/fineweb", name="sample-10BT", split="train", streaming=True
+    )
+    corpus = []
+    for row in ds:
+        text = row["text"]
+        if len(text) > 500:
+            corpus.append(text)
+            if len(corpus) >= args.n_prompts:
+                break
 
     jac_sum = {lyr: torch.zeros(d_model, d_model) for lyr in source_layers}
     n_done = 0
