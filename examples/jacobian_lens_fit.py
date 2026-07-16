@@ -31,13 +31,16 @@ Method (per prompt):
      ``requires_grad_(True)``. Backward then traverses only activation->activation
      (never per-param grads), so no FSDP2 grad reduce-scatter fires and peak
      memory stays ~one layer's worth.
-  3. For each block of ``dim_batch`` output dims of ``h_final`` we re-run the
-     forward on ``dim_batch`` identical copies of the prompt, build a one-hot
-     cotangent selecting one output dim per batch row over the valid token
-     positions, and call ``torch.autograd.backward(h_final, grad_tensors=cot)``
-     (``autograd.grad`` errors under sharded/EP autograd). Each source's retained
-     ``.grad``, meaned over valid source positions, gives that block of rows of
-     ``J_l``, accumulated over prompts.
+  3. Each prompt runs the forward *once* on ``dim_batch`` identical copies and
+     retains the graph. We then do ``d_model/dim_batch`` backwards over that one
+     graph, each seeding a one-hot cotangent that selects a different block of
+     ``dim_batch`` output dims of ``h_final`` (one dim per batch row) over the
+     valid token positions, via ``torch.autograd.backward(h_final,
+     grad_tensors=cot, inputs=srcs)`` (``autograd.grad`` errors under sharded/EP
+     autograd; FSDP2 tolerates repeated backwards over a retained graph). Each
+     source's ``.grad``, meaned over valid source positions, gives that block of
+     rows of ``J_l``, accumulated over prompts. Reusing one forward across all
+     blocks removes ``d_model/dim_batch - 1`` redundant forwards per prompt.
 
 Every rank runs the same forward on the same data, so ``J_l`` is identical across
 ranks and only rank 0 saves.
@@ -120,8 +123,8 @@ def _parse_args():
         "--dim-batch",
         type=int,
         default=32,
-        help="output dims of h_final per forward+backward. Larger => fewer "
-        "forwards (d_model/dim_batch per prompt) but more activation memory.",
+        help="output dims of h_final per backward. Larger => fewer backwards "
+        "(d_model/dim_batch per prompt) but more grad memory per backward.",
     )
     ap.add_argument(
         "--max-seq-len",
