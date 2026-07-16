@@ -307,23 +307,35 @@ def fit(args):
             )
             b = torch.arange(args.dim_batch, device=device)
 
-            for start in range(0, d_model, args.dim_batch):
+            # ONE forward per prompt, then N = d_model/dim_batch backwards that
+            # reuse the retained graph (each covers a different block of output
+            # dims). The forward is identical across blocks, so re-running it per
+            # block (the old path) wasted ~dim_batch full forwards. `inputs=srcs`
+            # restricts backprop to the captured activations (no param grads), and
+            # retain_graph is dropped on the last block so the graph is freed.
+            model.zero_grad(set_to_none=True)
+            acts.clear()
+            with torch.enable_grad():
+                # logits_to_keep=1 => lm_head runs on 1 position only (h_final is
+                # captured pre-norm by the hook, so lm_head output is unused).
+                model(input_ids=batched, position_ids=position_ids, logits_to_keep=1)
+            target = acts[target_layer]
+            srcs = [acts[lyr] for lyr in source_layers]
+            for s in srcs:
+                s.retain_grad()
+            starts = list(range(0, d_model, args.dim_batch))
+            for bi, start in enumerate(starts):
                 n = min(args.dim_batch, d_model - start)
-                model.zero_grad(set_to_none=True)
-                acts.clear()
-                with torch.enable_grad():
-                    # logits_to_keep=1 => lm_head runs on 1 position only (h_final
-                    # is captured pre-norm by the hook, so lm_head output is unused).
-                    model(
-                        input_ids=batched, position_ids=position_ids, logits_to_keep=1
-                    )
-                target = acts[target_layer]
-                srcs = [acts[lyr] for lyr in source_layers]
                 for s in srcs:
-                    s.retain_grad()
+                    s.grad = None  # backward accumulates into .grad; reset per block
                 cot = torch.zeros_like(target)
                 cot[b[:n, None], valid[None, :], start + b[:n, None]] = 1.0
-                torch.autograd.backward(target, grad_tensors=cot)
+                torch.autograd.backward(
+                    target,
+                    grad_tensors=cot,
+                    retain_graph=(bi < len(starts) - 1),
+                    inputs=srcs,
+                )
                 for lyr, s in zip(source_layers, srcs):
                     rows = s.grad[:n][:, valid, :].float().mean(dim=1)  # [n, d_model]
                     jac_sum[lyr][start : start + n] += rows.detach().cpu()
