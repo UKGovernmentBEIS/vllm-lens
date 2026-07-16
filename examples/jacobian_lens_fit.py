@@ -1,83 +1,45 @@
-"""Jacobian-lens fitter for arbitrary-size models (FSDP2 + expert-parallel).
+"""Fit a Jacobian lens: ``J_l = E[dh_final/dh_l]`` averaged over a text corpus.
 
-Fits the average Jacobian lens ``J_l = E[dh_final/dh_l]`` for a set of decoder
-source layers l, where ``h_l`` is the residual-stream output of layer l and
-``h_final`` is the output of the LAST decoder layer. The output ``.pt`` is
-byte-compatible with the vllm-lens reader/visualizer ``jacobian_lens.py`` (keys:
-``J``, ``source_layers``, ``d_model``) — fit here, then serve + read out there.
+For each source layer ``l``, ``J_l`` linearly transports that layer's
+residual-stream vector ``h_l`` into the final layer's basis, so that
+``unembed(J_l @ h_l)`` reads out what the model is disposed to say from layer
+``l``. This script does the one-time fit and writes ``--out`` with keys ``J``,
+``source_layers`` and ``d_model``; ``jacobian_lens.py`` reads that file back to
+apply and visualize the lens.
 
-This is the ONE fitter for the Jacobian lens. It runs on prime-rl's FSDP2 +
-expert-parallel (EP) model stack, so it scales from a 1.7B dense model on a
-single GPU up to large MoE models (validated on GLM-4.5-Air, 110B) across many
-GPUs / nodes — the same models vllm-lens can then serve and read the lens out on.
+Reference: Anthropic, "Verbalizable Representations Form a Global Workspace in
+Language Models" (https://transformer-circuits.pub/2026/workspace).
 
-Why prime-rl: the naive HF+FSDP path OOMs on large MoE by materializing per-param
-grads. This fitter reuses prime-rl's ``setup_model`` / parallel-dims / EP /
-torchtitan infra (the exact stack the SFT/RL trainers use) and does NO weight
-updates — it only captures activations and backprops activation->activation.
+How it works: the model's parameters are frozen; forward hooks capture the
+residual stream of each source layer and of the final layer, then a backward
+pass from ``h_final`` yields ``dh_final/dh_l`` as a batched vector-Jacobian
+product (``dim_batch`` output dimensions per backward, ``d_model/dim_batch``
+backwards per prompt), averaged over token positions and prompts. Because it
+needs a backward pass, it runs on prime-rl's FSDP2 + expert-parallel stack
+rather than the vLLM serving env — build that env with
+``jacobian_lens_fit_env.sh``. It scales from a small dense model on one GPU to
+large MoE models across many GPUs / nodes.
 
-Two environments (see ``jacobian_lens_fit_env.sh``):
-  * FIT here runs in the *prime-rl* env (torch 2.11/cu128 + torchtitan). This
-    script ``import``s prime-rl internals; it will not run in the vllm-lens env.
-  * READ OUT + VISUALIZE run in the *vllm-lens* env (vLLM) via
-    ``jacobian_lens.py run`` against a served model.
+Usage -- single node (8 GPUs):
 
-Method (per prompt):
-  1. Forward hooks capture the residual-stream output of each source layer and of
-     the last decoder layer. Under EP the residual stream is FULL-WIDTH and
-     replicated on every rank (EP shards expert *params*, not activations), so the
-     captured activations are complete on rank 0.
-  2. Params are frozen; the earliest captured source activation is rooted with
-     ``requires_grad_(True)``. Backward then traverses only activation->activation
-     (never per-param grads), so no FSDP2 grad reduce-scatter fires and peak
-     memory stays ~one layer's worth.
-  3. Each prompt runs the forward *once* on ``dim_batch`` identical copies and
-     retains the graph. We then do ``d_model/dim_batch`` backwards over that one
-     graph, each seeding a one-hot cotangent that selects a different block of
-     ``dim_batch`` output dims of ``h_final`` (one dim per batch row) over the
-     valid token positions, via ``torch.autograd.backward(h_final,
-     grad_tensors=cot, inputs=srcs)`` (``autograd.grad`` errors under sharded/EP
-     autograd; FSDP2 tolerates repeated backwards over a retained graph). Each
-     source's ``.grad``, meaned over valid source positions, gives that block of
-     rows of ``J_l``, accumulated over prompts. Reusing one forward across all
-     blocks removes ``d_model/dim_batch - 1`` redundant forwards per prompt.
-
-Every rank runs the same forward on the same data, so ``J_l`` is identical across
-ranks and only rank 0 saves.
-
-Launch — single node (8 GPUs on one host):
-
-    cd /path/to/prime-rl        # the fit env from jacobian_lens_fit_env.sh
-    unset VIRTUAL_ENV
+    cd /path/to/prime-rl && unset VIRTUAL_ENV        # the fit env
     uv run --no-sync torchrun --nproc-per-node=8 \\
-        /path/to/vllm-lens/examples/jacobian_lens_fit.py \\
-        --model zai-org/GLM-4.5-Air --layers 25,33,40 --ep 8 \\
-        --out glm45air-lens.pt
+        /path/to/examples/jacobian_lens_fit.py \\
+        --model Qwen/Qwen3-1.7B --out lens.pt
 
-Launch — multi-node (torchrun; run on EACH node, N_GPUS per node):
+Usage -- multi-node (run on every node; differ only in ``--node-rank``):
 
-    # node 0 (rendezvous host) and node 1, differing only in --node-rank:
     uv run --no-sync torchrun \\
-        --nnodes=2 --node-rank=0 --nproc-per-node=8 \\
-        --rdzv-id=jaclens --rdzv-backend=c10d \\
-        --rdzv-endpoint=$HEAD_IP:29500 \\
-        /path/to/vllm-lens/examples/jacobian_lens_fit.py \\
-        --model zai-org/GLM-4.5-Air --layers 25,33,40 --ep 16 --out glm45air-lens.pt
-    # node 1: identical, but --node-rank=1
+        --nnodes=2 --node-rank=$NODE --nproc-per-node=8 \\
+        --rdzv-backend=c10d --rdzv-endpoint=$HEAD_IP:29500 \\
+        /path/to/examples/jacobian_lens_fit.py \\
+        --model zai-org/GLM-4.5-Air --layers 25,33,40 --ep 16 --out lens.pt
 
-Launch — multi-node under SLURM (srun sets the rendezvous env for you):
-
-    srun --nodes=2 --ntasks-per-node=8 --gpus-per-node=8 \\
-        torchrun --nnodes=$SLURM_NNODES --node-rank=$SLURM_NODEID \\
-            --nproc-per-node=8 --rdzv-backend=c10d \\
-            --rdzv-endpoint=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -1):29500 \\
-            examples/jacobian_lens_fit.py --model ... --layers ... --ep 16 --out ...
-
-``--ep`` is the expert-parallelism degree for MoE models (defaults to ``auto`` =
-``min(world_size, 8)``); it must divide the world size and is a no-op for dense
-models. Fit only the ``--layers`` you plan to read out — cost scales with the
-number of source layers (one backward sweep per prompt covers all of them, but
-each fitted layer adds a ``d_model x d_model`` matrix to ship + store).
+Key options: ``--layers`` selects source layers (default: all; fit only the
+layers you will read out, since each adds a ``d_model x d_model`` matrix).
+``--ep`` sets the expert-parallelism degree for MoE models (must divide the
+world size; no-op for dense). ``--n-prompts`` is the number of web-text contexts
+to average over (default 1000). Only rank 0 writes the lens.
 """
 
 # Patch ring_flash_attn compat before torch imports (prime-rl requirement).
