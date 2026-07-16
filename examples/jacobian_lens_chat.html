@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jacobian lens · live J-space readout</title>
+<style>
+  :root { --ink:#111; --muted:#666; --line:#e6e6e3; --bg:#fcfcfb; --accent:#2a78d6; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  header { padding:16px 20px 6px; }
+  h1 { font-size:18px; margin:0; }
+  .subtitle { color:var(--muted); font-size:13px; margin:4px 0 0; }
+  .wrap { display:flex; flex-direction:column; height:100vh; }
+  #chat { flex:0 0 34%; overflow-y:auto; padding:8px 20px; border-bottom:1px solid var(--line); }
+  .turn { margin:10px 0; }
+  .turn .role { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+  .turn .msg { font-family:Menlo,Consolas,monospace; font-size:13px; line-height:1.55;
+               white-space:pre-wrap; margin-top:2px; }
+  .turn.user .msg { color:#0e2747; }
+  .inputrow { display:flex; gap:8px; padding:10px 20px; align-items:flex-end; }
+  #inp { flex:1; min-height:38px; max-height:120px; resize:vertical; padding:8px;
+         font-family:inherit; font-size:14px; border:1px solid var(--line); border-radius:6px; }
+  button { padding:9px 16px; font-size:14px; border:0; border-radius:6px;
+           background:var(--accent); color:#fff; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  #panel { flex:1; overflow:auto; padding:10px 20px 20px; }
+  .panel-head { display:flex; align-items:center; gap:14px; position:sticky; left:0;
+                margin-bottom:8px; font-size:13px; color:var(--muted); }
+  .panel-head select, .panel-head input { font-size:13px; }
+  .grid { display:flex; gap:2px; align-items:flex-start; }
+  .col { display:flex; flex-direction:column; gap:2px; }
+  .cell { width:82px; min-height:22px; padding:2px 4px; font-family:Menlo,Consolas,monospace;
+          font-size:11px; line-height:1.3; border-radius:3px; overflow:hidden;
+          text-overflow:ellipsis; white-space:nowrap; }
+  .cell.head { background:transparent; color:var(--ink); font-weight:700; border-bottom:2px solid var(--line);
+               border-radius:0; }
+  #status { padding:0 20px 8px; color:var(--muted); font-size:12px; min-height:16px; }
+  .hint { color:var(--muted); font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Jacobian lens · live J-space readout</h1>
+    <p class="subtitle">Top-k tokens the model is <em>disposed to say</em> at each generated
+      position — its residual transported through <code>J_l</code>, then unembedded.</p>
+  </header>
+
+  <div id="chat"></div>
+
+  <div class="inputrow">
+    <textarea id="inp" placeholder="Message… (Enter to send, Shift+Enter for newline)"></textarea>
+    <button id="send">Send</button>
+  </div>
+  <div id="status"></div>
+
+  <div id="panel">
+    <div class="panel-head">
+      <span>J-space readout (latest turn) &mdash; layer</span>
+      <select id="layerSel"></select>
+      <label>max tokens <input id="maxTokens" type="number" value="80" min="1" max="512" style="width:64px"></label>
+      <label>temp <input id="temp" type="number" value="0.7" step="0.1" min="0" max="2" style="width:56px"></label>
+      <span class="hint" id="panelHint">send a message to see the readout</span>
+    </div>
+    <div id="readout"></div>
+  </div>
+</div>
+
+<script>
+// ── Injected by jacobian_lens_chat.py ──────────────────────────────
+const BASE_URL = $BASE_URL;            // "" = same origin as this page
+const MODEL = $MODEL;
+const LAYERS = $LAYERS;                // fitted layers captured each turn
+const TOPK = $TOPK;
+const INITIAL_PROMPT = $INITIAL_PROMPT;
+const HOOK_JSON = $HOOK_JSON;          // serialized [hook] array (raw)
+
+const chatHistory = [];
+let lastReadout = null;                // { tokens:[...], layers:{ L:{toks,probs} } }
+
+// ── Layer dropdown (instant switch, no re-chat) ────────────────────
+const layerSel = document.getElementById('layerSel');
+LAYERS.forEach(L => {
+  const o = document.createElement('option');
+  o.value = L; o.textContent = 'layer ' + L; layerSel.appendChild(o);
+});
+layerSel.value = LAYERS[Math.floor(LAYERS.length / 2)] ?? LAYERS[0];
+layerSel.onchange = renderReadout;
+
+document.getElementById('inp').value = INITIAL_PROMPT;
+
+// white → accent-blue by probability
+function probColor(p) {
+  const t = Math.max(0, Math.min(1, p * 2.0));
+  const r = Math.round(252 - (252 - 42) * t);
+  const g = Math.round(252 - (252 - 120) * t);
+  const b = Math.round(251 - (251 - 214) * t);
+  return `rgb(${r},${g},${b})`;
+}
+
+function showTok(s) {
+  if (s === '') return '·';
+  if (s.trim() === '') return s.includes('\n') ? '⏎' : '␣';
+  return s.replace(/\n/g, '⏎');
+}
+
+// Render the positions × top-k grid for the selected layer from lastReadout.
+function renderReadout() {
+  const box = document.getElementById('readout');
+  box.innerHTML = '';
+  if (!lastReadout) return;
+  const data = lastReadout.layers[parseInt(layerSel.value)];
+  const tokens = lastReadout.tokens;
+  if (!data || !data.toks.length) { box.textContent = 'no readout for this layer'; return; }
+
+  // Readout covers prompt+generated positions; align to the generated tokens.
+  const total = data.toks.length;
+  const offset = Math.max(0, total - tokens.length);
+  const n = Math.min(tokens.length, total - offset);
+
+  const grid = document.createElement('div'); grid.className = 'grid';
+  for (let c = 0; c < n; c++) {
+    const pos = offset + c;
+    const col = document.createElement('div'); col.className = 'col';
+    const head = document.createElement('div'); head.className = 'cell head';
+    head.textContent = showTok(tokens[c] ?? '');
+    head.title = JSON.stringify(tokens[c] ?? '');
+    col.appendChild(head);
+    const trow = data.toks[pos] || [], prow = data.probs[pos] || [];
+    for (let r = 0; r < TOPK; r++) {
+      const cell = document.createElement('div'); cell.className = 'cell';
+      const w = trow[r] ?? '', p = prow[r] ?? 0;
+      cell.textContent = showTok(w);
+      cell.style.background = probColor(p);
+      cell.style.color = p > 0.35 ? '#fff' : '#111';
+      cell.title = JSON.stringify(w) + '  p=' + Number(p).toFixed(3);
+      col.appendChild(cell);
+    }
+    grid.appendChild(col);
+  }
+  box.appendChild(grid);
+}
+
+function addTurn(role, text) {
+  const d = document.createElement('div'); d.className = 'turn ' + role;
+  const lbl = document.createElement('div'); lbl.className = 'role';
+  lbl.textContent = role === 'user' ? 'You' : 'Assistant';
+  const body = document.createElement('div'); body.className = 'msg'; body.textContent = text;
+  d.appendChild(lbl); d.appendChild(body);
+  const chat = document.getElementById('chat');
+  chat.appendChild(d); chat.scrollTop = chat.scrollHeight;
+  return body;
+}
+
+async function send() {
+  const inp = document.getElementById('inp');
+  const prompt = inp.value.trim();
+  if (!prompt) return;
+  inp.value = '';
+  const sendBtn = document.getElementById('send');
+  sendBtn.disabled = true;
+  const status = document.getElementById('status');
+
+  addTurn('user', prompt);
+  chatHistory.push({ role: 'user', content: prompt });
+  const bodyEl = addTurn('assistant', '');
+  status.textContent = 'generating…';
+
+  const xargs = { apply_hooks: JSON.stringify(HOOK_JSON) };
+  let fullText = '', hookResults = null, streamTokens = [];
+  try {
+    const resp = await fetch(BASE_URL + '/v1/chat/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: MODEL, messages: chatHistory,
+        max_tokens: parseInt(document.getElementById('maxTokens').value) || 80,
+        temperature: parseFloat(document.getElementById('temp').value) || 0,
+        stream: true, logprobs: true, top_logprobs: 1, vllm_xargs: xargs
+      })
+    });
+    const reader = resp.body.getReader(); const decoder = new TextDecoder(); let buf = '';
+    while (true) {
+      const { done, value } = await reader.read(); if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n'); buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
+        let chunk; try { chunk = JSON.parse(line.slice(6)); } catch (e) { continue; }
+        const delta = chunk.choices?.[0]?.delta?.content;
+        if (delta) { fullText += delta; bodyEl.textContent = fullText;
+                     document.getElementById('chat').scrollTop = 1e9; }
+        const lp = chunk.choices?.[0]?.logprobs?.content;
+        if (lp) lp.forEach(t => streamTokens.push(t.token));
+        if (chunk.hook_results) { hookResults = chunk.hook_results; status.textContent = 'reading out…'; }
+      }
+    }
+  } catch (e) {
+    status.textContent = 'error: ' + e; sendBtn.disabled = false; return;
+  }
+  chatHistory.push({ role: 'assistant', content: fullText });
+  status.textContent = '';
+  sendBtn.disabled = false;
+
+  // Parse hook results: keys t_{layer}_{pass} (top-k strings) + p_{layer}_{pass} (probs).
+  if (hookResults && hookResults['0']) {
+    const saved = hookResults['0'];
+    const byPass = (prefix) => Object.keys(saved)
+      .filter(k => k.startsWith(prefix))
+      .sort((a, b) => parseInt(a.split('_')[2]) - parseInt(b.split('_')[2]));
+    const layers = {};
+    LAYERS.forEach(L => {
+      let toks = [], probs = [];
+      byPass(`t_${L}_`).forEach(k => { toks = toks.concat(saved[k]); });
+      byPass(`p_${L}_`).forEach(k => { probs = probs.concat(saved[k]); });
+      layers[L] = { toks, probs };
+    });
+    lastReadout = { tokens: streamTokens, layers };
+    document.getElementById('panelHint').textContent = '';
+    renderReadout();
+  } else {
+    document.getElementById('panelHint').textContent = '(no J-space readout returned)';
+  }
+}
+
+document.getElementById('send').onclick = send;
+document.getElementById('inp').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+</script>
+</body>
+</html>
