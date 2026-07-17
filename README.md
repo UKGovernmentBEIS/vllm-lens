@@ -65,6 +65,7 @@ up its own in-process engine. The notebooks are self-contained.
 | [`causal_tracing.py`](examples/causal_tracing.py) | ROME-style causal tracing — pre-hook embedding corruption + post-hook clean-state patching, rendered as a (layer × token) heatmap. |
 | [`logit_lens.py`](examples/logit_lens.py) | Logit lens — project each layer's hidden states through the final norm + unembedding via `ctx.get_parameter("lm_head.weight")`. |
 | [`jacobian_lens.py`](examples/jacobian_lens.py) | Jacobian lens / J-space ([Anthropic global-workspace](https://transformer-circuits.pub/2026/workspace)) — like the logit lens, but transports each layer's residual through a pre-fitted average Jacobian `J_l` before unembedding, reading out what the model is "disposed to say". Readout + visualization; the lens is fit by [`jacobian_lens_fit.py`](examples/jacobian_lens_fit.py). |
+| [`jacobian_lens_chat.py`](examples/jacobian_lens_chat.py) | Live J-space chat — registers a J-lens readout hook on a served model and generates an HTML chat page where every token is hoverable, showing the streaming top-k readout across the captured layers. |
 | [`deception_probe.py`](examples/deception_probe.py) | Apollo-style linear deception probe — contrastive activation extraction with persistent hooks, then a pure-torch logistic-regression probe. |
 | [`emotion_tracker.py`](examples/emotion_tracker.py) | Anthropic emotion-concepts replication — emotion direction vectors + per-token projection tracking, with an interactive HTML visualization. |
 | [`activation_oracle.py`](examples/activation_oracle.py) | Activation Oracle steering (arXiv:2512.15674) — capture activations and steer a LoRA oracle to describe them. |
@@ -145,7 +146,7 @@ The `ctx` (a `HookContext`) passed to `fn` exposes:
 | `ctx.model` | The underlying model (for architecture-specific access). |
 | `ctx.get_parameter(name) -> Tensor` | Fetch a full model parameter, gathered across TP/PP ranks — e.g. `ctx.get_parameter("lm_head.weight")`. With pipeline parallelism, `prefetch_params` the name first (see below). |
 
-`fn` runs on **every** tensor-parallel rank, so it must be deterministic across ranks (seed any randomness). For HTTP transport `fn` is serialized with cloudpickle — i.e. **arbitrary code execution** on the server, so only use with trusted clients.
+`fn` runs on **every** tensor-parallel rank, so it must be deterministic across ranks (seed any randomness). Note that `ctx.saved` is merged across ranks at collection, and **list** values from different ranks are concatenated — so with TP > 1, a hook that saves plain lists sees every entry duplicated `tp_size`×. Save tensors, or guard the writes to one rank (e.g. `get_tp_group().rank_in_group == 0`, as [`jacobian_lens_chat.py`](examples/jacobian_lens_chat.py) does — but keep `ctx.get_parameter` calls on all ranks: the TP gather is a collective). For HTTP transport `fn` is serialized with cloudpickle — i.e. **arbitrary code execution** on the server, so only use with trusted clients.
 
 ```python
 from vllm import LLM, SamplingParams
@@ -198,11 +199,12 @@ POST /v1/hooks/register          {"hooks": [...], "prefetch_params": [...]}
 POST /v1/completions             (hooks fire automatically)
 POST /v1/hooks/collect           → {"results": {<req_id>: ...}}
 POST /v1/hooks/clear
+POST /v1/hooks/clear_results
 POST /v1/hooks/prefetch          {"params": ["lm_head.weight", ...]}
 POST /v1/hooks/clear_prefetched
 ```
 
-Multiple `register` calls append hooks. `collect` is non-destructive. `clear` removes hooks and all accumulated results. Pre-fetched parameters persist independently.
+Multiple `register` calls append hooks. `collect` is non-destructive, so results accumulate across requests; `clear_results` (`client.clear_hook_results()`) drains them while keeping the hooks registered, and `clear` removes hooks and all accumulated results. Pre-fetched parameters persist independently.
 
 ### Accessing model parameters from hooks
 
@@ -252,7 +254,8 @@ The Jacobian lens extends the logit lens: it transports each layer's residual th
 
 1. **Fit** `J_l` with [`jacobian_lens_fit.py`](examples/jacobian_lens_fit.py) — the single source of truth for fitting. It needs the backward pass and runs in the **prime-rl fit env** (torch 2.11/cu128 + torchtitan; not the vllm-lens env), on prime-rl's FSDP2 + expert-parallel stack. This scales from small dense models on one GPU up to large MoE across many GPUs / nodes — GLM-4.5-Air (110B) is validated (cosine 1.0 vs a single-GPU reference), and the same path serves GLM-5.2. Build the env once with [`jacobian_lens_fit_env.sh`](examples/jacobian_lens_fit_env.sh).
 2. **Serve** the model under vllm-lens (the readout env).
-3. **Read out + visualize** with [`jacobian_lens.py`](examples/jacobian_lens.py) — forward-only, applied in a hook on the vLLM worker, correct under TP/PP/EP.
+3. **Read out** with [`jacobian_lens.py`](examples/jacobian_lens.py) — forward-only, applied in a hook on the vLLM worker, correct under TP/PP/EP.
+4. **Chat interactively** with [`jacobian_lens_chat.py`](examples/jacobian_lens_chat.py) — registers the readout hook on the server and generates an HTML chat page; hover any token to see the top-k J-space readout across the captured layers, streaming in as the reply generates.
 
 ```bash
 # 1. fit J_l (once; cached to lens.pt). In the prime-rl fit env — see
@@ -274,12 +277,14 @@ VLLM_USE_V2_MODEL_RUNNER=0 vllm serve zai-org/GLM-4.5-Air
 # 3. read the lens out live against the server (vllm-lens env)
 python examples/jacobian_lens.py run --lens lens.pt \
     --prompt "The Eiffel Tower is located in the city of" \
-    --layers 25,33,40 --grid-out token_grid.png
+    --layers 25,33,40
+
+# 4. or build an interactive HTML: chat + live J-space readout at a chosen layer
+python examples/jacobian_lens_chat.py --lens lens.pt \
+    --base-url http://localhost:8000 --out jacobian_lens_chat
 ```
 
-`run` prints the top-1 J-lens token at each (layer, position). With `--grid-out FILE` it also writes the top-k tokens per position, one subplot per layer (needs matplotlib):
-
-![Jacobian-lens token grid](docs/jacobian_lens/token_grid.png)
+`run` prints the top-1 J-lens token at each (layer, position); with `--grid-out FILE` it also writes a static top-k grid, one subplot per layer (needs matplotlib). `jacobian_lens_chat.py` registers the readout hook server-side (the fitted lens uploads once) and writes an HTML chat page: replies stream in with every token hoverable — the tooltip shows the top-k readout across all captured layers (click to pin) — and messages are editable, with top-k, response length, and thinking adjustable in the page. Pass `--html-base-url` if the browser reaches the server on a different address than the generator (e.g. a forwarded port).
 
 `--layers` picks which layers to read out (the lens is shipped to the worker, so keep it modest on large models — and fit only the layers you'll read out); `--k` sets how many tokens per position; `--baseline` drops the `J_l` transport for a logit-lens comparison; `--norm-weight` overrides the auto-detected final-norm weight name. `run --lens` also loads a pre-fitted Hub lens (e.g. [Neuronpedia](https://huggingface.co/neuronpedia/jacobian-lens)).
 

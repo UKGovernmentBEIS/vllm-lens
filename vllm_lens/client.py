@@ -265,6 +265,17 @@ class VLLMLensClient:
         """Remove all persistent hooks and accumulated results."""
         self._session.post(f"{self.base_url}/v1/hooks/clear", timeout=self._timeout)
 
+    def clear_hook_results(self) -> None:
+        """Drop accumulated results but keep the hooks registered.
+
+        :meth:`collect_hook_results` never drains, so results accumulate
+        across requests. Call this to bound accumulation (e.g. between chat
+        turns) without re-uploading the hooks.
+        """
+        self._session.post(
+            f"{self.base_url}/v1/hooks/clear_results", timeout=self._timeout
+        )
+
     # ------------------------------------------------------------------
     # Parameter prefetch
     # ------------------------------------------------------------------
