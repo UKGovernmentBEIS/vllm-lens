@@ -9,104 +9,90 @@
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--ink);
          font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
-  header { padding:16px 20px 6px; }
+  header { padding:16px 20px 8px; }
   h1 { font-size:18px; margin:0; }
   .subtitle { color:var(--muted); font-size:13px; margin:4px 0 0; }
-  .wrap { display:flex; flex-direction:column; height:100vh; }
-  #chat { flex:0 0 34%; overflow-y:auto; padding:8px 20px; border-bottom:1px solid var(--line); }
-  .turn { margin:10px 0; }
-  .turn .role { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
-  .turn .msg { font-family:Menlo,Consolas,monospace; font-size:13px; line-height:1.55;
-               white-space:pre-wrap; margin-top:2px; }
-  .turn.user .msg { color:#0e2747; }
-  .inputrow { display:flex; gap:8px; padding:10px 20px; align-items:flex-end; }
-  #inp { flex:1; min-height:38px; max-height:120px; resize:vertical; padding:8px;
-         font-family:inherit; font-size:14px; border:1px solid var(--line); border-radius:6px; }
-  button { padding:9px 16px; font-size:14px; border:0; border-radius:6px;
-           background:var(--accent); color:#fff; cursor:pointer; }
-  button:disabled { opacity:.5; cursor:default; }
-  #panel { flex:1; overflow:auto; padding:10px 20px 20px; }
-  .panel-head { display:flex; align-items:center; gap:14px; position:sticky; left:0;
-                margin-bottom:8px; font-size:13px; color:var(--muted); }
-  .panel-head select, .panel-head input { font-size:13px; }
+  .controls { display:flex; align-items:center; gap:14px; padding:6px 20px; flex-wrap:wrap;
+              font-size:13px; color:var(--muted); }
+  .controls select, .controls button { font-size:13px; }
+  button { padding:6px 12px; border:0; border-radius:6px; background:var(--accent); color:#fff;
+           cursor:pointer; } button:disabled { opacity:.5; cursor:default; }
+  #ctx { width:calc(100% - 40px); margin:4px 20px; min-height:64px; max-height:180px; resize:vertical;
+         padding:10px; font-family:Menlo,Consolas,monospace; font-size:14px; line-height:1.5;
+         border:1px solid var(--line); border-radius:8px; }
+  #panel { padding:8px 20px 24px; overflow:auto; }
   .grid { display:flex; gap:2px; align-items:flex-start; }
   .col { display:flex; flex-direction:column; gap:2px; }
-  .cell { width:82px; min-height:22px; padding:2px 4px; font-family:Menlo,Consolas,monospace;
+  .cell { width:86px; min-height:22px; padding:2px 5px; font-family:Menlo,Consolas,monospace;
           font-size:11px; line-height:1.3; border-radius:3px; overflow:hidden;
           text-overflow:ellipsis; white-space:nowrap; }
-  .cell.head { background:transparent; color:var(--ink); font-weight:700; border-bottom:2px solid var(--line);
-               border-radius:0; }
-  #status { padding:0 20px 8px; color:var(--muted); font-size:12px; min-height:16px; }
-  .hint { color:var(--muted); font-size:12px; }
+  .cell.head { background:transparent; color:var(--ink); font-weight:700;
+               border-bottom:2px solid var(--line); border-radius:0; }
+  #status { color:var(--muted); font-size:12px; }
+  .hint { color:var(--muted); font-size:12px; padding:0 20px; }
 </style>
 </head>
 <body>
-<div class="wrap">
   <header>
     <h1>Jacobian lens · live J-space readout</h1>
-    <p class="subtitle">Top-k tokens the model is <em>disposed to say</em> at each generated
-      position — its residual transported through <code>J_l</code>, then unembedded.</p>
+    <p class="subtitle">Type below — each column shows the top-k tokens the model is
+      <em>disposed to say</em> at that position (residual transported through <code>J_l</code>,
+      then unembedded). Updates as you type.</p>
   </header>
 
-  <div id="chat"></div>
-
-  <div class="inputrow">
-    <textarea id="inp" placeholder="Message… (Enter to send, Shift+Enter for newline)"></textarea>
-    <button id="send">Send</button>
+  <div class="controls">
+    <span>layer</span><select id="layerSel"></select>
+    <button id="contBtn" title="let the model extend the text">continue ▸</button>
+    <label>+<input id="contN" type="number" value="20" min="1" max="128" style="width:52px"> tokens</label>
+    <span id="status"></span>
   </div>
-  <div id="status"></div>
 
-  <div id="panel">
-    <div class="panel-head">
-      <span>J-space readout (latest turn) &mdash; layer</span>
-      <select id="layerSel"></select>
-      <label>max tokens <input id="maxTokens" type="number" value="80" min="1" max="512" style="width:64px"></label>
-      <label>temp <input id="temp" type="number" value="0.7" step="0.1" min="0" max="2" style="width:56px"></label>
-      <span class="hint" id="panelHint">send a message to see the readout</span>
-    </div>
-    <div id="readout"></div>
-  </div>
-</div>
+  <textarea id="ctx" spellcheck="false"></textarea>
+  <div id="panel"><div class="hint" id="hint">…</div><div id="readout"></div></div>
 
 <script>
 // ── Injected by jacobian_lens_chat.py ──────────────────────────────
-const BASE_URL = $BASE_URL;            // "" = same origin as this page
+const BASE_URL = $BASE_URL;        // "" = same origin as this page
 const MODEL = $MODEL;
-const LAYERS = $LAYERS;                // fitted layers captured each turn
+const LAYERS = $LAYERS;
 const TOPK = $TOPK;
 const INITIAL_PROMPT = $INITIAL_PROMPT;
-const HOOK_JSON = $HOOK_JSON;          // serialized [hook] array (raw)
 
-const chatHistory = [];
-let lastReadout = null;                // { tokens:[...], layers:{ L:{toks,probs} } }
+let lastReadout = null;            // { tokens:[...], layers:{ L:{toks,probs} } }
+let reqSeq = 0;                    // guards against stale (out-of-order) responses
 
-// ── Layer dropdown (instant switch, no re-chat) ────────────────────
 const layerSel = document.getElementById('layerSel');
-LAYERS.forEach(L => {
-  const o = document.createElement('option');
-  o.value = L; o.textContent = 'layer ' + L; layerSel.appendChild(o);
-});
+LAYERS.forEach(L => { const o = document.createElement('option'); o.value = L;
+  o.textContent = 'layer ' + L; layerSel.appendChild(o); });
 layerSel.value = LAYERS[Math.floor(LAYERS.length / 2)] ?? LAYERS[0];
 layerSel.onchange = renderReadout;
 
-document.getElementById('inp').value = INITIAL_PROMPT;
+const ctx = document.getElementById('ctx');
+ctx.value = INITIAL_PROMPT;
 
-// white → accent-blue by probability
 function probColor(p) {
   const t = Math.max(0, Math.min(1, p * 2.0));
-  const r = Math.round(252 - (252 - 42) * t);
-  const g = Math.round(252 - (252 - 120) * t);
-  const b = Math.round(251 - (251 - 214) * t);
-  return `rgb(${r},${g},${b})`;
+  return `rgb(${Math.round(252-(252-42)*t)},${Math.round(252-(252-120)*t)},${Math.round(251-(251-214)*t)})`;
 }
-
 function showTok(s) {
-  if (s === '') return '·';
+  if (s === '' || s == null) return '·';
   if (s.trim() === '') return s.includes('\n') ? '⏎' : '␣';
   return s.replace(/\n/g, '⏎');
 }
 
-// Render the positions × top-k grid for the selected layer from lastReadout.
+function parseLayers(saved) {
+  const byPass = (prefix) => Object.keys(saved).filter(k => k.startsWith(prefix))
+    .sort((a, b) => parseInt(a.split('_')[2]) - parseInt(b.split('_')[2]));
+  const out = {};
+  LAYERS.forEach(L => {
+    let toks = [], probs = [];
+    byPass(`t_${L}_`).forEach(k => { toks = toks.concat(saved[k]); });
+    byPass(`p_${L}_`).forEach(k => { probs = probs.concat(saved[k]); });
+    out[L] = { toks, probs };
+  });
+  return out;
+}
+
 function renderReadout() {
   const box = document.getElementById('readout');
   box.innerHTML = '';
@@ -114,21 +100,14 @@ function renderReadout() {
   const data = lastReadout.layers[parseInt(layerSel.value)];
   const tokens = lastReadout.tokens;
   if (!data || !data.toks.length) { box.textContent = 'no readout for this layer'; return; }
-
-  // Readout covers prompt+generated positions; align to the generated tokens.
-  const total = data.toks.length;
-  const offset = Math.max(0, total - tokens.length);
-  const n = Math.min(tokens.length, total - offset);
-
+  const n = Math.min(tokens.length, data.toks.length);
   const grid = document.createElement('div'); grid.className = 'grid';
   for (let c = 0; c < n; c++) {
-    const pos = offset + c;
     const col = document.createElement('div'); col.className = 'col';
     const head = document.createElement('div'); head.className = 'cell head';
-    head.textContent = showTok(tokens[c] ?? '');
-    head.title = JSON.stringify(tokens[c] ?? '');
+    head.textContent = showTok(tokens[c]); head.title = JSON.stringify(tokens[c]);
     col.appendChild(head);
-    const trow = data.toks[pos] || [], prow = data.probs[pos] || [];
+    const trow = data.toks[c] || [], prow = data.probs[c] || [];
     for (let r = 0; r < TOPK; r++) {
       const cell = document.createElement('div'); cell.className = 'cell';
       const w = trow[r] ?? '', p = prow[r] ?? 0;
@@ -143,91 +122,56 @@ function renderReadout() {
   box.appendChild(grid);
 }
 
-function addTurn(role, text) {
-  const d = document.createElement('div'); d.className = 'turn ' + role;
-  const lbl = document.createElement('div'); lbl.className = 'role';
-  lbl.textContent = role === 'user' ? 'You' : 'Assistant';
-  const body = document.createElement('div'); body.className = 'msg'; body.textContent = text;
-  d.appendChild(lbl); d.appendChild(body);
-  const chat = document.getElementById('chat');
-  chat.appendChild(d); chat.scrollTop = chat.scrollHeight;
-  return body;
-}
-
-async function send() {
-  const inp = document.getElementById('inp');
-  const prompt = inp.value.trim();
-  if (!prompt) return;
-  inp.value = '';
-  const sendBtn = document.getElementById('send');
-  sendBtn.disabled = true;
-  const status = document.getElementById('status');
-
-  addTurn('user', prompt);
-  chatHistory.push({ role: 'user', content: prompt });
-  const bodyEl = addTurn('assistant', '');
-  status.textContent = 'generating…';
-
-  const xargs = { apply_hooks: JSON.stringify(HOOK_JSON) };
-  let fullText = '', hookResults = null, streamTokens = [];
+// One tiny 1-token echo request; the server-registered hook runs over the text,
+// and we pull its result from /v1/hooks/collect (correlated by X-Request-Id).
+async function readout() {
+  const text = ctx.value;
+  const seq = ++reqSeq;
+  const hint = document.getElementById('hint'), status = document.getElementById('status');
+  if (!text.trim()) { lastReadout = null; document.getElementById('readout').innerHTML = '';
+                      hint.textContent = 'type something…'; return; }
+  status.textContent = 'reading…';
+  const rid = 'jl-' + Math.random().toString(36).slice(2);
   try {
-    const resp = await fetch(BASE_URL + '/v1/chat/completions', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: MODEL, messages: chatHistory,
-        max_tokens: parseInt(document.getElementById('maxTokens').value) || 80,
-        temperature: parseFloat(document.getElementById('temp').value) || 0,
-        stream: true, logprobs: true, top_logprobs: 1, vllm_xargs: xargs
-      })
+    const resp = await fetch(BASE_URL + '/v1/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Request-Id': rid },
+      body: JSON.stringify({ model: MODEL, prompt: text, max_tokens: 1, echo: true,
+                             logprobs: 1, temperature: 0 })
     });
-    const reader = resp.body.getReader(); const decoder = new TextDecoder(); let buf = '';
-    while (true) {
-      const { done, value } = await reader.read(); if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\n'); buf = lines.pop();
-      for (const line of lines) {
-        if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
-        let chunk; try { chunk = JSON.parse(line.slice(6)); } catch (e) { continue; }
-        const delta = chunk.choices?.[0]?.delta?.content;
-        if (delta) { fullText += delta; bodyEl.textContent = fullText;
-                     document.getElementById('chat').scrollTop = 1e9; }
-        const lp = chunk.choices?.[0]?.logprobs?.content;
-        if (lp) lp.forEach(t => streamTokens.push(t.token));
-        if (chunk.hook_results) { hookResults = chunk.hook_results; status.textContent = 'reading out…'; }
-      }
-    }
-  } catch (e) {
-    status.textContent = 'error: ' + e; sendBtn.disabled = false; return;
-  }
-  chatHistory.push({ role: 'assistant', content: fullText });
-  status.textContent = '';
-  sendBtn.disabled = false;
-
-  // Parse hook results: keys t_{layer}_{pass} (top-k strings) + p_{layer}_{pass} (probs).
-  if (hookResults && hookResults['0']) {
-    const saved = hookResults['0'];
-    const byPass = (prefix) => Object.keys(saved)
-      .filter(k => k.startsWith(prefix))
-      .sort((a, b) => parseInt(a.split('_')[2]) - parseInt(b.split('_')[2]));
-    const layers = {};
-    LAYERS.forEach(L => {
-      let toks = [], probs = [];
-      byPass(`t_${L}_`).forEach(k => { toks = toks.concat(saved[k]); });
-      byPass(`p_${L}_`).forEach(k => { probs = probs.concat(saved[k]); });
-      layers[L] = { toks, probs };
-    });
-    lastReadout = { tokens: streamTokens, layers };
-    document.getElementById('panelHint').textContent = '';
+    const d = await resp.json();
+    if (seq !== reqSeq) return;                       // a newer keystroke superseded us
+    const tokens = d.choices?.[0]?.logprobs?.tokens || [];
+    const c = await fetch(BASE_URL + '/v1/hooks/collect', { method: 'POST' });
+    const res = (await c.json()).results || {};
+    if (seq !== reqSeq) return;
+    const key = Object.keys(res).find(k => k.includes(rid));
+    if (!key) { status.textContent = ''; hint.textContent = '(no readout returned)'; return; }
+    lastReadout = { tokens, layers: parseLayers(res[key]['0']) };
+    hint.textContent = ''; status.textContent = '';
     renderReadout();
-  } else {
-    document.getElementById('panelHint').textContent = '(no J-space readout returned)';
-  }
+  } catch (e) { if (seq === reqSeq) status.textContent = 'error: ' + e; }
 }
 
-document.getElementById('send').onclick = send;
-document.getElementById('inp').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
-});
+let debounce = null;
+ctx.addEventListener('input', () => { clearTimeout(debounce); debounce = setTimeout(readout, 350); });
+
+document.getElementById('contBtn').onclick = async () => {
+  const btn = document.getElementById('contBtn'); btn.disabled = true;
+  const status = document.getElementById('status'); status.textContent = 'generating…';
+  const nTok = parseInt(document.getElementById('contN').value) || 20;
+  try {
+    const resp = await fetch(BASE_URL + '/v1/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: MODEL, prompt: ctx.value, max_tokens: nTok, temperature: 0.7 })
+    });
+    const d = await resp.json();
+    ctx.value += (d.choices?.[0]?.text || '');
+  } catch (e) { status.textContent = 'error: ' + e; }
+  btn.disabled = false;
+  readout();
+};
+
+readout();  // initial
 </script>
 </body>
 </html>
