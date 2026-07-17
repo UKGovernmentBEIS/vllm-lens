@@ -1,7 +1,7 @@
 """Integration tests for persistent (Garçon-style) hook management.
 
-Tests the /v1/hooks/register, /v1/hooks/collect, and /v1/hooks/clear
-endpoints for user-controlled hook lifecycle.
+Tests the /v1/hooks/register, /v1/hooks/collect, /v1/hooks/clear, and
+/v1/hooks/clear_results endpoints for user-controlled hook lifecycle.
 """
 
 import json
@@ -80,6 +80,38 @@ def test_register_collect_clear(vllm_server):
     # Collect again — should be empty
     empty = requests.post(f"{vllm_server}/v1/hooks/collect").json()
     assert len(empty["results"]) == 0
+
+
+def test_clear_results_keeps_hooks_registered(vllm_server):
+    """clear_results drains accumulated results but the hooks keep firing."""
+
+    def capture_mean(ctx, h):
+        ctx.saved[f"mean_L{ctx.layer_idx}"] = h.mean(dim=-1).cpu()
+        return None
+
+    hook = Hook(fn=capture_mean, layer_indices=[15])
+    resp = requests.post(
+        f"{vllm_server}/v1/hooks/register",
+        json={"hooks": [hook.model_dump()]},
+    ).json()
+    assert resp["status"] == "ok"
+
+    r1 = _completions(vllm_server, "Hello world")
+    assert "error" not in r1, r1
+    assert len(requests.post(f"{vllm_server}/v1/hooks/collect").json()["results"]) == 1
+
+    # Drain results — hooks stay registered
+    clear_resp = requests.post(f"{vllm_server}/v1/hooks/clear_results").json()
+    assert clear_resp["status"] == "ok"
+    assert len(requests.post(f"{vllm_server}/v1/hooks/collect").json()["results"]) == 0
+
+    # A new request still fires the (still-registered) hook
+    r2 = _completions(vllm_server, "Goodbye world")
+    assert "error" not in r2, r2
+    results = requests.post(f"{vllm_server}/v1/hooks/collect").json()["results"]
+    assert len(results) == 1
+    hook_data = deserialize_hook_results(next(iter(results.values())))
+    assert "mean_L15" in hook_data["0"]
 
 
 def test_persistent_hooks_coexist_with_per_request(vllm_server):

@@ -85,6 +85,18 @@ async def clear_hooks(raw_request: Request):
     return JSONResponse({"status": "ok"})
 
 
+@router.post("/clear_results")
+async def clear_hook_results(raw_request: Request):
+    """Drop accumulated results but keep the hooks registered.
+
+    ``/collect`` never drains, so results grow unboundedly across requests.
+    Call this to reset accumulation (e.g. between chat turns) without
+    re-uploading the hooks.
+    """
+    await _engine_client(raw_request).collective_rpc("clear_persistent_hook_results")
+    return JSONResponse({"status": "ok"})
+
+
 @router.post("/prefetch")
 async def prefetch_params(raw_request: Request):
     body = await raw_request.json()

@@ -199,11 +199,12 @@ POST /v1/hooks/register          {"hooks": [...], "prefetch_params": [...]}
 POST /v1/completions             (hooks fire automatically)
 POST /v1/hooks/collect           → {"results": {<req_id>: ...}}
 POST /v1/hooks/clear
+POST /v1/hooks/clear_results
 POST /v1/hooks/prefetch          {"params": ["lm_head.weight", ...]}
 POST /v1/hooks/clear_prefetched
 ```
 
-Multiple `register` calls append hooks. `collect` is non-destructive. `clear` removes hooks and all accumulated results. Pre-fetched parameters persist independently.
+Multiple `register` calls append hooks. `collect` is non-destructive, so results accumulate across requests; `clear_results` (`client.clear_hook_results()`) drains them while keeping the hooks registered, and `clear` removes hooks and all accumulated results. Pre-fetched parameters persist independently.
 
 ### Accessing model parameters from hooks
 

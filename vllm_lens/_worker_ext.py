@@ -949,6 +949,16 @@ class HiddenStatesExtension:
         self._persistent_hooks = []
         self._persistent_hook_contexts = {}
 
+    def clear_persistent_hook_results(self) -> None:
+        """Drop accumulated persistent-hook contexts, keeping hooks registered.
+
+        ``get_all_hook_results`` never drains, so results pile up across
+        requests. This clears them without unregistering the hooks (so a
+        fitted lens does not need re-uploading), letting a client bound
+        accumulation by clearing between turns.
+        """
+        self._persistent_hook_contexts = {}
+
     # ------------------------------------------------------------------
     # Parameter prefetch (called via collective_rpc — all ranks in sync)
     # ------------------------------------------------------------------
