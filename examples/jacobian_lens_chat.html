@@ -9,49 +9,58 @@
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--ink);
          font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
-  header { padding:14px 20px 6px; }
+  header { padding:14px 20px 4px; }
   h1 { font-size:18px; margin:0; }
-  .subtitle { color:var(--muted); font-size:13px; margin:4px 0 0; }
-  .controls { display:flex; align-items:center; gap:14px; padding:6px 20px; flex-wrap:wrap;
+  .subtitle { color:var(--muted); font-size:13px; margin:3px 0 0; }
+  .controls { display:flex; align-items:center; gap:16px; padding:6px 20px; flex-wrap:wrap;
               font-size:13px; color:var(--muted); }
-  .controls input { font-size:13px; }
+  .controls input[type=number] { font-size:13px; }
   button { padding:7px 13px; border:0; border-radius:6px; background:var(--accent); color:#fff;
            cursor:pointer; font-size:14px; } button:disabled { opacity:.5; cursor:default; }
-  #chat { padding:6px 20px; max-height:30vh; overflow-y:auto; }
-  .turn { margin:8px 0; }
-  .turn .role { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
-  .turn .msg { font-family:Menlo,Consolas,monospace; font-size:13px; line-height:1.5;
-               white-space:pre-wrap; margin-top:2px; }
-  .turn.user .msg { color:#0e2747; }
+  button.mini { padding:1px 6px; font-size:11px; background:#eee; color:#333; }
+  #chat { padding:6px 20px; }
+  .turn { margin:12px 0; border-left:3px solid var(--line); padding-left:10px; }
+  .turn.user { border-color:#9db8d6; }
+  .turn.assistant { border-color:#cdd6cd; }
+  .turn .hd { display:flex; align-items:center; gap:8px; font-size:11px; color:var(--muted);
+              text-transform:uppercase; letter-spacing:.05em; margin-bottom:3px; }
+  .turn .body { font-family:Menlo,Consolas,monospace; font-size:13.5px; line-height:1.7;
+                white-space:pre-wrap; }
+  .tok { border-radius:3px; padding:0 1px; cursor:default; }
+  .tok.ready { cursor:pointer; }
+  .tok.ready:hover, .tok.pinned { outline:2px solid var(--accent); outline-offset:0; }
+  .turn .editrow textarea { width:100%; min-height:60px; font-family:Menlo,Consolas,monospace;
+                            font-size:13px; padding:6px; border:1px solid var(--line); border-radius:6px; }
   .inputrow { display:flex; gap:8px; padding:8px 20px; align-items:flex-end; }
-  #inp { flex:1; min-height:40px; max-height:140px; resize:vertical; padding:9px;
+  #inp { flex:1; min-height:42px; max-height:150px; resize:vertical; padding:9px;
          font-family:Menlo,Consolas,monospace; font-size:14px; border:1px solid var(--line);
          border-radius:8px; }
-  #panel { padding:4px 20px 22px; overflow:auto; }
-  .panel-head { display:flex; gap:12px; align-items:center; font-size:12px; color:var(--muted);
-                margin-bottom:6px; }
-  .grid { display:flex; gap:2px; align-items:flex-start; }
-  .col { display:flex; flex-direction:column; gap:2px; }
-  .cell { width:88px; min-height:22px; padding:2px 5px; font-family:Menlo,Consolas,monospace;
-          font-size:11px; line-height:1.3; border-radius:3px; overflow:hidden;
-          text-overflow:ellipsis; white-space:nowrap; }
-  .cell.head { background:transparent; color:var(--ink); font-weight:700;
-               border-bottom:2px solid var(--line); border-radius:0; }
   #status { color:var(--muted); font-size:12px; }
+  /* readout grid (used by hover tooltip + pinned panel) */
+  .rd { display:flex; gap:6px; }
+  .rd .lyr { display:flex; flex-direction:column; gap:2px; }
+  .rd .lh { font-size:10px; color:var(--muted); text-align:center; }
+  .rd .c { width:80px; padding:1px 4px; font-family:Menlo,Consolas,monospace; font-size:10.5px;
+           border-radius:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #tip { position:fixed; z-index:20; background:#fff; border:1px solid var(--line); border-radius:8px;
+         box-shadow:0 6px 24px rgba(0,0,0,.12); padding:8px; display:none; }
+  #tip .cap, #pin .cap { font-size:11px; color:var(--muted); margin-bottom:4px; }
+  #pin { position:sticky; bottom:0; background:var(--bg); border-top:1px solid var(--line);
+         padding:8px 20px; min-height:20px; }
 </style>
 </head>
 <body>
   <header>
     <h1>Jacobian lens · live J-space chat</h1>
-    <p class="subtitle">Chat with the model and watch the top-k tokens it is
-      <em>disposed to say</em> at each position — residual transported through
-      <code>J_l</code>, then unembedded.</p>
+    <p class="subtitle">Chat, and hover any token to see the top-k it's <em>disposed to say</em>
+      there (residual transported through <code>J_l</code>, then unembedded). Readout streams in
+      as the reply generates; click a token to pin it.</p>
   </header>
 
   <div class="controls">
-    <span>layer</span><select id="layerSel"></select>
     <label>top-<input id="kSel" type="number" value="6" min="1" style="width:52px"></label>
-    <label>response <input id="contN" type="number" value="60" min="1" max="512" style="width:60px"> tokens</label>
+    <label>response <input id="maxTok" type="number" value="512" min="1" max="2048" style="width:64px"> tokens</label>
+    <label><input id="thinkChk" type="checkbox" checked> thinking</label>
     <span id="status"></span>
   </div>
 
@@ -59,37 +68,27 @@
 
   <div class="inputrow">
     <textarea id="inp" spellcheck="false"
-      placeholder="Type a message… readout updates as you type; ‘Create response’ to generate the reply"></textarea>
-    <button id="respBtn">Create response ▸</button>
+      placeholder="Type a message, then Send (or Enter). Shift+Enter for newline."></textarea>
+    <button id="sendBtn">Send ▸</button>
   </div>
 
-  <div id="panel">
-    <div class="panel-head"><span id="scope">readout: —</span></div>
-    <div id="readout"></div>
-  </div>
+  <div id="pin"><span class="cap">click a token to pin its readout here</span></div>
+  <div id="tip"></div>
 
 <script>
 // ── Injected by jacobian_lens_chat.py ──────────────────────────────
 const BASE_URL = $BASE_URL;        // local forwarded port, or "" for same origin
 const MODEL = $MODEL;
-const LAYERS = $LAYERS;
+const LAYERS = $LAYERS;            // captured layers (shown across the tooltip)
 const MAXK = $TOPK;                // top-k captured by the registered hook
 const INITIAL_PROMPT = $INITIAL_PROMPT;
 
-const chatHistory = [];            // [{role, content}]
-let lastReadout = null;            // { tokens:[...], layers:{ L:{toks,probs} } }
-let reqSeq = 0;                    // guards against stale (out-of-order) readouts
-
-const layerSel = document.getElementById('layerSel');
-LAYERS.forEach(L => { const o = document.createElement('option'); o.value = L;
-  o.textContent = 'layer ' + L; layerSel.appendChild(o); });
-layerSel.value = LAYERS[Math.floor(LAYERS.length / 2)] ?? LAYERS[0];
-layerSel.onchange = renderReadout;
+const turns = [];                  // [{role, content, tokens:[str], readout:{L:{toks,probs}}, streaming}]
+let pinned = null;                 // {turn, idx}
 
 const kSel = document.getElementById('kSel');
 kSel.max = MAXK; if (parseInt(kSel.value) > MAXK) kSel.value = MAXK;
-kSel.oninput = renderReadout;
-
+kSel.oninput = () => { if (pinned) renderInto(document.getElementById('pin'), pinned.turn, pinned.idx, true); };
 const inp = document.getElementById('inp');
 inp.value = INITIAL_PROMPT;
 
@@ -102,7 +101,9 @@ function showTok(s) {
   if (s.trim() === '') return s.includes('\n') ? '⏎' : '␣';
   return s.replace(/\n/g, '⏎');
 }
-function parseLayers(saved) {
+
+// Build {L:{toks,probs}} aligned to the LAST `nTok` readout positions.
+function buildReadout(saved, nTok) {
   const byPass = (p) => Object.keys(saved).filter(k => k.startsWith(p))
     .sort((a, b) => parseInt(a.split('_')[2]) - parseInt(b.split('_')[2]));
   const out = {};
@@ -110,120 +111,178 @@ function parseLayers(saved) {
     let toks = [], probs = [];
     byPass(`t_${L}_`).forEach(k => { toks = toks.concat(saved[k]); });
     byPass(`p_${L}_`).forEach(k => { probs = probs.concat(saved[k]); });
-    out[L] = { toks, probs };
+    const off = Math.max(0, toks.length - nTok);
+    out[L] = { toks: toks.slice(off), probs: probs.slice(off) };
   });
   return out;
 }
 
-function renderReadout() {
-  const box = document.getElementById('readout');
-  box.innerHTML = '';
-  if (!lastReadout) return;
-  const data = lastReadout.layers[parseInt(layerSel.value)];
-  const tokens = lastReadout.tokens;
-  if (!data || !data.toks.length) { box.textContent = 'no readout for this layer'; return; }
-  const K = Math.max(1, Math.min(MAXK, parseInt(kSel.value) || 6));
-  // align the last `tokens.length` readout rows to the displayed tokens
-  const total = data.toks.length;
-  const offset = Math.max(0, total - tokens.length);
-  const n = Math.min(tokens.length, total - offset);
-  const grid = document.createElement('div'); grid.className = 'grid';
-  for (let c = 0; c < n; c++) {
-    const pos = offset + c;
-    const col = document.createElement('div'); col.className = 'col';
-    const head = document.createElement('div'); head.className = 'cell head';
-    head.textContent = showTok(tokens[c]); head.title = JSON.stringify(tokens[c]);
-    col.appendChild(head);
-    const trow = data.toks[pos] || [], prow = data.probs[pos] || [];
-    for (let r = 0; r < K; r++) {
-      const cell = document.createElement('div'); cell.className = 'cell';
-      const w = trow[r] ?? '', p = prow[r] ?? 0;
-      cell.textContent = showTok(w);
-      cell.style.background = probColor(p);
-      cell.style.color = p > 0.35 ? '#fff' : '#111';
-      cell.title = JSON.stringify(w) + '  p=' + Number(p).toFixed(3);
-      col.appendChild(cell);
-    }
-    grid.appendChild(col);
-  }
-  box.appendChild(grid);
-}
-
-function addTurn(role, text) {
-  const d = document.createElement('div'); d.className = 'turn ' + role;
-  const lbl = document.createElement('div'); lbl.className = 'role';
-  lbl.textContent = role === 'user' ? 'You' : 'Assistant';
-  const body = document.createElement('div'); body.className = 'msg'; body.textContent = text;
-  d.appendChild(lbl); d.appendChild(body);
-  const chat = document.getElementById('chat'); chat.appendChild(d); chat.scrollTop = 1e9;
-  return body;
-}
-
-// Run the registered hook over `payload` (a /v1/completions or /v1/chat/completions
-// body), pull the readout back from /v1/hooks/collect (correlated by X-Request-Id),
-// and hand back {tokens, saved}. Returns null if superseded by a newer call.
-async function runReadout(path, payload, tokensFrom) {
-  const seq = ++reqSeq;
-  const rid = 'jl-' + Math.random().toString(36).slice(2);
-  const resp = await fetch(BASE_URL + path, {
-    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Request-Id': rid },
-    body: JSON.stringify(payload)
-  });
-  const d = await resp.json();
-  if (seq !== reqSeq) return null;
-  const tokens = tokensFrom(d);
+async function collect(rid) {
   const c = await fetch(BASE_URL + '/v1/hooks/collect', { method: 'POST' });
   const res = (await c.json()).results || {};
-  if (seq !== reqSeq) return null;
   const key = Object.keys(res).find(k => k.includes(rid));
-  return key ? { tokens, saved: res[key]['0'], resp: d } : null;
+  return key ? res[key]['0'] : null;
 }
 
-// As you type: readout over your (raw) message text.
-async function readoutInput() {
-  const text = inp.value;
-  const scope = document.getElementById('scope'), status = document.getElementById('status');
-  if (!text.trim()) { lastReadout = null; document.getElementById('readout').innerHTML = '';
-                      scope.textContent = 'readout: —'; return; }
-  status.textContent = 'reading…';
-  const out = await runReadout('/v1/completions',
-    { model: MODEL, prompt: text, max_tokens: 1, echo: true, logprobs: 1, temperature: 0 },
-    d => d.choices?.[0]?.logprobs?.tokens || []);
-  status.textContent = '';
-  if (!out) return;
-  lastReadout = { tokens: out.tokens, layers: parseLayers(out.saved) };
-  scope.textContent = 'readout: your message';
-  renderReadout();
+// Render the layers × top-K grid for turn.tokens[idx] into `el`.
+function renderInto(el, turn, idx, withCap) {
+  el.innerHTML = '';
+  const K = Math.max(1, Math.min(MAXK, parseInt(kSel.value) || 6));
+  if (withCap) { const cap = document.createElement('div'); cap.className = 'cap';
+    cap.textContent = 'token ' + JSON.stringify(turn.tokens[idx]); el.appendChild(cap); }
+  const rd = document.createElement('div'); rd.className = 'rd';
+  LAYERS.forEach(L => {
+    const lyr = document.createElement('div'); lyr.className = 'lyr';
+    const lh = document.createElement('div'); lh.className = 'lh'; lh.textContent = 'L' + L;
+    lyr.appendChild(lh);
+    const d = turn.readout?.[L]; const trow = d?.toks[idx] || [], prow = d?.probs[idx] || [];
+    for (let r = 0; r < K; r++) {
+      const c = document.createElement('div'); c.className = 'c';
+      const w = trow[r] ?? '', p = prow[r] ?? 0;
+      c.textContent = showTok(w); c.style.background = probColor(p);
+      c.style.color = p > 0.35 ? '#fff' : '#111';
+      c.title = JSON.stringify(w) + '  p=' + Number(p).toFixed(3);
+      lyr.appendChild(c);
+    }
+    rd.appendChild(lyr);
+  });
+  el.appendChild(rd);
 }
 
-let debounce = null;
-inp.addEventListener('input', () => { clearTimeout(debounce); debounce = setTimeout(readoutInput, 350); });
+const tip = document.getElementById('tip');
+function showTip(e, turn, idx) {
+  renderInto(tip, turn, idx, true); tip.style.display = 'block';
+  const r = 14; tip.style.left = Math.min(e.clientX + r, innerWidth - tip.offsetWidth - 8) + 'px';
+  tip.style.top = Math.min(e.clientY + r, innerHeight - tip.offsetHeight - 8) + 'px';
+}
+function hideTip() { tip.style.display = 'none'; }
 
-// Create the assistant response (proper chat template) + readout over it.
-document.getElementById('respBtn').onclick = async () => {
+function renderBody(turn, bodyEl) {
+  bodyEl.innerHTML = '';
+  if (!turn.tokens || !turn.tokens.length) { bodyEl.textContent = turn.content; return; }
+  turn.tokens.forEach((t, i) => {
+    const sp = document.createElement('span'); sp.className = 'tok'; sp.textContent = t;
+    const has = turn.readout && turn.readout[LAYERS[0]] && turn.readout[LAYERS[0]].toks[i];
+    if (has) {
+      sp.classList.add('ready');
+      sp.onmousemove = (e) => showTip(e, turn, i);
+      sp.onmouseleave = hideTip;
+      sp.onclick = () => { pinned = { turn, idx: i };
+        renderInto(document.getElementById('pin'), turn, i, true);
+        document.querySelectorAll('.tok.pinned').forEach(x => x.classList.remove('pinned'));
+        sp.classList.add('pinned'); };
+    }
+    bodyEl.appendChild(sp);
+  });
+}
+
+function renderChat() {
+  const chat = document.getElementById('chat'); chat.innerHTML = '';
+  turns.forEach((turn, ti) => {
+    const d = document.createElement('div'); d.className = 'turn ' + turn.role;
+    const hd = document.createElement('div'); hd.className = 'hd';
+    hd.innerHTML = `<span>${turn.role === 'user' ? 'You' : 'Assistant'}</span>`;
+    const edit = document.createElement('button'); edit.className = 'mini'; edit.textContent = 'edit';
+    const del = document.createElement('button'); del.className = 'mini'; del.textContent = 'delete';
+    hd.append(edit, del);
+    const body = document.createElement('div'); body.className = 'body';
+    renderBody(turn, body);
+    d.append(hd, body); chat.appendChild(d);
+    del.onclick = () => { turns.splice(ti, 1); if (pinned && pinned.turn === turn) pinned = null; renderChat(); };
+    edit.onclick = () => beginEdit(turn, d, body);
+  });
+  chat.scrollTop = 1e9;
+}
+
+function beginEdit(turn, turnEl, bodyEl) {
+  const wrap = document.createElement('div'); wrap.className = 'editrow';
+  const ta = document.createElement('textarea'); ta.value = turn.content;
+  const save = document.createElement('button'); save.className = 'mini'; save.textContent = 'save';
+  const cancel = document.createElement('button'); cancel.className = 'mini'; cancel.textContent = 'cancel';
+  wrap.append(ta, document.createElement('br'), save, cancel);
+  bodyEl.replaceWith(wrap);
+  cancel.onclick = renderChat;
+  save.onclick = async () => { turn.content = ta.value; turn.tokens = null; turn.readout = null;
+    renderChat(); await echoReadout(turn); };
+}
+
+// Readout over a turn's raw text (used for user + edited turns). Clean per-token labels.
+async function echoReadout(turn) {
+  if (!turn.content.trim()) return;
+  const rid = 'jl-' + Math.random().toString(36).slice(2);
+  const resp = await fetch(BASE_URL + '/v1/completions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Request-Id': rid },
+    body: JSON.stringify({ model: MODEL, prompt: turn.content, max_tokens: 1, echo: true,
+                           logprobs: 1, temperature: 0 })
+  });
+  const d = await resp.json();
+  turn.tokens = d.choices?.[0]?.logprobs?.tokens || [];
+  const saved = await collect(rid);
+  if (saved) turn.readout = buildReadout(saved, turn.tokens.length);
+  renderChat();
+}
+
+// Stream the assistant reply; poll /collect during generation so the readout
+// streams onto the tokens as they arrive.
+async function createResponse() {
   const text = inp.value.trim(); if (!text) return;
-  const btn = document.getElementById('respBtn'); btn.disabled = true;
-  const status = document.getElementById('status'); status.textContent = 'generating…';
-  addTurn('user', text); chatHistory.push({ role: 'user', content: text }); inp.value = '';
-  const nTok = parseInt(document.getElementById('contN').value) || 60;
-  const out = await runReadout('/v1/chat/completions',
-    { model: MODEL, messages: chatHistory, max_tokens: nTok, temperature: 0.7,
-      logprobs: true, top_logprobs: 1 },
-    d => (d.choices?.[0]?.logprobs?.content || []).map(t => t.token));
+  const btn = document.getElementById('sendBtn'), status = document.getElementById('status');
+  btn.disabled = true; status.textContent = 'generating…'; inp.value = '';
+
+  const userTurn = { role: 'user', content: text }; turns.push(userTurn);
+  const asst = { role: 'assistant', content: '', tokens: [], readout: {}, streaming: true };
+  turns.push(asst); renderChat();
+  echoReadout(userTurn);  // fill the user message's hover readout in the background
+
+  const rid = 'jl-' + Math.random().toString(36).slice(2);
+  const history = turns.filter(t => !t.streaming).map(t => ({ role: t.role, content: t.content }));
+  let poll = setInterval(async () => {
+    const saved = await collect(rid);
+    if (saved && asst.tokens.length) { asst.readout = buildReadout(saved, asst.tokens.length); refreshAsst(asst); }
+  }, 700);
+
+  try {
+    const resp = await fetch(BASE_URL + '/v1/chat/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Request-Id': rid },
+      body: JSON.stringify({ model: MODEL, messages: history,
+        max_tokens: parseInt(document.getElementById('maxTok').value) || 512, temperature: 0.7,
+        stream: true, logprobs: true, top_logprobs: 1,
+        chat_template_kwargs: { enable_thinking: document.getElementById('thinkChk').checked } })
+    });
+    const reader = resp.body.getReader(); const dec = new TextDecoder(); let buf = '';
+    while (true) {
+      const { done, value } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split('\n'); buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
+        let ch; try { ch = JSON.parse(line.slice(6)); } catch (e) { continue; }
+        const delta = ch.choices?.[0]?.delta?.content;
+        if (delta) asst.content += delta;
+        const lp = ch.choices?.[0]?.logprobs?.content;
+        if (lp) lp.forEach(t => asst.tokens.push(t.token));
+        refreshAsst(asst);
+      }
+    }
+  } catch (e) { status.textContent = 'error: ' + e; }
+  clearInterval(poll);
+  const saved = await collect(rid);
+  if (saved) asst.readout = buildReadout(saved, asst.tokens.length);
+  asst.streaming = false; refreshAsst(asst);
   status.textContent = ''; btn.disabled = false;
-  if (!out) return;
-  const reply = out.resp.choices?.[0]?.message?.content || '';
-  addTurn('assistant', reply); chatHistory.push({ role: 'assistant', content: reply });
-  lastReadout = { tokens: out.tokens, layers: parseLayers(out.saved) };
-  document.getElementById('scope').textContent = 'readout: assistant response';
-  renderReadout();
-};
+}
 
+// Re-render just the assistant turn's body in place (during streaming).
+function refreshAsst(asst) {
+  const ti = turns.indexOf(asst); if (ti < 0) return;
+  const body = document.querySelectorAll('#chat .turn')[ti]?.querySelector('.body');
+  if (body) { if (!asst.tokens.length) body.textContent = asst.content; else renderBody(asst, body); }
+}
+
+document.getElementById('sendBtn').onclick = createResponse;
 inp.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); document.getElementById('respBtn').click(); }
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); createResponse(); }
 });
-
-readoutInput();  // initial readout over the seed prompt
 </script>
 </body>
 </html>

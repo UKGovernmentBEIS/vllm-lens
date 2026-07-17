@@ -1,16 +1,16 @@
 """Live, interactive Jacobian-lens (J-space) visualizer.
 
-A chat page: type a message and watch — live, as you type — the top-k tokens the
-model is *disposed to say* at each position (the J-lens readout
-``unembed(J_l @ h)``), with a dropdown to switch the readout layer and a box to
-set how many top tokens to show. "Create response" generates the assistant turn
-(proper chat template) and the readout follows the reply.
+A chat page: send a message, the reply streams in, and every token is hoverable —
+hovering shows the top-k tokens the model is *disposed to say* there (the J-lens
+readout ``unembed(J_l @ h)``) across all captured layers; click to pin it. The
+readout streams onto the tokens as the reply generates. Messages are editable /
+deletable, top-k and response length are adjustable, and thinking can be toggled.
 
 Rather than send the lens on every message, this **registers** the readout hook
 on the server once (the fitted lens is uploaded a single time), then the page
-fires a small request as you type / on each turn and pulls the readout from
-``/v1/hooks/collect`` (correlated by request id). Re-run this generator if the
-server restarts (it re-registers the hook and rewrites the page).
+pulls the readout from ``/v1/hooks/collect`` (correlated by request id), polling
+during generation so it streams in. Re-run this generator if the server restarts
+(it re-registers the hook and rewrites the page).
 
 The readout is the same projection ``jacobian_lens.py`` applies (transport by
 ``J_l`` -> RMSNorm -> unembed -> top-k). The hook is self-contained: it resolves
