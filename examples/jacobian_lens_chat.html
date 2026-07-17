@@ -3,63 +3,82 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Jacobian lens · live J-space readout</title>
+<title>Jacobian lens · live J-space chat</title>
 <style>
   :root { --ink:#111; --muted:#666; --line:#e6e6e3; --bg:#fcfcfb; --accent:#2a78d6; }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--ink);
          font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
-  header { padding:16px 20px 8px; }
+  header { padding:14px 20px 6px; }
   h1 { font-size:18px; margin:0; }
   .subtitle { color:var(--muted); font-size:13px; margin:4px 0 0; }
   .controls { display:flex; align-items:center; gap:14px; padding:6px 20px; flex-wrap:wrap;
               font-size:13px; color:var(--muted); }
-  .controls select, .controls button { font-size:13px; }
-  button { padding:6px 12px; border:0; border-radius:6px; background:var(--accent); color:#fff;
-           cursor:pointer; } button:disabled { opacity:.5; cursor:default; }
-  #ctx { width:calc(100% - 40px); margin:4px 20px; min-height:64px; max-height:180px; resize:vertical;
-         padding:10px; font-family:Menlo,Consolas,monospace; font-size:14px; line-height:1.5;
-         border:1px solid var(--line); border-radius:8px; }
-  #panel { padding:8px 20px 24px; overflow:auto; }
+  .controls input { font-size:13px; }
+  button { padding:7px 13px; border:0; border-radius:6px; background:var(--accent); color:#fff;
+           cursor:pointer; font-size:14px; } button:disabled { opacity:.5; cursor:default; }
+  #chat { padding:6px 20px; max-height:30vh; overflow-y:auto; }
+  .turn { margin:8px 0; }
+  .turn .role { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+  .turn .msg { font-family:Menlo,Consolas,monospace; font-size:13px; line-height:1.5;
+               white-space:pre-wrap; margin-top:2px; }
+  .turn.user .msg { color:#0e2747; }
+  .inputrow { display:flex; gap:8px; padding:8px 20px; align-items:flex-end; }
+  #inp { flex:1; min-height:40px; max-height:140px; resize:vertical; padding:9px;
+         font-family:Menlo,Consolas,monospace; font-size:14px; border:1px solid var(--line);
+         border-radius:8px; }
+  #panel { padding:4px 20px 22px; overflow:auto; }
+  .panel-head { display:flex; gap:12px; align-items:center; font-size:12px; color:var(--muted);
+                margin-bottom:6px; }
   .grid { display:flex; gap:2px; align-items:flex-start; }
   .col { display:flex; flex-direction:column; gap:2px; }
-  .cell { width:86px; min-height:22px; padding:2px 5px; font-family:Menlo,Consolas,monospace;
+  .cell { width:88px; min-height:22px; padding:2px 5px; font-family:Menlo,Consolas,monospace;
           font-size:11px; line-height:1.3; border-radius:3px; overflow:hidden;
           text-overflow:ellipsis; white-space:nowrap; }
   .cell.head { background:transparent; color:var(--ink); font-weight:700;
                border-bottom:2px solid var(--line); border-radius:0; }
   #status { color:var(--muted); font-size:12px; }
-  .hint { color:var(--muted); font-size:12px; padding:0 20px; }
 </style>
 </head>
 <body>
   <header>
-    <h1>Jacobian lens · live J-space readout</h1>
-    <p class="subtitle">Type below — each column shows the top-k tokens the model is
-      <em>disposed to say</em> at that position (residual transported through <code>J_l</code>,
-      then unembedded). Updates as you type.</p>
+    <h1>Jacobian lens · live J-space chat</h1>
+    <p class="subtitle">Chat with the model and watch the top-k tokens it is
+      <em>disposed to say</em> at each position — residual transported through
+      <code>J_l</code>, then unembedded.</p>
   </header>
 
   <div class="controls">
     <span>layer</span><select id="layerSel"></select>
-    <button id="contBtn" title="let the model extend the text">continue ▸</button>
-    <label>+<input id="contN" type="number" value="20" min="1" max="128" style="width:52px"> tokens</label>
+    <label>top-<input id="kSel" type="number" value="6" min="1" style="width:52px"></label>
+    <label>response <input id="contN" type="number" value="60" min="1" max="512" style="width:60px"> tokens</label>
     <span id="status"></span>
   </div>
 
-  <textarea id="ctx" spellcheck="false"></textarea>
-  <div id="panel"><div class="hint" id="hint">…</div><div id="readout"></div></div>
+  <div id="chat"></div>
+
+  <div class="inputrow">
+    <textarea id="inp" spellcheck="false"
+      placeholder="Type a message… readout updates as you type; ‘Create response’ to generate the reply"></textarea>
+    <button id="respBtn">Create response ▸</button>
+  </div>
+
+  <div id="panel">
+    <div class="panel-head"><span id="scope">readout: —</span></div>
+    <div id="readout"></div>
+  </div>
 
 <script>
 // ── Injected by jacobian_lens_chat.py ──────────────────────────────
-const BASE_URL = $BASE_URL;        // "" = same origin as this page
+const BASE_URL = $BASE_URL;        // local forwarded port, or "" for same origin
 const MODEL = $MODEL;
 const LAYERS = $LAYERS;
-const TOPK = $TOPK;
+const MAXK = $TOPK;                // top-k captured by the registered hook
 const INITIAL_PROMPT = $INITIAL_PROMPT;
 
+const chatHistory = [];            // [{role, content}]
 let lastReadout = null;            // { tokens:[...], layers:{ L:{toks,probs} } }
-let reqSeq = 0;                    // guards against stale (out-of-order) responses
+let reqSeq = 0;                    // guards against stale (out-of-order) readouts
 
 const layerSel = document.getElementById('layerSel');
 LAYERS.forEach(L => { const o = document.createElement('option'); o.value = L;
@@ -67,8 +86,12 @@ LAYERS.forEach(L => { const o = document.createElement('option'); o.value = L;
 layerSel.value = LAYERS[Math.floor(LAYERS.length / 2)] ?? LAYERS[0];
 layerSel.onchange = renderReadout;
 
-const ctx = document.getElementById('ctx');
-ctx.value = INITIAL_PROMPT;
+const kSel = document.getElementById('kSel');
+kSel.max = MAXK; if (parseInt(kSel.value) > MAXK) kSel.value = MAXK;
+kSel.oninput = renderReadout;
+
+const inp = document.getElementById('inp');
+inp.value = INITIAL_PROMPT;
 
 function probColor(p) {
   const t = Math.max(0, Math.min(1, p * 2.0));
@@ -79,9 +102,8 @@ function showTok(s) {
   if (s.trim() === '') return s.includes('\n') ? '⏎' : '␣';
   return s.replace(/\n/g, '⏎');
 }
-
 function parseLayers(saved) {
-  const byPass = (prefix) => Object.keys(saved).filter(k => k.startsWith(prefix))
+  const byPass = (p) => Object.keys(saved).filter(k => k.startsWith(p))
     .sort((a, b) => parseInt(a.split('_')[2]) - parseInt(b.split('_')[2]));
   const out = {};
   LAYERS.forEach(L => {
@@ -100,15 +122,20 @@ function renderReadout() {
   const data = lastReadout.layers[parseInt(layerSel.value)];
   const tokens = lastReadout.tokens;
   if (!data || !data.toks.length) { box.textContent = 'no readout for this layer'; return; }
-  const n = Math.min(tokens.length, data.toks.length);
+  const K = Math.max(1, Math.min(MAXK, parseInt(kSel.value) || 6));
+  // align the last `tokens.length` readout rows to the displayed tokens
+  const total = data.toks.length;
+  const offset = Math.max(0, total - tokens.length);
+  const n = Math.min(tokens.length, total - offset);
   const grid = document.createElement('div'); grid.className = 'grid';
   for (let c = 0; c < n; c++) {
+    const pos = offset + c;
     const col = document.createElement('div'); col.className = 'col';
     const head = document.createElement('div'); head.className = 'cell head';
     head.textContent = showTok(tokens[c]); head.title = JSON.stringify(tokens[c]);
     col.appendChild(head);
-    const trow = data.toks[c] || [], prow = data.probs[c] || [];
-    for (let r = 0; r < TOPK; r++) {
+    const trow = data.toks[pos] || [], prow = data.probs[pos] || [];
+    for (let r = 0; r < K; r++) {
       const cell = document.createElement('div'); cell.className = 'cell';
       const w = trow[r] ?? '', p = prow[r] ?? 0;
       cell.textContent = showTok(w);
@@ -122,56 +149,81 @@ function renderReadout() {
   box.appendChild(grid);
 }
 
-// One tiny 1-token echo request; the server-registered hook runs over the text,
-// and we pull its result from /v1/hooks/collect (correlated by X-Request-Id).
-async function readout() {
-  const text = ctx.value;
+function addTurn(role, text) {
+  const d = document.createElement('div'); d.className = 'turn ' + role;
+  const lbl = document.createElement('div'); lbl.className = 'role';
+  lbl.textContent = role === 'user' ? 'You' : 'Assistant';
+  const body = document.createElement('div'); body.className = 'msg'; body.textContent = text;
+  d.appendChild(lbl); d.appendChild(body);
+  const chat = document.getElementById('chat'); chat.appendChild(d); chat.scrollTop = 1e9;
+  return body;
+}
+
+// Run the registered hook over `payload` (a /v1/completions or /v1/chat/completions
+// body), pull the readout back from /v1/hooks/collect (correlated by X-Request-Id),
+// and hand back {tokens, saved}. Returns null if superseded by a newer call.
+async function runReadout(path, payload, tokensFrom) {
   const seq = ++reqSeq;
-  const hint = document.getElementById('hint'), status = document.getElementById('status');
-  if (!text.trim()) { lastReadout = null; document.getElementById('readout').innerHTML = '';
-                      hint.textContent = 'type something…'; return; }
-  status.textContent = 'reading…';
   const rid = 'jl-' + Math.random().toString(36).slice(2);
-  try {
-    const resp = await fetch(BASE_URL + '/v1/completions', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Request-Id': rid },
-      body: JSON.stringify({ model: MODEL, prompt: text, max_tokens: 1, echo: true,
-                             logprobs: 1, temperature: 0 })
-    });
-    const d = await resp.json();
-    if (seq !== reqSeq) return;                       // a newer keystroke superseded us
-    const tokens = d.choices?.[0]?.logprobs?.tokens || [];
-    const c = await fetch(BASE_URL + '/v1/hooks/collect', { method: 'POST' });
-    const res = (await c.json()).results || {};
-    if (seq !== reqSeq) return;
-    const key = Object.keys(res).find(k => k.includes(rid));
-    if (!key) { status.textContent = ''; hint.textContent = '(no readout returned)'; return; }
-    lastReadout = { tokens, layers: parseLayers(res[key]['0']) };
-    hint.textContent = ''; status.textContent = '';
-    renderReadout();
-  } catch (e) { if (seq === reqSeq) status.textContent = 'error: ' + e; }
+  const resp = await fetch(BASE_URL + path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Request-Id': rid },
+    body: JSON.stringify(payload)
+  });
+  const d = await resp.json();
+  if (seq !== reqSeq) return null;
+  const tokens = tokensFrom(d);
+  const c = await fetch(BASE_URL + '/v1/hooks/collect', { method: 'POST' });
+  const res = (await c.json()).results || {};
+  if (seq !== reqSeq) return null;
+  const key = Object.keys(res).find(k => k.includes(rid));
+  return key ? { tokens, saved: res[key]['0'], resp: d } : null;
+}
+
+// As you type: readout over your (raw) message text.
+async function readoutInput() {
+  const text = inp.value;
+  const scope = document.getElementById('scope'), status = document.getElementById('status');
+  if (!text.trim()) { lastReadout = null; document.getElementById('readout').innerHTML = '';
+                      scope.textContent = 'readout: —'; return; }
+  status.textContent = 'reading…';
+  const out = await runReadout('/v1/completions',
+    { model: MODEL, prompt: text, max_tokens: 1, echo: true, logprobs: 1, temperature: 0 },
+    d => d.choices?.[0]?.logprobs?.tokens || []);
+  status.textContent = '';
+  if (!out) return;
+  lastReadout = { tokens: out.tokens, layers: parseLayers(out.saved) };
+  scope.textContent = 'readout: your message';
+  renderReadout();
 }
 
 let debounce = null;
-ctx.addEventListener('input', () => { clearTimeout(debounce); debounce = setTimeout(readout, 350); });
+inp.addEventListener('input', () => { clearTimeout(debounce); debounce = setTimeout(readoutInput, 350); });
 
-document.getElementById('contBtn').onclick = async () => {
-  const btn = document.getElementById('contBtn'); btn.disabled = true;
+// Create the assistant response (proper chat template) + readout over it.
+document.getElementById('respBtn').onclick = async () => {
+  const text = inp.value.trim(); if (!text) return;
+  const btn = document.getElementById('respBtn'); btn.disabled = true;
   const status = document.getElementById('status'); status.textContent = 'generating…';
-  const nTok = parseInt(document.getElementById('contN').value) || 20;
-  try {
-    const resp = await fetch(BASE_URL + '/v1/completions', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: MODEL, prompt: ctx.value, max_tokens: nTok, temperature: 0.7 })
-    });
-    const d = await resp.json();
-    ctx.value += (d.choices?.[0]?.text || '');
-  } catch (e) { status.textContent = 'error: ' + e; }
-  btn.disabled = false;
-  readout();
+  addTurn('user', text); chatHistory.push({ role: 'user', content: text }); inp.value = '';
+  const nTok = parseInt(document.getElementById('contN').value) || 60;
+  const out = await runReadout('/v1/chat/completions',
+    { model: MODEL, messages: chatHistory, max_tokens: nTok, temperature: 0.7,
+      logprobs: true, top_logprobs: 1 },
+    d => (d.choices?.[0]?.logprobs?.content || []).map(t => t.token));
+  status.textContent = ''; btn.disabled = false;
+  if (!out) return;
+  const reply = out.resp.choices?.[0]?.message?.content || '';
+  addTurn('assistant', reply); chatHistory.push({ role: 'assistant', content: reply });
+  lastReadout = { tokens: out.tokens, layers: parseLayers(out.saved) };
+  document.getElementById('scope').textContent = 'readout: assistant response';
+  renderReadout();
 };
 
-readout();  // initial
+inp.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); document.getElementById('respBtn').click(); }
+});
+
+readoutInput();  // initial readout over the seed prompt
 </script>
 </body>
 </html>

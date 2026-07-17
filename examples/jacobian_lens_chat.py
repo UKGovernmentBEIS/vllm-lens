@@ -1,15 +1,16 @@
 """Live, interactive Jacobian-lens (J-space) visualizer.
 
-Type into a box and watch — live, as you type — the top-k tokens the model is
-*disposed to say* at each position: the J-lens readout ``unembed(J_l @ h)``, with
-a dropdown to switch the readout layer instantly. A "continue" button lets the
-model extend the text so you can watch the readout evolve.
+A chat page: type a message and watch — live, as you type — the top-k tokens the
+model is *disposed to say* at each position (the J-lens readout
+``unembed(J_l @ h)``), with a dropdown to switch the readout layer and a box to
+set how many top tokens to show. "Create response" generates the assistant turn
+(proper chat template) and the readout follows the reply.
 
-Rather than send the lens on every keystroke, this **registers** the readout hook
+Rather than send the lens on every message, this **registers** the readout hook
 on the server once (the fitted lens is uploaded a single time), then the page
-fires a tiny 1-token ``/v1/completions`` request as you type and pulls the result
-from ``/v1/hooks/collect``. Re-run this generator if the server restarts (it
-re-registers the hook and rewrites the page).
+fires a small request as you type / on each turn and pulls the readout from
+``/v1/hooks/collect`` (correlated by request id). Re-run this generator if the
+server restarts (it re-registers the hook and rewrites the page).
 
 The readout is the same projection ``jacobian_lens.py`` applies (transport by
 ``J_l`` -> RMSNorm -> unembed -> top-k). The hook is self-contained: it resolves
@@ -123,16 +124,28 @@ def _write_html(layers, k, html_base_url, model, prompt, out):
 
 def main():
     ap = argparse.ArgumentParser(description="Interactive J-space visualizer")
-    ap.add_argument("--lens", required=True, help="fitted lens .pt (jacobian_lens_fit.py)")
-    ap.add_argument("--base-url", default="http://localhost:8000", help="server URL for setup.")
+    ap.add_argument(
+        "--lens", required=True, help="fitted lens .pt (jacobian_lens_fit.py)"
+    )
+    ap.add_argument(
+        "--base-url", default="http://localhost:8000", help="server URL for setup."
+    )
     ap.add_argument(
         "--layers",
         default=None,
         help="comma-separated layers to capture (default: all fitted).",
     )
-    ap.add_argument("--k", type=int, default=6, help="top-k tokens per position.")
-    ap.add_argument("--prompt", default="The Eiffel Tower is in the city of")
-    ap.add_argument("--out", default="jacobian_lens_chat", help="output basename (.html appended).")
+    ap.add_argument(
+        "--k",
+        type=int,
+        default=25,
+        help="top-k tokens captured per position; the page's K control displays "
+        "up to this many (registered once, so K changes are instant/client-side).",
+    )
+    ap.add_argument("--prompt", default="Tell me about the Eiffel Tower.")
+    ap.add_argument(
+        "--out", default="jacobian_lens_chat", help="output basename (.html appended)."
+    )
     ap.add_argument(
         "--html-base-url",
         default=None,
@@ -157,12 +170,17 @@ def main():
     # time). It then applies to every request; the page reads results back via
     # /v1/hooks/collect. clear with client.clear_hooks() when done.
     hook = _build_hook(jacobians, layers, rms_eps, vocab_size, args.k, client.model)
-    print(f"registering J-lens hook (layers {layers}) on {args.base_url} ...")
+    print(
+        f"registering J-lens hook (layers {layers}, top-{args.k}) on {args.base_url} ..."
+    )
+    client.clear_hooks()  # replace any hook from a previous run (register appends)
     client.register_hooks([hook])
     print("registered.")
 
     html_base = args.base_url if args.html_base_url is None else args.html_base_url
-    _write_html(layers, args.k, html_base, client.model, args.prompt, f"{args.out}.html")
+    _write_html(
+        layers, args.k, html_base, client.model, args.prompt, f"{args.out}.html"
+    )
     print(
         "Open the HTML and type. Note: the hook is registered on the server and "
         "applies to ALL requests until cleared (client.clear_hooks() / POST "
