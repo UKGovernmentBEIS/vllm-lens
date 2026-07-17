@@ -8,6 +8,16 @@ Uses PyTorch forward hooks on each decoder layer for concurrency-safe,
 per-request activation capture and steering.  Each hook checks the
 request's ``extra_args["output_residual_stream"]`` to decide whether to
 capture, and reads from ``_steering_data`` to apply any steering vectors.
+
+Also supports capturing each attention head's individual write to the
+residual stream (``extra_args["output_head_contributions"]``), for
+component-level circuit analysis (e.g. ``_examples/induction_circuits.py``).
+vLLM's attention runs through fused kernels with no hookable module
+exposing the attention weight matrix itself, so this is derived instead
+from a forward *pre*-hook on each layer's ``self_attn.o_proj``: since
+``o_proj`` is linear, its input decomposes exactly per-head into each
+head's additive contribution to the residual stream (the "OV circuit"
+write), without needing attention weights at all.
 """
 
 from __future__ import annotations
@@ -19,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import zstandard as zstd
+from vllm.distributed.parallel_state import get_pp_group, get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.models.utils import PPMissingLayer
 
@@ -53,6 +64,31 @@ def _get_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
         "Expected model.language_model.model.layers, "
         "model.model.decoder.layers, or model.model.layers"
     )
+
+
+def _get_attn_o_proj(layer: torch.nn.Module) -> tuple[torch.nn.Module, int, int]:
+    """Find a decoder layer's attention output projection, plus its (TP-local)
+    head count and head dim.
+
+    Supports the ``self_attn.o_proj`` naming used across the Llama/Qwen/
+    Mistral/Gemma family — the same architecture family ``_get_layers``
+    targets.  ``o_proj`` is a ``RowParallelLinear`` with
+    ``input_is_parallel=True``, so under tensor parallelism its input is
+    already the local shard: shape ``(seq_len, num_heads * head_dim)``
+    where ``num_heads`` is this rank's local head count, not the model's
+    total head count.
+    """
+    attn: Any = getattr(layer, "self_attn", None)
+    o_proj = getattr(attn, "o_proj", None) if attn is not None else None
+    num_heads = getattr(attn, "num_heads", None) if attn is not None else None
+    head_dim = getattr(attn, "head_dim", None) if attn is not None else None
+    if o_proj is None or num_heads is None or head_dim is None:
+        raise AttributeError(
+            f"Cannot find self_attn.o_proj/num_heads/head_dim on "
+            f"{type(layer).__name__}. Expected the Llama/Qwen/Mistral/Gemma "
+            "style attention module layout."
+        )
+    return o_proj, num_heads, head_dim
 
 
 def _find_steering_configs(
@@ -146,12 +182,17 @@ def _apply_steering(
                 target[rel] = target[rel] + v * cfg.scale
 
 
-def _hook_inner(
+def _get_batch_bookkeeping(
     extension: HiddenStatesExtension,
-    layer_idx: int,
-    output: torch.Tensor | tuple[torch.Tensor, ...],
-) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
-    """Core hook logic, separated so _make_hook can wrap it in try/except."""
+) -> tuple[Any, int, list[str], torch.Tensor, Any] | None:
+    """Read per-forward-pass batch bookkeeping shared by all hooks.
+
+    Returns ``(runner, num_reqs, req_ids, query_start_loc, attn_metadata)``,
+    or ``None`` if no forward context / attention metadata is available this
+    step (e.g. a dummy profiling pass).  Shared between the per-layer output
+    hook and the per-head ``o_proj``-input hook since both need to slice the
+    same dynamically-batched forward pass by request.
+    """
     if not is_forward_context_available():
         return None
 
@@ -185,6 +226,20 @@ def _hook_inner(
             list(attn_metadata.keys()),
         )
         return None
+
+    return runner, num_reqs, req_ids, query_start_loc, attn_metadata
+
+
+def _hook_inner(
+    extension: HiddenStatesExtension,
+    layer_idx: int,
+    output: torch.Tensor | tuple[torch.Tensor, ...],
+) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
+    """Core hook logic, separated so _make_hook can wrap it in try/except."""
+    bookkeeping = _get_batch_bookkeeping(extension)
+    if bookkeeping is None:
+        return None
+    runner, num_reqs, req_ids, query_start_loc, attn_metadata = bookkeeping
 
     # --- Phase 1: detect steering requests --------------------------
     per_req_steering: list[list[SteeringVector]] = []
@@ -304,6 +359,108 @@ def _make_hook(extension: HiddenStatesExtension, layer_idx: int) -> Callable:
     return hook
 
 
+def _head_contrib_hook_inner(
+    extension: HiddenStatesExtension,
+    layer_idx: int,
+    num_heads: int,
+    head_dim: int,
+    o_proj_weight: torch.Tensor,
+    z: torch.Tensor,
+) -> None:
+    """Decompose ``o_proj``'s input into each attention head's additive
+    contribution to the residual stream, and capture per requesting request.
+
+    ``o_proj`` computes ``attn_out = z @ W_O.T`` (plus bias, not attributed to
+    any head).  Since this is linear, it decomposes exactly per-head:
+    ``attn_out = sum_h  z[:, h_slice] @ W_O[:, h_slice].T``.  This gives each
+    head's individual write to the residual stream — the "OV circuit" output
+    — without needing the (unavailable, see module docstring) attention
+    weight matrix itself.  ``z`` is already this rank's local TP shard of
+    heads (``o_proj`` is a ``RowParallelLinear`` with
+    ``input_is_parallel=True``), so no cross-rank communication is needed
+    here; the caller tags results with this rank's TP index for merging.
+    """
+    bookkeeping = _get_batch_bookkeeping(extension)
+    if bookkeeping is None:
+        return
+    runner, num_reqs, req_ids, query_start_loc, _attn_metadata = bookkeeping
+
+    # (hidden_dim, num_heads * head_dim) -> (hidden_dim, num_heads, head_dim)
+    w_heads = o_proj_weight.view(o_proj_weight.shape[0], num_heads, head_dim)
+
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        req_state = runner.requests.get(req_id)
+        if req_state is None or req_state.sampling_params is None:
+            continue
+        extra = req_state.sampling_params.extra_args
+        if not extra:
+            continue
+
+        wanted_layers = extra.get("output_head_contributions")
+        if wanted_layers is None:
+            continue
+        if isinstance(wanted_layers, list) and layer_idx not in wanted_layers:
+            continue
+
+        start = int(query_start_loc[i].item())
+        end = int(query_start_loc[i + 1].item())
+        seq_len = end - start
+        # (seq_len, num_heads * head_dim) -> (seq_len, num_heads, head_dim)
+        z_heads = z[start:end].view(seq_len, num_heads, head_dim)
+        # contributions[h, t, :] = z_heads[t, h, :] @ w_heads[:, h, :].T
+        # Blocking .cpu() benchmarked faster than non_blocking + event sync
+        # (see the equivalent note on the residual-stream capture above).
+        contributions: Float[torch.Tensor, "num_heads seq_len hidden_dim"] = (  # type: ignore[reportUndefinedVariable]
+            torch.einsum("thd,ohd->hto", z_heads, w_heads).cpu()
+        )
+
+        if req_id not in extension._captured_head_contribs:
+            extension._captured_head_contribs[req_id] = {}
+        layer_states = extension._captured_head_contribs[req_id]
+        if layer_idx not in layer_states:
+            layer_states[layer_idx] = []
+        layer_states[layer_idx].append(contributions)
+
+
+def _make_head_contrib_hook(
+    extension: HiddenStatesExtension,
+    layer_idx: int,
+    num_heads: int,
+    head_dim: int,
+) -> Callable:
+    """Create a forward *pre*-hook closure capturing per-head OV contributions
+    for a specific layer's ``o_proj``.
+
+    A pre-hook (not a post-hook) is used because we need ``o_proj``'s
+    *input* (the concatenated per-head values) rather than its output (the
+    already-summed residual-stream write).
+    """
+
+    def hook(module: torch.nn.Module, args: tuple[object, ...]) -> None:
+        """Forward pre-hook: capture per-head OV contributions, if wanted.
+
+        Never returns a value (unlike the steering hook above) — this hook
+        only observes ``o_proj``'s input, it never modifies it.
+        """
+        try:
+            module_any: Any = module
+            weight: torch.Tensor = module_any.weight
+            z = args[0]
+            assert isinstance(z, torch.Tensor)
+            _head_contrib_hook_inner(
+                extension, layer_idx, num_heads, head_dim, weight, z
+            )
+        except Exception:
+            logger.warning(
+                "vllm-lens head-contribution hook error on layer %d, skipping",
+                layer_idx,
+                exc_info=True,
+            )
+
+    return hook
+
+
 class HiddenStatesExtension:
     """Mixin injected into vLLM's GPU Worker at runtime.
 
@@ -329,6 +486,15 @@ class HiddenStatesExtension:
     ] = {}
     _hooks_installed: bool = False
 
+    # Per-request captured per-head OV contributions:
+    # internal_req_id → { layer_idx → [tensor (num_heads seq_len hidden_dim), ...] }
+    # Unlike _captured_states, every TP rank captures here (each rank holds a
+    # different, non-replicated shard of heads — see get_captured_head_contributions).
+    _captured_head_contribs: dict[
+        str,
+        dict[int, list[Float[torch.Tensor, "num_heads seq_len hidden_dim"]]],  # type: ignore[reportUndefinedVariable]
+    ] = {}
+
     # Per-request steering configs:
     # key (external_req_id or _steering_id) → list of SteeringVector
     _steering_data: dict[str, list[SteeringVector]] = {}
@@ -352,6 +518,7 @@ class HiddenStatesExtension:
         self._hooks_installed = True
         # Reset to instance-level dicts (class-level defaults are shared)
         self._captured_states = {}
+        self._captured_head_contribs = {}
         self._steering_data = {}
 
         # Only rank 0 captures — residual streams are replicated across
@@ -366,6 +533,10 @@ class HiddenStatesExtension:
             if isinstance(layer, PPMissingLayer):
                 continue
             layer.register_forward_hook(_make_hook(self, layer_idx))
+            o_proj, num_heads, head_dim = _get_attn_o_proj(layer)
+            o_proj.register_forward_pre_hook(
+                _make_head_contrib_hook(self, layer_idx, num_heads, head_dim)
+            )
 
     # ------------------------------------------------------------------
     # Steering data management (called via collective_rpc)
@@ -461,6 +632,64 @@ class HiddenStatesExtension:
                     pickle.dumps(
                         {
                             "activations": {"residual_stream": stacked},
+                        }
+                    )
+                )
+        return None
+
+    def clear_captured_head_contributions(self, external_req_id: str) -> None:
+        """Remove captured per-head contributions without returning them.
+
+        Same leaked-state cleanup role as ``clear_captured_states``, for the
+        per-head capture channel.
+        """
+        prefix = f"{external_req_id}-"
+        for req_id in list(self._captured_head_contribs):
+            if req_id.startswith(prefix):
+                del self._captured_head_contribs[req_id]
+                logger.debug("Cleared leaked head contributions for %s", req_id)
+
+    def get_captured_head_contributions(self, external_req_id: str) -> bytes | None:
+        """Retrieve captured per-head OV contributions for a specific request.
+
+        Same prefix-matching convention as ``get_captured_states``. Unlike
+        residual-stream capture, this is **not** rank-0-only: under tensor
+        parallelism, each rank holds a different (non-replicated) shard of
+        attention heads, so every rank's data is needed to reconstruct the
+        full head count.  The response is tagged with this rank's TP/PP
+        indices so the caller (``_merge_captured_head_contributions`` in
+        ``_activations_plugin.py``) can group and order ranks correctly
+        without assuming a specific global-rank layout convention.
+
+        Returns a dict when deserialized::
+
+            {
+                "head_contributions": Tensor,  # (n_layers_local, n_heads_local, total_pos, hidden_dim)
+                "tp_rank": int,
+                "pp_rank": int,
+            }
+
+        Layers are stacked in ascending (this rank's local) order along dim
+        0; heads are stacked in ascending local-head order along dim 1.
+        Removes the request's data after retrieval.
+        """
+        prefix = f"{external_req_id}-"
+        for req_id in list(self._captured_head_contribs):
+            if req_id.startswith(prefix):
+                layer_dict = self._captured_head_contribs.pop(req_id)
+                sorted_indices = sorted(layer_dict.keys())
+                per_layer: list[
+                    Float[torch.Tensor, "num_heads total_pos hidden_dim"]  # type: ignore[reportUndefinedVariable]
+                ] = [torch.cat(layer_dict[idx], dim=1) for idx in sorted_indices]
+                stacked: Float[
+                    torch.Tensor, "n_layers num_heads total_pos hidden_dim"  # type: ignore[reportUndefinedVariable]
+                ] = torch.stack(per_layer, dim=0)
+                return _ZSTD_COMPRESSOR.compress(
+                    pickle.dumps(
+                        {
+                            "head_contributions": stacked,
+                            "tp_rank": get_tensor_model_parallel_rank(),
+                            "pp_rank": get_pp_group().rank_in_group,
                         }
                     )
                 )

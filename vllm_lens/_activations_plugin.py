@@ -1,7 +1,8 @@
 """
 vLLM general plugin that transparently captures residual-stream
-activations via worker extension when ``output_residual_stream`` is
-passed in ``extra_args``.
+activations (and, optionally, per-attention-head contributions to the
+residual stream) via worker extension when ``output_residual_stream`` /
+``output_head_contributions`` is passed in ``extra_args``.
 
 Installed automatically via the ``vllm.general_plugins`` entry point
 (configured in pyproject.toml). Patches ``EngineArgs.create_engine_config``
@@ -71,11 +72,54 @@ def _merge_captured_states(
     return {"residual_stream": merged}
 
 
+def _merge_captured_head_contributions(
+    states: list[bytes | None] | None,
+) -> torch.Tensor | None:
+    """Merge per-head OV-contribution captures from multiple TP/PP ranks.
+
+    Unlike residual-stream capture (rank-0-only under TP, see
+    ``_merge_captured_states``), every TP rank captures here — each rank
+    holds a different, non-replicated shard of attention heads (see
+    ``HiddenStatesExtension.get_captured_head_contributions``). Rather than
+    relying on ``collective_rpc``'s positional rank-order convention (which
+    ``_merge_captured_states`` assumes), each payload is self-describing —
+    tagged with its own ``tp_rank``/``pp_rank`` — so this groups by
+    ``pp_rank``, concatenates each group's ranks along the head dimension
+    in ascending ``tp_rank`` order, then concatenates the PP groups along
+    the layer dimension in ascending ``pp_rank`` order.
+    """
+    if not states:
+        return None
+    parts: list[dict[str, Any]] = [
+        pickle.loads(_ZSTD_DECOMPRESSOR.decompress(s) if s[:4] == _ZSTD_MAGIC else s)
+        for s in states
+        if s is not None
+    ]
+    if not parts:
+        return None
+
+    by_pp_rank: dict[int, list[dict[str, Any]]] = {}
+    for part in parts:
+        by_pp_rank.setdefault(part["pp_rank"], []).append(part)
+
+    pp_blocks = [
+        torch.cat(
+            [
+                p["head_contributions"]
+                for p in sorted(group, key=lambda p: p["tp_rank"])
+            ],
+            dim=1,
+        )
+        for _, group in sorted(by_pp_rank.items())
+    ]
+    return pp_blocks[0] if len(pp_blocks) == 1 else torch.cat(pp_blocks, dim=0)
+
+
 def _trim_activations(
     activations: dict[str, Any],
     expected_len: int,
 ) -> None:
-    """Trim residual stream activations and input_ids to the expected length.
+    """Trim residual stream / head contributions / input_ids to expected length.
 
     The vLLM v1 scheduler may execute one extra forward pass after the EOS
     stop condition is hit, because ``schedule()`` commits the next step
@@ -83,12 +127,15 @@ def _trim_activations(
     discards the extra output tokens
     (``vllm.v1.core.sched.scheduler.Scheduler.update_from_output`` skips
     already-finished requests), but our activation capture hooks still fire
-    during that extra pass.  This trims the surplus positions so the
-    residual stream shape is always deterministic.
+    during that extra pass.  This trims the surplus positions so captured
+    tensors always have a deterministic shape.
     """
     rs = activations.get("residual_stream")
     if rs is not None and rs.shape[1] > expected_len:
         activations["residual_stream"] = rs[:, :expected_len, :]
+    hc = activations.get("head_contributions")
+    if hc is not None and hc.shape[2] > expected_len:
+        activations["head_contributions"] = hc[:, :, :expected_len, :]
     ids = activations.get("input_ids")
     if ids is not None and len(ids) > expected_len:
         activations["input_ids"] = ids[:expected_len]
@@ -156,6 +203,7 @@ async def _patched_generate(
 
     extra = effective_params.extra_args or {}
     wants_activations = extra.get("output_residual_stream") is not None
+    wants_head_contribs = extra.get("output_head_contributions") is not None
     # Extract steering data and remove from extra_args before vLLM
     # serialises the SamplingParams (tensors don't survive msgspec).
     steering_vectors = extra.pop("apply_steering_vectors", None)
@@ -169,7 +217,9 @@ async def _patched_generate(
     # Allow explicit prefix-cache bypass via extra_args.
     skip_kv_cache = extra.pop("skip_reading_prefix_cache", None)
 
-    needs_hooks = wants_activations or steering_vectors is not None
+    needs_hooks = (
+        wants_activations or wants_head_contribs or steering_vectors is not None
+    )
     if needs_hooks or skip_kv_cache:
         # Hooks rely on forward passes firing; prefix-cached tokens skip
         # computation entirely, so force a fresh prefill for this request.
@@ -190,12 +240,23 @@ async def _patched_generate(
         async for output in _original_generate(
             self, prompt, sampling_params, request_id, **kwargs
         ):
-            if output.finished and wants_activations:
-                states = await self.collective_rpc(
-                    "get_captured_states", args=(request_id,)
-                )
-                activations = _merge_captured_states(states)
-                if activations is not None:
+            if output.finished and (wants_activations or wants_head_contribs):
+                activations: dict[str, Any] = {}
+                if wants_activations:
+                    states = await self.collective_rpc(
+                        "get_captured_states", args=(request_id,)
+                    )
+                    merged = _merge_captured_states(states)
+                    if merged is not None:
+                        activations.update(merged)
+                if wants_head_contribs:
+                    hc_states = await self.collective_rpc(
+                        "get_captured_head_contributions", args=(request_id,)
+                    )
+                    hc = _merge_captured_head_contributions(hc_states)
+                    if hc is not None:
+                        activations["head_contributions"] = hc
+                if activations:
                     n_prompt = len(output.prompt_token_ids)
                     n_gen = len(output.outputs[0].token_ids)
                     _trim_activations(activations, n_prompt + n_gen - 1)
@@ -206,6 +267,10 @@ async def _patched_generate(
             await self.collective_rpc("clear_steering_data", args=(request_id,))
         if wants_activations:
             await self.collective_rpc("clear_captured_states", args=(request_id,))
+        if wants_head_contribs:
+            await self.collective_rpc(
+                "clear_captured_head_contributions", args=(request_id,)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +302,10 @@ def _patched_llm_generate(
         (sp.extra_args or {}).get("output_residual_stream") is not None
         for sp in params_list
     )
+    wants_head_contribs = any(
+        (sp.extra_args or {}).get("output_head_contributions") is not None
+        for sp in params_list
+    )
 
     # Extract steering vectors per-request.  We must pop them from
     # extra_args before vLLM serialises SamplingParams (tensors don't
@@ -259,7 +328,7 @@ def _patched_llm_generate(
             any_skip_kv_cache = True
 
     has_steering = len(steering_payloads) > 0
-    needs_hooks = wants_activations or has_steering
+    needs_hooks = wants_activations or wants_head_contribs or has_steering
     if needs_hooks or any_skip_kv_cache:
         for sp in params_list:
             sp.skip_reading_prefix_cache = True
@@ -275,12 +344,23 @@ def _patched_llm_generate(
     assert _original_llm_generate is not None
     outputs = _original_llm_generate(self, prompts, sampling_params, **kwargs)
 
-    if wants_activations:
+    if wants_activations or wants_head_contribs:
         for output in outputs:
             req_id = output.request_id
-            states = self.collective_rpc("get_captured_states", args=(req_id,))
-            activations = _merge_captured_states(states)
-            if activations is not None:
+            activations: dict[str, Any] = {}
+            if wants_activations:
+                states = self.collective_rpc("get_captured_states", args=(req_id,))
+                merged = _merge_captured_states(states)
+                if merged is not None:
+                    activations.update(merged)
+            if wants_head_contribs:
+                hc_states = self.collective_rpc(
+                    "get_captured_head_contributions", args=(req_id,)
+                )
+                hc = _merge_captured_head_contributions(hc_states)
+                if hc is not None:
+                    activations["head_contributions"] = hc
+            if activations:
                 n_prompt = len(output.prompt_token_ids)
                 n_gen = len(output.outputs[0].token_ids)
                 _trim_activations(activations, n_prompt + n_gen - 1)
@@ -358,7 +438,11 @@ def register() -> None:
     activations are included in HTTP responses from ``vllm serve``.
 
     Use ``extra_args={"output_residual_stream": True | list[int]}`` in
-    SamplingParams to request activations.
+    SamplingParams to request activations, or
+    ``extra_args={"output_head_contributions": True | list[int]}`` to
+    additionally request each attention head's individual contribution to
+    the residual stream (returned as ``activations["head_contributions"]``,
+    shape ``(n_layers, n_heads, total_pos, hidden_dim)``).
     """
     global _original_create_engine_config
     global _original_generate, _original_llm_generate
