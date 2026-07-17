@@ -117,11 +117,22 @@ function buildReadout(saved, nTok) {
   return out;
 }
 
-async function collect(rid) {
-  const c = await fetch(BASE_URL + '/v1/hooks/collect', { method: 'POST' });
-  const res = (await c.json()).results || {};
-  const key = Object.keys(res).find(k => k.includes(rid));
-  return key ? res[key]['0'] : null;
+// Time-bounded so a slow/large fetch can't hang the turn forever; null on failure.
+async function collect(rid, ms = 8000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const c = await fetch(BASE_URL + '/v1/hooks/collect', { method: 'POST', signal: ctrl.signal });
+    const res = (await c.json()).results || {};
+    const key = Object.keys(res).find(k => k.includes(rid));
+    return key ? res[key]['0'] : null;
+  } catch (e) { return null; } finally { clearTimeout(timer); }
+}
+
+// Drop accumulated results on the server (keeps the hook registered) so that
+// /collect only ever returns the current turn and stays small.
+async function clearResults() {
+  try { await fetch(BASE_URL + '/v1/hooks/clear_results', { method: 'POST' }); } catch (e) {}
 }
 
 // Render the layers × top-K grid for turn.tokens[idx] into `el`.
@@ -157,23 +168,36 @@ function showTip(e, turn, idx) {
 }
 function hideTip() { tip.style.display = 'none'; }
 
-function renderBody(turn, bodyEl) {
-  bodyEl.innerHTML = '';
-  if (!turn.tokens || !turn.tokens.length) { bodyEl.textContent = turn.content; return; }
-  turn.tokens.forEach((t, i) => {
-    const sp = document.createElement('span'); sp.className = 'tok'; sp.textContent = t;
-    const has = turn.readout && turn.readout[LAYERS[0]] && turn.readout[LAYERS[0]].toks[i];
-    if (has) {
-      sp.classList.add('ready');
-      sp.onmousemove = (e) => showTip(e, turn, i);
-      sp.onmouseleave = hideTip;
-      sp.onclick = () => { pinned = { turn, idx: i };
-        renderInto(document.getElementById('pin'), turn, i, true);
-        document.querySelectorAll('.tok.pinned').forEach(x => x.classList.remove('pinned'));
-        sp.classList.add('pinned'); };
-    }
+function hasReadout(turn, idx) {
+  return !!(turn.readout && turn.readout[LAYERS[0]] && turn.readout[LAYERS[0]].toks[idx]);
+}
+
+// Incrementally sync a turn's token spans into bodyEl: append spans for newly
+// arrived tokens only (never rebuild existing ones, so hover handlers stay put
+// and the span under the cursor isn't destroyed mid-stream), then refresh each
+// span's "ready" state as readouts arrive. Plain text until tokens exist.
+function syncBody(turn, bodyEl) {
+  const toks = turn.tokens || [];
+  if (!toks.length) { bodyEl.textContent = turn.content; bodyEl._n = 0; return; }
+  if (bodyEl._n === undefined || (bodyEl.firstChild && bodyEl.firstChild.nodeType === 3)) {
+    bodyEl.innerHTML = ''; bodyEl._n = 0;   // was plain text → switch to spans
+  }
+  for (let i = bodyEl._n; i < toks.length; i++) {
+    const idx = i;
+    const sp = document.createElement('span'); sp.className = 'tok'; sp.textContent = toks[i];
+    sp.onmousemove = (e) => showTip(e, turn, idx);
+    sp.onmouseleave = hideTip;
+    sp.onclick = () => { if (!hasReadout(turn, idx)) return;
+      pinned = { turn, idx };
+      renderInto(document.getElementById('pin'), turn, idx, true);
+      document.querySelectorAll('.tok.pinned').forEach(x => x.classList.remove('pinned'));
+      sp.classList.add('pinned'); };
     bodyEl.appendChild(sp);
-  });
+  }
+  bodyEl._n = toks.length;
+  const spans = bodyEl.childNodes;
+  for (let i = 0; i < spans.length && i < toks.length; i++)
+    spans[i].classList.toggle('ready', hasReadout(turn, i));
 }
 
 function renderChat() {
@@ -186,7 +210,7 @@ function renderChat() {
     const del = document.createElement('button'); del.className = 'mini'; del.textContent = 'delete';
     hd.append(edit, del);
     const body = document.createElement('div'); body.className = 'body';
-    renderBody(turn, body);
+    syncBody(turn, body);
     d.append(hd, body); chat.appendChild(d);
     del.onclick = () => { turns.splice(ti, 1); if (pinned && pinned.turn === turn) pinned = null; renderChat(); };
     edit.onclick = () => beginEdit(turn, d, body);
@@ -203,7 +227,7 @@ function beginEdit(turn, turnEl, bodyEl) {
   bodyEl.replaceWith(wrap);
   cancel.onclick = renderChat;
   save.onclick = async () => { turn.content = ta.value; turn.tokens = null; turn.readout = null;
-    renderChat(); await echoReadout(turn); };
+    renderChat(); await clearResults(); await echoReadout(turn); };
 }
 
 // Readout over a turn's raw text (used for user + edited turns). Clean per-token labels.
@@ -229,6 +253,8 @@ async function createResponse() {
   const btn = document.getElementById('sendBtn'), status = document.getElementById('status');
   btn.disabled = true; status.textContent = 'generating…'; inp.value = '';
 
+  await clearResults();  // start this turn from an empty result set → /collect stays small
+
   const userTurn = { role: 'user', content: text }; turns.push(userTurn);
   const asst = { role: 'assistant', content: '', tokens: [], readout: {}, streaming: true };
   turns.push(asst); renderChat();
@@ -236,10 +262,19 @@ async function createResponse() {
 
   const rid = 'jl-' + Math.random().toString(36).slice(2);
   const history = turns.filter(t => !t.streaming).map(t => ({ role: t.role, content: t.content }));
-  let poll = setInterval(async () => {
-    const saved = await collect(rid);
-    if (saved && asst.tokens.length) { asst.readout = buildReadout(saved, asst.tokens.length); refreshAsst(asst); }
-  }, 700);
+
+  // Poll for the streaming readout with only ONE request in flight at a time: the
+  // next poll starts only after the previous returns, so polls can't stack up and
+  // saturate the connection pool (which is what stalled the SSE stream before).
+  let polling = true;
+  (async function pollLoop() {
+    while (polling) {
+      const saved = await collect(rid);
+      if (saved && asst.tokens.length) { asst.readout = buildReadout(saved, asst.tokens.length); refreshAsst(asst); }
+      if (!polling) break;
+      await new Promise(r => setTimeout(r, 500));
+    }
+  })();
 
   try {
     const resp = await fetch(BASE_URL + '/v1/chat/completions', {
@@ -265,7 +300,9 @@ async function createResponse() {
       }
     }
   } catch (e) { status.textContent = 'error: ' + e; }
-  clearInterval(poll);
+  polling = false;
+  // One final collect for any tail positions; keep the last good readout if it fails
+  // (so a slow final fetch never loses the readout the polls already streamed in).
   const saved = await collect(rid);
   if (saved) asst.readout = buildReadout(saved, asst.tokens.length);
   asst.streaming = false; refreshAsst(asst);
@@ -276,7 +313,7 @@ async function createResponse() {
 function refreshAsst(asst) {
   const ti = turns.indexOf(asst); if (ti < 0) return;
   const body = document.querySelectorAll('#chat .turn')[ti]?.querySelector('.body');
-  if (body) { if (!asst.tokens.length) body.textContent = asst.content; else renderBody(asst, body); }
+  if (body) syncBody(asst, body);
 }
 
 document.getElementById('sendBtn').onclick = createResponse;

@@ -83,6 +83,17 @@ def _build_hook(jacobians, layers, rms_eps, vocab_size, k, model_name) -> Hook:
 
         lm_w = ctx.get_parameter("lm_head.weight")
         norm_w = ctx.get_parameter(norm_name)
+
+        # get_parameter() is a collective (TP all_gather), so every rank calls
+        # it — but only ONE rank per TP group may save: hidden states are
+        # replicated across TP ranks, and /collect's cross-rank merge would
+        # otherwise concatenate tp_size identical copies of each position,
+        # misaligning the readout against the token sequence.
+        from vllm.distributed.parallel_state import get_tp_group
+
+        if get_tp_group().rank_in_group != 0:
+            return None
+
         with torch.no_grad():
             x = h.float()
             if ctx.layer_idx in jacobians:
