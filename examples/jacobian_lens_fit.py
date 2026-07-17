@@ -362,18 +362,27 @@ def fit(args):
         jacobians = {
             int(lyr): (jac_sum[lyr] / n_done).to(torch.float16) for lyr in source_layers
         }
+        provenance = {
+            "model": args.model,
+            "n_prompts": n_done,  # contexts actually averaged over (post length-filter)
+            "corpus": args.prompts_file or "HuggingFaceFW/fineweb (sample-10BT)",
+            "max_seq_len": args.max_seq_len,
+            "skip_first": args.skip_first,
+            "dim_batch": args.dim_batch,
+        }
         os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
         torch.save(
             {
                 "J": jacobians,
                 "source_layers": sorted(jacobians),
                 "d_model": int(d_model),
+                "provenance": provenance,
             },
             args.out,
         )
         logger.success(
             f"fit done over {n_done} prompts -> {args.out} "
-            f"({len(jacobians)} layers, d_model={d_model})"
+            f"({len(jacobians)} layers, d_model={d_model}); provenance={provenance}"
         )
 
     if dist.is_initialized():
