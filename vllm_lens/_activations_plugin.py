@@ -6,8 +6,8 @@ passed in ``extra_args``.
 Installed automatically via the ``vllm.general_plugins`` entry point
 (configured in pyproject.toml). Patches ``EngineArgs.create_engine_config``
 to inject the worker extension and eager mode, and patches
-``AsyncLLM.generate`` and ``LLM.generate`` to retrieve per-request
-activations for both online (async) and offline (sync) usage.
+``AsyncLLM.generate``, ``LLM.generate``, and ``LLM.chat`` to retrieve
+per-request activations for both online (async) and offline (sync) usage.
 """
 
 from __future__ import annotations
@@ -44,6 +44,7 @@ _WORKER_EXT = "vllm_lens._worker_ext.HiddenStatesExtension"
 _original_create_engine_config: Callable | None = None
 _original_generate: Callable | None = None
 _original_llm_generate: Callable | None = None
+_original_llm_chat: Callable | None = None
 _original_completion_response: Callable | None = None
 _original_chat_full_generator: Callable | None = None
 _original_chat_stream_generator: Callable | None = None
@@ -165,6 +166,36 @@ def _merge_captured_states_batch(
     return out
 
 
+def _decode_steering_vectors(value: Any) -> list[SteeringVector] | None:
+    """Normalise an ``apply_steering_vectors`` extra_args value.
+
+    Accepts live ``SteeringVector`` instances, plain dicts (already
+    JSON-parsed), or the JSON-encoded string wire format used by the
+    OpenAI-compatible API (``vllm_xargs``), so every entry point
+    understands every documented form.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = json.loads(value)
+    return [
+        v if isinstance(v, SteeringVector) else SteeringVector.model_validate(v)
+        for v in value
+    ]
+
+
+def _decode_hooks(value: Any) -> list[Hook] | None:
+    """Normalise an ``apply_hooks`` extra_args value.
+
+    Same forms as :func:`_decode_steering_vectors`, for ``Hook``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = json.loads(value)
+    return [h if isinstance(h, Hook) else Hook.model_validate(h) for h in value]
+
+
 def _trim_activations(
     activations: dict[str, Any],
     expected_len: int,
@@ -271,18 +302,14 @@ async def _patched_generate(
     wants_activations = extra.get("output_residual_stream") is not None
     # Extract steering data and remove from extra_args before vLLM
     # serialises the SamplingParams (tensors don't survive msgspec).
-    steering_vectors = extra.pop("apply_steering_vectors", None)
     # When arriving via the OpenAI API (vllm_xargs), complex values
     # are JSON-encoded strings; decode and validate as SteeringVector.
-    if isinstance(steering_vectors, str):
-        steering_vectors = [
-            SteeringVector.model_validate(d) for d in json.loads(steering_vectors)
-        ]
+    steering_vectors = _decode_steering_vectors(
+        extra.pop("apply_steering_vectors", None)
+    )
 
     # Extract hooks (callables can't survive msgspec).
-    hooks_list = extra.pop("apply_hooks", None)
-    if isinstance(hooks_list, str):
-        hooks_list = [Hook.model_validate(d) for d in json.loads(hooks_list)]
+    hooks_list = _decode_hooks(extra.pop("apply_hooks", None))
 
     # Allow explicit prefix-cache bypass via extra_args.
     skip_kv_cache = extra.pop("skip_reading_prefix_cache", None)
@@ -351,22 +378,25 @@ async def _patched_generate(
 
 
 # ---------------------------------------------------------------------------
-# Offline (sync) LLM.generate patch
+# Offline (sync) LLM.generate / LLM.chat patches
 # ---------------------------------------------------------------------------
 
 
-def _patched_llm_generate(
+def _prepare_offline_params(
     self: LLM,
-    prompts: Any,
-    sampling_params: SamplingParams | Sequence[SamplingParams] | None = None,
-    **kwargs,
-) -> list:
-    """Wrap ``LLM.generate`` to install hooks, apply steering, and attach activations.
+    sampling_params: SamplingParams | Sequence[SamplingParams] | None,
+) -> dict[str, Any]:
+    """Shared pre-processing for the patched offline entry points.
 
-    Same logic as the async variant but for the synchronous offline API.
-    Because ``LLM.generate`` auto-assigns request IDs internally, steering
-    data is keyed by a synthetic ``_steering_id`` stored in ``extra_args``
-    (a lightweight string that survives msgspec serialization).
+    Pops steering vectors and hooks from ``extra_args`` before vLLM
+    serialises the SamplingParams (tensors/callables don't survive
+    msgspec), decoding the JSON-string wire format where present.
+    Because the offline API auto-assigns request IDs internally, the
+    payloads are keyed by synthetic ``_steering_id`` / ``_hook_id``
+    sentinels stored in ``extra_args`` (lightweight strings that survive
+    msgspec serialization), then shipped to workers via RPC.
+
+    Returns the state dict consumed by :func:`_finalize_offline_outputs`.
     """
     if isinstance(sampling_params, Sequence):
         params_list = list(sampling_params)
@@ -381,12 +411,12 @@ def _patched_llm_generate(
     )
 
     # Extract steering vectors per-request.  We must pop them from
-    # extra_args before vLLM serialises SamplingParams (tensors don't
-    # survive msgspec), but keep them for the RPC call.
+    # extra_args before vLLM serialises SamplingParams, but keep them
+    # for the RPC call.
     steering_payloads: dict[str, bytes] = {}  # steering_id -> pickled vectors
     for idx, sp in enumerate(params_list):
         extra = sp.extra_args or {}
-        vectors = extra.pop("apply_steering_vectors", None)
+        vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
         if vectors is not None:
             steering_id = f"_steer_{idx}"
             steering_payloads[steering_id] = pickle.dumps(vectors)
@@ -398,7 +428,7 @@ def _patched_llm_generate(
     hook_payloads: dict[str, bytes] = {}  # hook_id -> cloudpickled hooks
     for idx, sp in enumerate(params_list):
         extra = sp.extra_args or {}
-        hooks = extra.pop("apply_hooks", None)
+        hooks = _decode_hooks(extra.pop("apply_hooks", None))
         if hooks is not None:
             hook_id = f"_hook_{idx}"
             hook_payloads[hook_id] = cloudpickle.dumps(hooks)
@@ -432,8 +462,28 @@ def _patched_llm_generate(
     for hid, payload in hook_payloads.items():
         self.collective_rpc("set_hook_data", args=(hid, payload))
 
-    assert _original_llm_generate is not None
-    outputs = _original_llm_generate(self, prompts, sampling_params, **kwargs)
+    return {
+        "wants_activations": wants_activations,
+        "steering_payloads": steering_payloads,
+        "hook_payloads": hook_payloads,
+    }
+
+
+def _finalize_offline_outputs(
+    self: LLM,
+    outputs: list,
+    state: dict[str, Any],
+) -> list:
+    """Shared post-processing for the patched offline entry points.
+
+    Attaches captured activations and hook results to the outputs, then
+    clears per-request worker state set up by
+    :func:`_prepare_offline_params`.
+    """
+    wants_activations = state["wants_activations"]
+    steering_payloads = state["steering_payloads"]
+    hook_payloads = state["hook_payloads"]
+    has_hooks = len(hook_payloads) > 0
 
     if wants_activations:
         req_ids = [output.request_id for output in outputs]
@@ -469,6 +519,46 @@ def _patched_llm_generate(
             self.collective_rpc("clear_hook_contexts", args=(output.request_id,))
 
     return outputs
+
+
+def _patched_llm_generate(
+    self: LLM,
+    prompts: Any,
+    sampling_params: SamplingParams | Sequence[SamplingParams] | None = None,
+    *args,
+    **kwargs,
+) -> list:
+    """Wrap ``LLM.generate`` to install hooks, apply steering, and attach activations.
+
+    Same logic as the async variant but for the synchronous offline API;
+    see :func:`_prepare_offline_params` for the mechanics.
+    """
+    state = _prepare_offline_params(self, sampling_params)
+    assert _original_llm_generate is not None
+    outputs = _original_llm_generate(self, prompts, sampling_params, *args, **kwargs)
+    return _finalize_offline_outputs(self, outputs, state)
+
+
+def _patched_llm_chat(
+    self: LLM,
+    messages: Any,
+    sampling_params: SamplingParams | Sequence[SamplingParams] | None = None,
+    *args,
+    **kwargs,
+) -> list:
+    """Wrap ``LLM.chat`` to install hooks, apply steering, and attach activations.
+
+    ``LLM.chat`` does not route through ``LLM.generate`` (it renders the
+    conversation and submits to the engine directly), so it needs the
+    same treatment as :func:`_patched_llm_generate`.  On vLLM versions
+    where chat *does* delegate to ``LLM.generate``, the double
+    pre-processing is harmless: the inner call finds ``extra_args``
+    already stripped and the worker-side clear RPCs are idempotent.
+    """
+    state = _prepare_offline_params(self, sampling_params)
+    assert _original_llm_chat is not None
+    outputs = _original_llm_chat(self, messages, sampling_params, *args, **kwargs)
+    return _finalize_offline_outputs(self, outputs, state)
 
 
 # ---------------------------------------------------------------------------
@@ -637,10 +727,11 @@ def register() -> None:
     """Entry point called by vLLM's plugin system at engine startup.
 
     Patches ``EngineArgs.create_engine_config`` to inject the worker
-    extension and eager mode, ``AsyncLLM.generate`` and ``LLM.generate``
-    to retrieve per-request activations for both online and offline
-    usage.  Also patches the OpenAI-compatible response builders so
-    activations are included in HTTP responses from ``vllm serve``.
+    extension and eager mode, ``AsyncLLM.generate``, ``LLM.generate``,
+    and ``LLM.chat`` to retrieve per-request activations for both online
+    and offline usage.  Also patches the OpenAI-compatible response
+    builders so activations are included in HTTP responses from
+    ``vllm serve``.
 
     Use ``extra_args={"output_residual_stream": True | list[int]}`` in
     SamplingParams to request activations.
@@ -662,7 +753,7 @@ def register() -> None:
         return
 
     global _original_create_engine_config
-    global _original_generate, _original_llm_generate
+    global _original_generate, _original_llm_generate, _original_llm_chat
     global _original_completion_response, _original_chat_full_generator
     global _original_chat_stream_generator
     global _original_register_routers
@@ -679,6 +770,11 @@ def register() -> None:
 
     _original_llm_generate = LLM.generate
     LLM.generate = _patched_llm_generate
+
+    # LLM.chat submits requests to the engine directly rather than
+    # delegating to LLM.generate, so it must be patched separately.
+    _original_llm_chat = LLM.chat
+    LLM.chat = _patched_llm_chat
 
     # Add persistent hook methods to LLM.
     LLM.register_hooks = _llm_register_hooks  # type: ignore[reportAttributeAccessIssue]

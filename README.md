@@ -126,6 +126,8 @@ sp = SamplingParams(max_tokens=20, extra_args={"apply_steering_vectors": [sv]})
 llm.generate(["I think the best dessert is"], sp)
 ```
 
+`llm.chat(...)` accepts the same `extra_args`, and both entry points also accept the JSON-serialized wire form (`json.dumps([sv.model_dump(mode="json")])`) that the HTTP API uses — handy when sharing request-building code with an HTTP client.
+
 Via the client (or `vllm_xargs` over HTTP):
 
 ```python

@@ -1,5 +1,10 @@
 ## Unreleased
 
+## v1.2.1 (22 July 2026)
+
+- Steering: Fixed offline steering via `LLM.chat` — the plugin now patches `LLM.chat` (which submits requests to the engine directly rather than routing through `LLM.generate`). Previously, live `SteeringVector` objects raised a msgpack `TypeError`, and JSON-serialized vectors ran **silently unsteered**. Activation capture (`output_residual_stream`) and per-request hooks (`apply_hooks`) now also work through `LLM.chat`. (#28)
+- Steering: The offline `LLM.generate` / `LLM.chat` path now decodes the JSON-string wire format for `apply_steering_vectors` and `apply_hooks` (the form the HTTP API accepts via `vllm_xargs`), instead of failing inside `collective_rpc`. Both entry points accept both wire forms. (#28)
+
 ## v1.2.0 (17 July 2026)
 
 - Hooks: Added a generic, Garçon-style hook system — run arbitrary Python functions per-request and per-layer to capture data (via `ctx.saved`) and/or modify hidden states (by returning a tensor). Supports per-request hooks (`apply_hooks` in `extra_args`), persistent register-once hooks (`register_hooks` / `collect_hook_results` / `clear_hooks`), and pre-hooks (run before the layer forward pass). Exposed over HTTP at `/v1/hooks/*` and through a `VLLMLensClient`; `ctx.get_parameter()` gathers parameters across tensor- and pipeline-parallel ranks. (#3)
