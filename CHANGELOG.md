@@ -1,5 +1,7 @@
 ## Unreleased
 
+- Plugin: Decoder-layer discovery now uses vLLM's `static_forward_context` attention-layer registry instead of hardcoded attribute paths (`model.model.layers`, …), so capture, steering, and hooks work on any decoder architecture vLLM can serve — including hybrid (Mamba/linear-attention) and multimodal layouts. The old duck-typed lookup is kept as a fallback. (#33)
+
 ## v1.2.1 (22 July 2026)
 
 - Steering: Fixed offline steering via `LLM.chat` — the plugin now patches `LLM.chat` (which submits requests to the engine directly rather than routing through `LLM.generate`). Previously, live `SteeringVector` objects raised a msgpack `TypeError`, and JSON-serialized vectors ran **silently unsteered**. Activation capture (`output_residual_stream`) and per-request hooks (`apply_hooks`) now also work through `LLM.chat`. (#28)
