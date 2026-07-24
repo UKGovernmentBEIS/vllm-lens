@@ -17,7 +17,8 @@ from vllm import LLM, SamplingParams
 from vllm_lens._worker_ext import HiddenStatesExtension
 from vllm_lens.attention import attention_patterns
 
-from .conftest import LAYER_IDX, MODEL_NAME, NUM_LAYERS, PROMPT
+from ._qk_asserts import assert_attention_matches
+from .conftest import LAYER_IDX, MODEL_NAME, NUM_LAYERS, PROMPT, PROMPTS
 
 _NUM_Q_HEADS = 14  # Qwen2.5-0.5B
 _NUM_KV_HEADS = 2
@@ -71,18 +72,8 @@ def _capture(llm: LLM, prompt: str, output_qk, max_tokens: int = 1):
     return outputs[0]
 
 
-def _assert_attention_close(got: torch.Tensor, want: torch.Tensor):
-    assert got.shape == want.shape, f"{got.shape} vs {want.shape}"
-    # HF eager casts attention probs back to bf16 (≈0.4% quantization on
-    # values near 1) while our replay stays fp32, so use the same 1e-2
-    # mean-abs-diff convention as the residual-stream tests.
-    mean_abs_diff = (got - want).abs().mean().item()
-    assert mean_abs_diff < 1e-2, f"Mean abs diff too large: {mean_abs_diff:.6f}"
-    # Rows should mostly agree on the most-attended source position.
-    got_argmax = got.argmax(dim=-1)
-    want_argmax = want.argmax(dim=-1)
-    agreement = (got_argmax == want_argmax).float().mean().item()
-    assert agreement > 0.9, f"Row-argmax agreement too low: {agreement:.2%}"
+# Attention comparisons use per-row total variation + confident-row
+# argmax (see _qk_asserts) — length-independent, unlike mean-abs-diff.
 
 
 class TestMatchesTransformers:
@@ -96,11 +87,12 @@ class TestMatchesTransformers:
         weights = attention_patterns(acts, LAYER_IDX)
 
         hf_weights = _hf_attention(model, token_ids, LAYER_IDX)
-        _assert_attention_close(weights[:, :n, :n], hf_weights)
+        assert_attention_matches(weights[:, :n, :n], hf_weights, label="prefill")
 
     def test_decode_rows_match_hf(self, llm_model, hf_eager):
         model, tokenizer = hf_eager
         prompt_ids = tokenizer(PROMPT).input_ids
+        p = len(prompt_ids)
 
         output = _capture(llm_model, PROMPT, output_qk=[LAYER_IDX], max_tokens=8)
         gen_ids = list(output.outputs[0].token_ids)
@@ -111,7 +103,41 @@ class TestMatchesTransformers:
         assert weights.shape[1] == len(all_ids)
 
         hf_weights = _hf_attention(model, all_ids, LAYER_IDX)
-        _assert_attention_close(weights, hf_weights)
+        assert_attention_matches(weights, hf_weights, label="full")
+        # The decode rows on their own — a full-matrix comparison is
+        # dominated by prefill rows, so a wrong decode capture could
+        # otherwise hide inside the aggregate.
+        assert weights.shape[1] > p
+        assert_attention_matches(
+            weights[:, p:, :], hf_weights[:, p:, :], label="decode rows"
+        )
+
+    def test_batched_requests_demultiplex(self, llm_model, hf_eager):
+        """Multiple concurrent requests: each gets its own Q/K slices.
+
+        Every other GPU test submits a single prompt; this one submits
+        the full PROMPTS batch so the hook's per-request
+        query_start_loc slicing is exercised against a real mixed-length
+        batch, and each request's reconstruction is checked against HF
+        independently.
+        """
+        model, tokenizer = hf_eager
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            extra_args={"output_qk": [LAYER_IDX]},
+        )
+        outputs = llm_model.generate(list(PROMPTS), sampling_params)
+
+        for prompt, output in zip(PROMPTS, outputs):
+            token_ids = tokenizer(prompt).input_ids
+            n = len(token_ids)
+            weights = attention_patterns(output.activations, LAYER_IDX)
+            assert weights.shape[1] == n, f"{prompt!r}: {weights.shape} vs n={n}"
+            hf_weights = _hf_attention(model, token_ids, LAYER_IDX)
+            assert_attention_matches(
+                weights[:, :n, :n], hf_weights, label=f"batch {prompt[:20]!r}"
+            )
 
     def test_shapes_and_meta(self, llm_model, hf_eager):
         _, tokenizer = hf_eager
@@ -150,7 +176,7 @@ class TestMatchesTransformers:
 
         weights = attention_patterns(acts, LAYER_IDX)
         hf_weights = _hf_attention(model, tokenizer(PROMPT).input_ids, LAYER_IDX)
-        _assert_attention_close(weights[:, :n, :n], hf_weights)
+        assert_attention_matches(weights[:, :n, :n], hf_weights, label="combined")
 
     def test_no_leaked_state(self, llm_model):
         _capture(llm_model, PROMPT, output_qk=[LAYER_IDX], max_tokens=2)

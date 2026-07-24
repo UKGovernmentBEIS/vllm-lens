@@ -128,24 +128,41 @@ def test_parity_with_hf(model_name, engine_kwargs, env, monkeypatch):
         monkeypatch.setenv(key, value)
 
     acts, n = _capture_all_layers(model_name, engine_kwargs)
+    # EVERY captured layer is compared — sampling a subset would miss
+    # per-layer regimes (alternating sliding windows, one layer with a
+    # different scale, metadata association bugs on interior layers).
+    layers = list(acts["qk_layers"])
+    hf_by_layer = _hf_attentions(model_name, layers, n)
+
+    from ._qk_asserts import assert_attention_matches
+
+    for layer in layers:
+        got = attention_patterns(acts, layer)[:, :n, :n]
+        assert_attention_matches(got, hf_by_layer[layer], label=f"L{layer}")
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="KV replication needs TP=4")
+def test_kv_head_replication_dedupe_on_real_hardware():
+    """Real replicated-KV merge: Qwen2.5-1.5B has 12 q / 2 kv heads, so
+    TP=4 replicates each kv head across 2 consecutive ranks — the merge
+    must dedupe (stride 2) and still match HF exactly.  The unit test in
+    test_qk_merge.py fabricates this layout; this validates it against
+    vLLM's actual sharding.
+    """
+    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
+    acts, n = _capture_all_layers(model_name, {"tensor_parallel_size": 4})
+    assert acts["attn_q"].shape[2] == 12  # global q heads restored
+    assert acts["attn_k"].shape[2] == 2  # replicated kv heads deduped
+
     layers = list(acts["qk_layers"])
     pick = sorted({layers[0], layers[len(layers) // 2], layers[-1]})
     hf_by_layer = _hf_attentions(model_name, pick, n)
 
+    from ._qk_asserts import assert_attention_matches
+
     for layer in pick:
         got = attention_patterns(acts, layer)[:, :n, :n]
-        want = hf_by_layer[layer]
-        assert got.shape == want.shape, f"L{layer}: {got.shape} vs {want.shape}"
-
-        mean_abs_diff = (got - want).abs().mean().item()
-        assert mean_abs_diff < 1e-2, f"L{layer} mean abs diff {mean_abs_diff:.6f}"
-
-        # Tie-tolerant argmax agreement: near-uniform rows (common in
-        # layer 0) flip argmax on bf16 noise, so a row agrees if our
-        # pick's HF probability is within 5e-3 of HF's row max.
-        hf_at_pick = want.gather(-1, got.argmax(-1).unsqueeze(-1)).squeeze(-1)
-        agreement = ((want.max(-1).values - hf_at_pick) < 5e-3).float().mean().item()
-        assert agreement > 0.9, f"L{layer} row-argmax agreement {agreement:.2%}"
+        assert_attention_matches(got, hf_by_layer[layer], label=f"tp4 L{layer}")
 
 
 def test_hybrid_model_captures_attention_layers_only():

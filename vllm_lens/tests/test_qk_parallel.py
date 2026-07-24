@@ -72,10 +72,7 @@ def _run_engine(weights_layer: int, **engine_kwargs):
         torch.cuda.empty_cache()
 
 
-def _assert_close(got: torch.Tensor, want: torch.Tensor):
-    assert got.shape == want.shape, f"{got.shape} vs {want.shape}"
-    mean_abs_diff = (got - want).abs().mean().item()
-    assert mean_abs_diff < 1e-2, f"Mean abs diff too large: {mean_abs_diff:.6f}"
+from ._qk_asserts import assert_attention_matches as _assert_close
 
 
 def test_tp2_merges_head_shards(hf_attention):

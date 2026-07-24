@@ -92,8 +92,14 @@ def test_chunked_prefill_matches_hf(llm_chunked):
             out = model(ids, output_attentions=True, use_cache=False)
         hf_weights = out.attentions[LAYER_IDX][0].float().cpu()
 
-        mean_abs_diff = (weights[:, :n, :n] - hf_weights).abs().mean().item()
-        assert mean_abs_diff < 1e-2, f"Mean abs diff too large: {mean_abs_diff:.6f}"
+        # Per-row total variation, NOT mean-abs-diff: at this prompt
+        # length (~400 tokens) mean-abs-diff shrinks as 1/n and would
+        # accept grossly wrong rows.
+        from ._qk_asserts import assert_attention_matches
+
+        assert_attention_matches(
+            weights[:, :n, :n], hf_weights, label="chunked prefill"
+        )
     finally:
         del model
         gc.collect()
