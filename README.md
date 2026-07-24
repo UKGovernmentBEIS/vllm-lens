@@ -375,6 +375,8 @@ output = await model.generate(state.messages, config=capture_config)
 residual_stream = output.metadata["activations"]["residual_stream"]
 ```
 
+Attention Q/K capture works the same way — pass `"output_qk": [layer, ...]` in `extra_args` and reconstruct with `vllm_lens.attention.attention_patterns(output.metadata["activations"], layer)`.
+
 #### Steering with an Activation Oracle
 
 ```python
