@@ -441,6 +441,12 @@ Unit tests in `vllm_lens/tests/` use a small model and manage their own in-proce
 pytest vllm_lens/tests/ -v
 ```
 
+An opt-in multi-architecture parity sweep validates attention Q/K capture + reconstruction against HuggingFace eager attention across GQA/MHA, soft-capping, sliding windows, custom scales, attention sinks, hybrid, and MLA models. It downloads several models (some gated — needs an HF token) and wants a large GPU:
+
+```bash
+VLLM_LENS_QK_PARITY=1 pytest vllm_lens/tests/test_qk_parity_models.py -v
+```
+
 ## Credits
 
 Developed by Alan Cooney, with credit going to Sid Black for the original vLLM worker extension idea.
