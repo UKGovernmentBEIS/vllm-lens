@@ -52,8 +52,93 @@ def _dtype_to_idx(dtype: torch.dtype) -> int:
 _ZSTD_COMPRESSOR = zstd.ZstdCompressor(level=1)
 
 
+def _discover_layer_modules(worker: Any) -> dict[int, torch.nn.Module] | None:
+    """Map global decoder-layer index → decoder-layer module on this rank.
+
+    Uses vLLM's ``static_forward_context`` registry: every attention-like
+    layer (``AttentionLayerBase`` — standard attention, MLA, Mamba-style
+    mixers, …) registers itself there at construction time under its full
+    module prefix (e.g. ``model.layers.7.self_attn.attn``).  The decoder
+    layer is the prefix truncated at its first integer segment, which is a
+    *global* layer index even under pipeline parallelism (non-owned layers
+    never construct, so they never register).
+
+    Returns ``None`` when the registry is unavailable or yields an
+    incoherent mapping; callers fall back to ``_get_layers``.
+    """
+    try:
+        from vllm.model_executor.layers.attention_layer_base import (
+            AttentionLayerBase,
+        )
+    except ImportError:
+        return None
+
+    registry = getattr(
+        getattr(worker, "compilation_config", None), "static_forward_context", None
+    )
+    if not registry:
+        return None
+
+    model = worker.model_runner.model
+    layer_map: dict[int, torch.nn.Module] = {}
+    for prefix, module in registry.items():
+        # FusedMoE and multimodal-encoder layers also register here.
+        if not isinstance(module, AttentionLayerBase):
+            continue
+        # Encoder / cross-attention is not part of the decoder residual
+        # stream.  Mamba-style mixers carry no attn_type and are kept so
+        # hybrid models still get every decoder layer hooked.
+        if getattr(module, "attn_type", "decoder") != "decoder":
+            continue
+        segments = prefix.split(".")
+        idx_pos = next((i for i, seg in enumerate(segments) if seg.isdigit()), None)
+        if idx_pos is None:
+            logger.warning(
+                "Registered layer %r has no integer layer index in its prefix; "
+                "falling back to attribute-path layer discovery.",
+                prefix,
+            )
+            return None
+        layer_idx = int(segments[idx_pos])
+        parent_path = ".".join(segments[: idx_pos + 1])
+        try:
+            layer = model.get_submodule(parent_path)
+        except AttributeError:
+            logger.warning(
+                "Could not resolve decoder layer %r from registered layer %r; "
+                "falling back to attribute-path layer discovery.",
+                parent_path,
+                prefix,
+            )
+            return None
+        existing = layer_map.get(layer_idx)
+        if existing is not None and existing is not layer:
+            logger.warning(
+                "Layer index %d resolves to two different modules (%r); "
+                "falling back to attribute-path layer discovery.",
+                layer_idx,
+                prefix,
+            )
+            return None
+        layer_map[layer_idx] = layer
+
+    return layer_map or None
+
+
+def _get_total_num_layers(worker: Any) -> int:
+    """Total decoder layers across all PP ranks, for layer-index validation."""
+    try:
+        return int(worker.model_config.get_total_num_hidden_layers())
+    except Exception:
+        return len(_get_layers(worker.model_runner.model))
+
+
 def _get_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
-    """Find the transformer decoder layers regardless of model architecture."""
+    """Find the transformer decoder layers by attribute-path traversal.
+
+    Fallback for when the ``static_forward_context`` registry is
+    unavailable (see ``_discover_layer_modules``).
+    """
     # Module.__getattr__ returns Tensor | Module, so pyright can't narrow
     # through chained attribute access.  Use Any for duck-typed traversal.
     m: Any = model
@@ -701,10 +786,15 @@ class HiddenStatesExtension:
 
         # Hooks must be installed on ALL ranks so steering vectors are
         # applied everywhere (not just rank 0).
-        layers = _get_layers(self.model_runner.model)
-        for layer_idx, layer in enumerate(layers):
-            if isinstance(layer, PPMissingLayer):
-                continue
+        layer_map = _discover_layer_modules(self)
+        if layer_map is None:
+            layers = _get_layers(self.model_runner.model)
+            layer_map = {
+                layer_idx: layer
+                for layer_idx, layer in enumerate(layers)
+                if not isinstance(layer, PPMissingLayer)
+            }
+        for layer_idx, layer in sorted(layer_map.items()):
             layer.register_forward_pre_hook(_make_pre_hook(self, layer_idx))
             layer.register_forward_hook(_make_hook(self, layer_idx))
 
@@ -726,7 +816,7 @@ class HiddenStatesExtension:
         device = next(self.model_runner.model.parameters()).device
         dtype = next(self.model_runner.model.parameters()).dtype
 
-        num_layers = len(_get_layers(self.model_runner.model))
+        num_layers = _get_total_num_layers(self)
         vectors: list[SteeringVector] = []
 
         for sv in sv_list:
@@ -853,6 +943,10 @@ class HiddenStatesExtension:
         """Return the number of entries in _captured_states (for testing)."""
         return len(self._captured_states)
 
+    def _debug_layer_discovery(self) -> list[int]:
+        """Global indices of decoder layers found via the registry (testing)."""
+        return sorted((_discover_layer_modules(self) or {}).keys())
+
     # ------------------------------------------------------------------
     # Hook data management (called via collective_rpc)
     # ------------------------------------------------------------------
@@ -866,7 +960,7 @@ class HiddenStatesExtension:
         keyed by *key* (an external request ID or ``_hook_id`` sentinel).
         """
         hooks: list[Hook] = cloudpickle.loads(pickled_data)
-        num_layers = len(_get_layers(self.model_runner.model))
+        num_layers = _get_total_num_layers(self)
         for hook in hooks:
             for idx in hook.layer_indices:
                 if idx < 0 or idx >= num_layers:
@@ -920,7 +1014,7 @@ class HiddenStatesExtension:
         """
         self.install_hooks()
         hooks: list[Hook] = cloudpickle.loads(pickled_data)
-        num_layers = len(_get_layers(self.model_runner.model))
+        num_layers = _get_total_num_layers(self)
         for hook in hooks:
             for idx in hook.layer_indices:
                 if idx < 0 or idx >= num_layers:
