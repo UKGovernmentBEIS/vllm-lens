@@ -96,3 +96,26 @@ def test_original_dtype_field(dtype: torch.dtype) -> None:
     """original_dtype field is always set and round-trips correctly."""
     serialized = serialize_tensor(torch.randn(2, 3, dtype=dtype))
     assert serialized["original_dtype"] == str(dtype)
+
+
+def test_round_trip_qk_activations() -> None:
+    """A Q/K payload round-trips: 4-D bf16 tensors + __json__ metadata."""
+    import json
+
+    activations = {
+        "attn_q": torch.randn(2, 5, 4, 8, dtype=torch.bfloat16),
+        "attn_k": torch.randn(2, 5, 2, 8, dtype=torch.bfloat16),
+        "qk_layers": [2, 7],
+        "qk_meta": [
+            {"scale": 0.125, "sliding_window": [-1, -1], "alibi_slopes": None},
+            {"scale": 0.125, "sliding_window": [255, 0], "alibi_slopes": None},
+        ],
+    }
+    serialized = serialize_activations(activations)
+    # The wire format must be JSON-safe end to end (HTTP path).
+    recovered = decode_activations({"activations": json.loads(json.dumps(serialized))})
+
+    assert torch.equal(recovered["attn_q"], activations["attn_q"])
+    assert torch.equal(recovered["attn_k"], activations["attn_k"])
+    assert recovered["qk_layers"] == [2, 7]
+    assert recovered["qk_meta"] == activations["qk_meta"]

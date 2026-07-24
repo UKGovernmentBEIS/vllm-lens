@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Activations: Added per-request attention Q/K capture (`extra_args={"output_qk": ...}`, client `capture_qk=`) plus `vllm_lens.attention.attention_patterns` / `compute_attention_weights`, which reconstruct true attention matrices offline from the captured post-RoPE Q/K and per-layer kernel parameters (GQA, sliding window, logit soft-cap, ALiBi, sinks). Works offline/online, sync/async, under chunked prefill, and under TP/PP (every TP rank captures its head shard; merged head-dim/layer-dim). MLA models are rejected with a clear error. (#34)
 - Plugin: Decoder-layer discovery now uses vLLM's `static_forward_context` attention-layer registry instead of hardcoded attribute paths (`model.model.layers`, …), so capture, steering, and hooks work on any decoder architecture vLLM can serve — including hybrid (Mamba/linear-attention) and multimodal layouts. The old duck-typed lookup is kept as a fallback. (#33)
 
 ## v1.2.1 (22 July 2026)

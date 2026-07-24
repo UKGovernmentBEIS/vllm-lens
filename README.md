@@ -43,6 +43,9 @@ print(output.hook_results)
 output = client.generate("Hello", capture_layers=[15])
 print(output.activations)
 
+# Attention pattern capture (reconstructed offline from captured Q/K)
+output = client.generate("Hello", capture_qk=[15])
+
 # Persistent hooks
 client.register_hooks([hook])
 client.generate("prompt 1", max_tokens=10)
@@ -105,6 +108,30 @@ print(out.activations["residual_stream"].shape)
 ```
 
 Layers are stacked in ascending order along dim 0. Capture runs on TP rank 0 only (residual streams are identical across TP ranks after all-reduce).
+
+### Attention pattern capture
+
+vLLM's fused attention kernels never materialize attention weights, so they can't be captured directly. Instead, `output_qk` captures each layer's **post-RoPE query/key tensors** (a plain pre-hook on vLLM's `Attention` wrapper) together with the exact kernel parameters (softmax scale, sliding window, logit soft-cap, ALiBi slopes, attention sinks), and `vllm_lens.attention.attention_patterns` replays the softmax offline — giving the true attention matrix:
+
+```python
+from vllm import LLM, SamplingParams
+from vllm_lens.attention import attention_patterns
+
+llm = LLM("meta-llama/Llama-3.1-8B-Instruct")
+sp = SamplingParams(max_tokens=8, extra_args={"output_qk": [15]})  # or True for all layers
+out = llm.generate(["Hello world"], sp)
+
+weights = attention_patterns(out[0].activations, 15)  # (num_heads, n_positions, n_positions)
+```
+
+Over HTTP, use the client's `capture_qk`:
+
+```python
+out = client.generate("Hello world", capture_qk=[15])
+weights = attention_patterns(out.activations, 15)
+```
+
+The captured entries are `attn_q` (`n_layers, n_positions, num_heads, head_dim`), `attn_k` (same with KV heads), `qk_layers`, and `qk_meta` (the per-layer kernel parameters). Unlike the residual stream, Q/K are sharded by head under tensor parallelism, so **every** TP rank captures and the shards are concatenated along the head dimension at merge time; grouped-query attention, sliding windows, and Gemma-style soft-capping are handled from the shipped metadata. The reconstruction is exact up to floating-point rounding (roughly bf16 precision against HuggingFace's eager attention). MLA models (DeepSeek-style latent attention) are rejected with a clear error — their Q/K never exist in per-head form. Reconstructing a full pattern materializes an `(num_heads, n, n)` matrix client-side, so reconstruct per layer rather than all at once for long sequences.
 
 ### Steering vectors
 
@@ -355,7 +382,7 @@ response = await model.generate(messages, config=oracle_config)
 
 vllm-lens registers as a [vLLM plugin](https://docs.vllm.ai/en/stable/design/plugin_system) and injects itself into vLLM's processing pipeline at broadly 3 stages:
 
-1. **Intercepting generate calls.** To utilise the plugin, you can pass [extra args](https://docs.vllm.ai/en/stable/api/vllm/sampling_params/#vllm.sampling_params.SamplingParams.extra_args) such as `output_residual_stream`, `apply_steering_vectors`, or `apply_hooks` in the sampling parameters. The plugin extracts these, initialises relevant [PyTorch hooks](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.register_hook.html) if they're not already setup (by adding a [worker extension](https://docs.vllm.ai/en/stable/cli/run-batch/?h=worker+extension#-worker-extension-cls)) and sends steering vectors and hook definitions directly to workers (vLLM typically has one worker per GPU).
+1. **Intercepting generate calls.** To utilise the plugin, you can pass [extra args](https://docs.vllm.ai/en/stable/api/vllm/sampling_params/#vllm.sampling_params.SamplingParams.extra_args) such as `output_residual_stream`, `output_qk`, `apply_steering_vectors`, or `apply_hooks` in the sampling parameters. The plugin extracts these, initialises relevant [PyTorch hooks](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.register_hook.html) if they're not already setup (by adding a [worker extension](https://docs.vllm.ai/en/stable/cli/run-batch/?h=worker+extension#-worker-extension-cls)) and sends steering vectors and hook definitions directly to workers (vLLM typically has one worker per GPU).
 2. **Per-sample hook operations**. vLLM dynamically batches tokens from multiple concurrent requests into a single forward pass, so a core challenge is "book-keeping" - working out which operations (e.g., activation extraction) should be applied to which parts of the request. To do this we read the `forward_context` metadata, utilising the `query_start_loc` (a tensor of token boundaries per request) and `req_ids` (mapping batch index to request ID). We then, for example, apply hooks to just the slices that correspond to the request. Any extracted activations are moved to CPU ram and compressed (lossless), ready to be requested by the vLLM scheduler process. Steering runs on all tensor-parallel ranks (since it modifies the forward pass), but capture only runs on TP rank 0 (residual streams are identical across TP replicas after all-reduce).
 3. **Response collation.** The plugin intercepts the response before it is sent to the client, at which point it queries the relevant vLLM processes for any requested activations. It trims surplus activations, since vLLM can run an extra forward pass under the hood (the scheduler often gets ahead of the number of tokens it needs to generate, before stopping). Activations are then returned to the client.
 

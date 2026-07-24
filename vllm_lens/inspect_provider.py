@@ -18,8 +18,8 @@ from inspect_ai.tool._tool_info import ToolInfo
 from typing_extensions import override
 
 from vllm_lens._helpers._serialize import (
+    decode_activation_entry,
     deserialize_hook_results,
-    deserialize_tensor,
 )
 from vllm_lens._helpers.types import Hook, SteeringVector
 
@@ -134,7 +134,8 @@ class VLLMLensAPI(VLLMAPI):
             raw = _pending_activations.get()
             if raw is not None:
                 metadata["activations"] = {
-                    name: deserialize_tensor(encoded) for name, encoded in raw.items()
+                    name: decode_activation_entry(encoded)
+                    for name, encoded in raw.items()
                 }
 
             raw_hr = _pending_hook_results.get()
