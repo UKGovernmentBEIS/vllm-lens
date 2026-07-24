@@ -60,6 +60,12 @@ MODELS = [
         id="granite-attention-multiplier-scale",
     ),
     pytest.param("openai/gpt-oss-20b", {}, {}, id="gpt-oss-sinks-sliding-window"),
+    pytest.param(
+        "zai-org/GLM-4-9B-0414",
+        {},
+        {},
+        id="glm4-extreme-gqa-partial-rope",
+    ),
 ]
 
 
