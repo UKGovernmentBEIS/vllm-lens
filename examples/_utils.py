@@ -27,7 +27,12 @@ def get_num_layers(model_name: str) -> int:
 
 
 def find_norm(model: Any) -> Any:
-    """Find the final layer norm from a vLLM model."""
+    """Find the final layer norm from a vLLM model.
+
+    Duck-typed traversal: examples run client-side (or inside hooks) and
+    can't reach the ``static_forward_context`` registry the worker
+    extension uses for layer discovery (``_worker_ext._discover_layer_modules``).
+    """
     if hasattr(model, "model") and hasattr(model.model, "norm"):
         return model.model.norm
     if (
