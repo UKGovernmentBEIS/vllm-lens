@@ -36,11 +36,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import requests
-import torch
 
 from vllm_lens._helpers._serialize import (
+    decode_activation_entry,
     deserialize_hook_results,
-    deserialize_tensor,
 )
 from vllm_lens._helpers.types import Hook, SteeringVector
 
@@ -52,8 +51,8 @@ class GenerateOutput:
     text: str
     """Generated text."""
 
-    activations: dict[str, torch.Tensor] | None = None
-    """Captured residual stream activations, if requested."""
+    activations: dict[str, Any] | None = None
+    """Captured activations (residual stream and/or attention Q/K), if requested."""
 
     hook_results: dict[str, dict[str, Any]] | None = None
     """Per-request hook results (ctx.saved dicts), if hooks were passed."""
@@ -101,10 +100,13 @@ class VLLMLensClient:
         hooks: list[Hook] | None,
         capture_layers: list[int] | None,
         steering_vectors: list[SteeringVector] | None,
+        capture_qk: list[int] | bool | None = None,
     ) -> dict[str, str]:
         xargs: dict[str, str] = {}
         if capture_layers is not None:
             xargs["output_residual_stream"] = json.dumps(capture_layers)
+        if capture_qk is not None:
+            xargs["output_qk"] = json.dumps(capture_qk)
         if hooks is not None:
             xargs["apply_hooks"] = json.dumps([h.model_dump() for h in hooks])
         if steering_vectors is not None:
@@ -125,7 +127,7 @@ class VLLMLensClient:
         activations = None
         if "activations" in resp:
             activations = {
-                name: deserialize_tensor(encoded)
+                name: decode_activation_entry(encoded)
                 for name, encoded in resp["activations"].items()
             }
 
@@ -151,6 +153,7 @@ class VLLMLensClient:
         temperature: float = 0.0,
         hooks: list[Hook] | None = None,
         capture_layers: list[int] | None = None,
+        capture_qk: list[int] | bool | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         logprobs: int | None = None,
         echo: bool = False,
@@ -159,6 +162,10 @@ class VLLMLensClient:
         """Generate a completion from a raw prompt.
 
         Uses ``/v1/completions``. For chat messages, use :meth:`chat`.
+
+        ``capture_qk`` captures post-RoPE attention Q/K for the given
+        layers (or all layers with ``True``); reconstruct patterns with
+        :func:`vllm_lens.attention.attention_patterns`.
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -172,7 +179,7 @@ class VLLMLensClient:
         if echo:
             body["echo"] = True
 
-        xargs = self._build_xargs(hooks, capture_layers, steering_vectors)
+        xargs = self._build_xargs(hooks, capture_layers, steering_vectors, capture_qk)
         if xargs:
             body["vllm_xargs"] = xargs
 
@@ -189,6 +196,7 @@ class VLLMLensClient:
         temperature: float = 0.0,
         hooks: list[Hook] | None = None,
         capture_layers: list[int] | None = None,
+        capture_qk: list[int] | bool | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         **kwargs: Any,
     ) -> GenerateOutput:
@@ -210,7 +218,7 @@ class VLLMLensClient:
             **kwargs,
         }
 
-        xargs = self._build_xargs(hooks, capture_layers, steering_vectors)
+        xargs = self._build_xargs(hooks, capture_layers, steering_vectors, capture_qk)
         if xargs:
             body["vllm_xargs"] = xargs
 

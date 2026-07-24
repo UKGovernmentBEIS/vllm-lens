@@ -166,6 +166,95 @@ def _merge_captured_states_batch(
     return out
 
 
+def _merge_qk_parts(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge per-rank Q/K payloads into client-facing activation entries.
+
+    Unlike the residual stream (replicated across TP, captured on rank 0
+    only), Q/K are sharded by head: every TP rank contributes its own
+    slice, concatenated along the head dimension (dim 2) in tp_rank
+    order.  When ``total_kv_heads < tp_size`` vLLM replicates each KV
+    head across ``tp_size // total_kv_heads`` consecutive ranks, so only
+    every ``stride``-th rank's K is kept.  PP groups then concatenate
+    along the layer dimension (dim 0), lower pp_rank first — the same
+    convention as :func:`_merge_captured_states`.
+    """
+    by_pp: dict[int, list[dict[str, Any]]] = {}
+    for p in parts:
+        by_pp.setdefault(int(p.get("pp_rank", 0)), []).append(p)
+
+    pp_groups: list[dict[str, Any]] = []
+    for pp_rank in sorted(by_pp):
+        group = sorted(by_pp[pp_rank], key=lambda p: int(p.get("tp_rank", 0)))
+        first = group[0]
+        meta: list[dict[str, Any]] = [dict(m) for m in first["meta"]]
+        if len(group) == 1:
+            q, k = first["q"], first["k"]
+        else:
+            tp_size = int(first.get("tp_size", len(group)))
+            q = torch.cat([p["q"] for p in group], dim=2)
+            total_kv = int(meta[0].get("num_kv_heads_total") or 0)
+            stride = max(1, tp_size // total_kv) if total_kv else 1
+            k = torch.cat(
+                [p["k"] for p in group if int(p.get("tp_rank", 0)) % stride == 0],
+                dim=2,
+            )
+            for li in range(len(meta)):
+                # Per-query-head metadata follows the Q concat order.
+                for key in ("alibi_slopes", "sinks"):
+                    vals = [p["meta"][li].get(key) for p in group]
+                    meta[li][key] = (
+                        None
+                        if vals[0] is None
+                        else [x for v in vals for x in (v or [])]
+                    )
+                meta[li]["num_heads_local"] = int(q.shape[2])
+                meta[li]["num_kv_heads_local"] = int(k.shape[2])
+        pp_groups.append(
+            {"q": q, "k": k, "layers": list(first["layers"]), "meta": meta}
+        )
+
+    if len(pp_groups) == 1:
+        g = pp_groups[0]
+        q, k, layers, meta = g["q"], g["k"], g["layers"], g["meta"]
+    else:
+        q = torch.cat([g["q"] for g in pp_groups], dim=0)
+        k = torch.cat([g["k"] for g in pp_groups], dim=0)
+        layers = [i for g in pp_groups for i in g["layers"]]
+        meta = [m for g in pp_groups for m in g["meta"]]
+
+    return {"attn_q": q, "attn_k": k, "qk_layers": layers, "qk_meta": meta}
+
+
+def _merge_captured_qk(
+    states: list[bytes | None] | None,
+) -> dict[str, Any] | None:
+    """Merge Q/K captures from all ranks (see :func:`_merge_qk_parts`)."""
+    if not states:
+        return None
+    parts = [_decode_rank_payload(s)["qk"] for s in states if s is not None]
+    if not parts:
+        return None
+    return _merge_qk_parts(parts)
+
+
+def _merge_captured_qk_batch(
+    states_per_rank: list[bytes | None] | None,
+    external_req_ids: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    """Batched :func:`_merge_captured_qk`, keyed by external request id."""
+    if not states_per_rank:
+        return {}
+    rank_dicts: list[dict[str, dict[str, Any]]] = [
+        _decode_rank_payload(s) for s in states_per_rank if s is not None
+    ]
+    out: dict[str, dict[str, Any]] = {}
+    for req_id in external_req_ids:
+        parts = [d[req_id]["qk"] for d in rank_dicts if req_id in d]
+        if parts:
+            out[req_id] = _merge_qk_parts(parts)
+    return out
+
+
 def _decode_steering_vectors(value: Any) -> list[SteeringVector] | None:
     """Normalise an ``apply_steering_vectors`` extra_args value.
 
@@ -214,6 +303,10 @@ def _trim_activations(
     rs = activations.get("residual_stream")
     if rs is not None and rs.shape[1] > expected_len:
         activations["residual_stream"] = rs[:, :expected_len, :]
+    for key in ("attn_q", "attn_k"):
+        t = activations.get(key)
+        if t is not None and t.shape[1] > expected_len:
+            activations[key] = t[:, :expected_len]
     ids = activations.get("input_ids")
     if ids is not None and len(ids) > expected_len:
         activations["input_ids"] = ids[:expected_len]
@@ -300,6 +393,7 @@ async def _patched_generate(
 
     extra = effective_params.extra_args or {}
     wants_activations = extra.get("output_residual_stream") is not None
+    wants_qk = extra.get("output_qk") is not None
     # Extract steering data and remove from extra_args before vLLM
     # serialises the SamplingParams (tensors don't survive msgspec).
     # When arriving via the OpenAI API (vllm_xargs), complex values
@@ -321,13 +415,16 @@ async def _patched_generate(
         or hooks_list is not None
         or has_persistent
     )
-    if needs_hooks or skip_kv_cache:
+    if needs_hooks or wants_qk or skip_kv_cache:
         # Hooks rely on forward passes firing; prefix-cached tokens skip
         # computation entirely, so force a fresh prefill for this request.
         effective_params.skip_reading_prefix_cache = True
     if needs_hooks and not getattr(self, "_hooks_installed", False):
         await self.collective_rpc("install_hooks")
         setattr(self, "_hooks_installed", True)
+    if wants_qk and not getattr(self, "_qk_hooks_installed", False):
+        await self.collective_rpc("install_qk_hooks")
+        setattr(self, "_qk_hooks_installed", True)
 
     # Send steering data to workers before the forward pass begins.
     if steering_vectors is not None:
@@ -359,6 +456,18 @@ async def _patched_generate(
                         n_gen = len(output.outputs[0].token_ids)
                         _trim_activations(activations, n_prompt + n_gen - 1)
                         output.activations = activations
+                if wants_qk:
+                    qk_states = await self.collective_rpc(
+                        "get_captured_qk", args=(request_id,)
+                    )
+                    qk = _merge_captured_qk(qk_states)
+                    if qk is not None:
+                        n_prompt = len(output.prompt_token_ids)
+                        n_gen = len(output.outputs[0].token_ids)
+                        _trim_activations(qk, n_prompt + n_gen - 1)
+                        merged_acts = getattr(output, "activations", None) or {}
+                        merged_acts.update(qk)
+                        output.activations = merged_acts
                 if hooks_list is not None:
                     raw_results = await self.collective_rpc(
                         "get_hook_results", args=(request_id,)
@@ -372,6 +481,8 @@ async def _patched_generate(
             await self.collective_rpc("clear_steering_data", args=(request_id,))
         if wants_activations:
             await self.collective_rpc("clear_captured_states", args=(request_id,))
+        if wants_qk:
+            await self.collective_rpc("clear_captured_qk", args=(request_id,))
         if hooks_list is not None:
             await self.collective_rpc("clear_hook_data", args=(request_id,))
             await self.collective_rpc("clear_hook_contexts", args=(request_id,))
@@ -408,6 +519,9 @@ def _prepare_offline_params(
     wants_activations = any(
         (sp.extra_args or {}).get("output_residual_stream") is not None
         for sp in params_list
+    )
+    wants_qk = any(
+        (sp.extra_args or {}).get("output_qk") is not None for sp in params_list
     )
 
     # Extract steering vectors per-request.  We must pop them from
@@ -446,13 +560,17 @@ def _prepare_offline_params(
     has_hooks = len(hook_payloads) > 0
     has_persistent = getattr(self, "_has_persistent_hooks", False)
     needs_hooks = wants_activations or has_steering or has_hooks or has_persistent
-    if needs_hooks or any_skip_kv_cache:
+    if needs_hooks or wants_qk or any_skip_kv_cache:
         for sp in params_list:
             sp.skip_reading_prefix_cache = True
 
     if needs_hooks and not getattr(self, "_hooks_installed", False):
         self.collective_rpc("install_hooks")
         self._hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
+
+    if wants_qk and not getattr(self, "_qk_hooks_installed", False):
+        self.collective_rpc("install_qk_hooks")
+        self._qk_hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
 
     # Send steering data to workers before generation.
     for sid, payload in steering_payloads.items():
@@ -464,6 +582,7 @@ def _prepare_offline_params(
 
     return {
         "wants_activations": wants_activations,
+        "wants_qk": wants_qk,
         "steering_payloads": steering_payloads,
         "hook_payloads": hook_payloads,
     }
@@ -481,6 +600,7 @@ def _finalize_offline_outputs(
     :func:`_prepare_offline_params`.
     """
     wants_activations = state["wants_activations"]
+    wants_qk = state.get("wants_qk", False)
     steering_payloads = state["steering_payloads"]
     hook_payloads = state["hook_payloads"]
     has_hooks = len(hook_payloads) > 0
@@ -498,6 +618,20 @@ def _finalize_offline_outputs(
                 n_gen = len(output.outputs[0].token_ids)
                 _trim_activations(activations, n_prompt + n_gen - 1)
                 output.activations = activations
+
+    if wants_qk:
+        req_ids = [output.request_id for output in outputs]
+        qk_per_rank = self.collective_rpc("get_captured_qk_batch", args=(req_ids,))
+        qk_by_id = _merge_captured_qk_batch(qk_per_rank, req_ids)
+        for output in outputs:
+            qk = qk_by_id.get(output.request_id)
+            if qk is not None:
+                n_prompt = len(output.prompt_token_ids)
+                n_gen = len(output.outputs[0].token_ids)
+                _trim_activations(qk, n_prompt + n_gen - 1)
+                merged_acts = getattr(output, "activations", None) or {}
+                merged_acts.update(qk)
+                output.activations = merged_acts
 
     if has_hooks:
         for output in outputs:

@@ -705,6 +705,145 @@ def _make_pre_hook(extension: HiddenStatesExtension, layer_idx: int) -> Callable
     return hook
 
 
+def _qk_hook_inner(
+    extension: HiddenStatesExtension,
+    layer_idx: int,
+    attn_module: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> None:
+    """Capture post-RoPE Q/K at the input of a vLLM ``Attention`` module.
+
+    Unlike residual-stream capture, this runs on **every** TP rank:
+    ``Attention`` inputs are sharded by head (each rank sees only its own
+    slice of query/kv heads), so all ranks must contribute and the plugin
+    concatenates along the head dimension at merge time.
+    """
+    if not is_forward_context_available():
+        return
+
+    runner = extension.model_runner
+    num_reqs = runner.input_batch.num_reqs
+    if num_reqs == 0:
+        return
+
+    query = kwargs.get("query", args[0] if len(args) > 0 else None)
+    key = kwargs.get("key", args[1] if len(args) > 1 else None)
+    if query is None or key is None:
+        return
+
+    ctx = get_forward_context()
+    attn_metadata = ctx.attn_metadata
+    if attn_metadata is None:
+        return
+    if isinstance(attn_metadata, list):
+        attn_metadata = attn_metadata[0]
+        if attn_metadata is None:
+            return
+    # attn_metadata is keyed by layer name — prefer this layer's own entry,
+    # falling back to the first entry with query_start_loc (hybrid models).
+    query_start_loc: torch.Tensor | None = None
+    if isinstance(attn_metadata, dict):
+        meta = attn_metadata.get(getattr(attn_module, "layer_name", ""))
+        if meta is not None and hasattr(meta, "query_start_loc"):
+            query_start_loc = getattr(meta, "query_start_loc")
+        else:
+            for _meta in attn_metadata.values():
+                if hasattr(_meta, "query_start_loc"):
+                    query_start_loc = getattr(_meta, "query_start_loc")
+                    break
+    else:
+        query_start_loc = getattr(attn_metadata, "query_start_loc", None)
+    if query_start_loc is None:
+        return
+
+    req_ids = runner.input_batch.req_ids
+
+    # Inputs are (num_tokens, heads * head_size), post-RoPE (the model
+    # applies rotary embeddings before calling the Attention wrapper);
+    # 3-D inputs are legal per the wrapper's contract, so reshape both.
+    num_heads = attn_module.num_heads
+    num_kv_heads = attn_module.num_kv_heads
+    head_size = attn_module.head_size
+    q3 = query.reshape(-1, num_heads, head_size)
+    k3 = key.reshape(-1, num_kv_heads, head_size)
+
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        req_state = runner.requests.get(req_id)
+        if req_state is None or req_state.sampling_params is None:
+            continue
+        extra = req_state.sampling_params.extra_args
+        if not extra:
+            continue
+
+        output_qk = extra.get("output_qk")
+        if output_qk is None:
+            continue
+        # vllm_xargs passes values as strings; parse JSON lists.
+        if isinstance(output_qk, str):
+            try:
+                output_qk = json.loads(output_qk)
+            except (json.JSONDecodeError, ValueError):
+                pass  # treat as truthy (capture all layers)
+        if isinstance(output_qk, list) and layer_idx not in output_qk:
+            continue
+
+        start = int(query_start_loc[i].item())
+        end = int(query_start_loc[i + 1].item())
+
+        if req_id not in extension._captured_qk:
+            extension._captured_qk[req_id] = {}
+        layer_states = extension._captured_qk[req_id]
+        if layer_idx not in layer_states:
+            layer_states[layer_idx] = {"q": [], "k": []}
+        layer_states[layer_idx]["q"].append(q3[start:end].cpu())
+        layer_states[layer_idx]["k"].append(k3[start:end].cpu())
+
+
+def _make_qk_hook(
+    extension: HiddenStatesExtension, layer_idx: int, attn_module: Any
+) -> Callable:
+    """Create a forward pre-hook closure for an ``Attention`` module."""
+
+    def hook(
+        _module: torch.nn.Module,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
+        """Forward pre-hook: capture this layer's Q/K for opted-in requests."""
+        try:
+            _qk_hook_inner(extension, layer_idx, attn_module, args, kwargs)
+        except Exception:
+            logger.warning(
+                "vllm-lens qk hook error on layer %d, skipping",
+                layer_idx,
+                exc_info=True,
+            )
+        return None
+
+    return hook
+
+
+def _normalize_sliding_window(value: Any) -> tuple[int, int]:
+    """Normalize a sliding-window spec to vLLM's ``(left, right)`` form."""
+    if value is None:
+        return (-1, -1)
+    if isinstance(value, int):
+        return (-1, -1) if value < 0 else (value - 1, 0)
+    left, right = value
+    return (int(left), int(right))
+
+
+def _to_float_list(value: Any) -> list[float] | None:
+    """Convert an optional per-head tensor/sequence to a JSON-safe list."""
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return [float(x) for x in value.detach().float().cpu().tolist()]
+    return [float(x) for x in value]
+
+
 class HiddenStatesExtension:
     """Mixin injected into vLLM's GPU Worker at runtime.
 
@@ -719,6 +858,8 @@ class HiddenStatesExtension:
 
     if TYPE_CHECKING:
         model_runner: Any  # Provided by Worker at runtime
+        model_config: Any
+        compilation_config: Any
         rank: int
         parallel_config: ParallelConfig
 
@@ -753,6 +894,15 @@ class HiddenStatesExtension:
 
     # Whether this rank should capture activations (only TP rank 0).
     _should_capture: bool = True
+
+    # Per-request captured attention Q/K (all TP ranks — heads are sharded):
+    # internal_req_id → { layer_idx → {"q": [tensor, ...], "k": [tensor, ...]} }
+    _captured_qk: dict[str, dict[int, dict[str, list[torch.Tensor]]]] = {}
+    _qk_hooks_installed: bool = False
+
+    # Per-layer kernel metadata recorded at install time, keyed by global
+    # layer index (scale, sliding window, soft-cap, ... — see install_qk_hooks).
+    _qk_layer_meta: dict[int, dict[str, Any]] = {}
 
     def install_hooks(self) -> None:
         """Register a forward hook on every decoder layer. Idempotent.
@@ -946,6 +1096,182 @@ class HiddenStatesExtension:
     def _debug_layer_discovery(self) -> list[int]:
         """Global indices of decoder layers found via the registry (testing)."""
         return sorted((_discover_layer_modules(self) or {}).keys())
+
+    # ------------------------------------------------------------------
+    # Attention Q/K capture (called via collective_rpc)
+    # ------------------------------------------------------------------
+
+    def install_qk_hooks(self) -> None:
+        """Register a pre-hook on every decoder ``Attention`` module. Idempotent.
+
+        Separate from :meth:`install_hooks` so residual-stream/steering
+        users pay no extra per-forward cost.  Installed — and capturing —
+        on **every** TP rank, because ``Attention`` inputs are sharded by
+        head (unlike the residual stream, which is replicated post
+        all-reduce).
+
+        Also records, per layer, the exact kernel parameters needed to
+        replay the attention softmax offline (``vllm_lens.attention``):
+        vLLM has already normalized model-specific conventions (custom
+        scales, sliding-window forms, ...) into these values.
+        """
+        if self._qk_hooks_installed:
+            return
+
+        try:
+            from vllm.model_executor.layers.attention.attention import Attention
+            from vllm.model_executor.layers.attention.mla_attention import (
+                MLAAttention,
+            )
+        except ImportError as e:
+            raise RuntimeError(
+                "output_qk requires a vLLM version with the attention-layer "
+                f"registry (could not import Attention/MLAAttention: {e})"
+            ) from e
+
+        registry = getattr(self.compilation_config, "static_forward_context", None)
+        if not registry:
+            raise RuntimeError(
+                "output_qk requires vLLM's static_forward_context registry, "
+                "which is empty — cannot locate attention layers."
+            )
+
+        selected: dict[int, Any] = {}
+        for prefix, module in registry.items():
+            if isinstance(module, MLAAttention):
+                raise RuntimeError(
+                    "output_qk is not supported for MLA models (DeepSeek-style "
+                    "multi-head latent attention): the Attention wrapper never "
+                    "sees materialized per-head Q/K, so there is nothing to "
+                    "capture. Residual-stream capture and steering still work."
+                )
+            if not isinstance(module, Attention):
+                continue
+            if getattr(module, "attn_type", "decoder") != "decoder":
+                continue
+            segments = prefix.split(".")
+            idx_pos = next((i for i, seg in enumerate(segments) if seg.isdigit()), None)
+            if idx_pos is None:
+                raise RuntimeError(
+                    f"Cannot parse a layer index from attention layer {prefix!r}."
+                )
+            selected[int(segments[idx_pos])] = module
+
+        if not selected:
+            raise RuntimeError(
+                "output_qk found no decoder attention layers to hook "
+                "(is this an attention-free model?)."
+            )
+
+        # Reset to instance-level state (class-level defaults are shared).
+        self._captured_qk = {}
+        self._qk_layer_meta = {}
+        self._qk_hooks_installed = True
+
+        model_config = getattr(self, "model_config", None)
+        try:
+            total_kv_heads = int(model_config.get_total_num_kv_heads())  # type: ignore[union-attr]
+        except Exception:
+            total_kv_heads = 0
+
+        from vllm.distributed import parallel_state as ps
+
+        tp_size = self.parallel_config.tensor_parallel_size
+        self._qk_tp_rank = int(ps.get_tensor_model_parallel_rank())
+        self._qk_pp_rank = int(ps.get_pp_group().rank_in_group)
+        self._qk_tp_size = int(tp_size)
+
+        for layer_idx, module in sorted(selected.items()):
+            impl = module.impl
+            self._qk_layer_meta[layer_idx] = {
+                "layer_name": getattr(module, "layer_name", ""),
+                "scale": float(getattr(impl, "scale", None) or module.head_size**-0.5),
+                "logits_soft_cap": float(getattr(impl, "logits_soft_cap", None) or 0.0),
+                "sliding_window": list(
+                    _normalize_sliding_window(getattr(impl, "sliding_window", None))
+                ),
+                "alibi_slopes": _to_float_list(getattr(impl, "alibi_slopes", None)),
+                "sinks": _to_float_list(getattr(impl, "sinks", None)),
+                "use_alibi_sqrt": bool(getattr(module, "use_alibi_sqrt", False)),
+                "num_heads_local": int(module.num_heads),
+                "num_kv_heads_local": int(module.num_kv_heads),
+                "head_size": int(module.head_size),
+                "num_kv_heads_total": total_kv_heads or int(module.num_kv_heads),
+            }
+            module.register_forward_pre_hook(
+                _make_qk_hook(self, layer_idx, module), with_kwargs=True
+            )
+
+    def _build_qk_payload(self, internal_req_id: str) -> dict[str, Any]:
+        """Materialise the stacked Q/K payload for one internal request id.
+
+        Pops the entry so successive calls do not re-emit the same data.
+        Q stacks to ``(n_layers, total_pos, local_q_heads, head_size)`` and
+        K to ``(n_layers, total_pos, local_kv_heads, head_size)``.
+        """
+        layer_dict = self._captured_qk.pop(internal_req_id)
+        sorted_indices = sorted(layer_dict.keys())
+        q_layers = [torch.cat(layer_dict[i]["q"], dim=0) for i in sorted_indices]
+        k_layers = [torch.cat(layer_dict[i]["k"], dim=0) for i in sorted_indices]
+        if len({t.shape for t in q_layers}) > 1 or len({t.shape for t in k_layers}) > 1:
+            # Heterogeneous head counts across captured layers (exotic
+            # hybrids). Stacking would silently misalign — refuse loudly.
+            raise RuntimeError(
+                "output_qk captured layers with heterogeneous Q/K shapes; "
+                "capture a single layer at a time for this model."
+            )
+        return {
+            "qk": {
+                "q": torch.stack(q_layers, dim=0),
+                "k": torch.stack(k_layers, dim=0),
+                "layers": sorted_indices,
+                "meta": [self._qk_layer_meta[i] for i in sorted_indices],
+                "tp_rank": getattr(self, "_qk_tp_rank", 0),
+                "pp_rank": getattr(self, "_qk_pp_rank", 0),
+                "tp_size": getattr(self, "_qk_tp_size", 1),
+            }
+        }
+
+    def get_captured_qk(self, external_req_id: str) -> bytes | None:
+        """Retrieve captured Q/K for a request (zstd + pickle).
+
+        Same ``"{external_req_id}-"`` prefix-match convention as
+        :meth:`get_captured_states`.  Every TP rank returns its own head
+        shard, tagged with its ranks; the plugin merges along the head
+        dimension.  Removes the request's data after retrieval.
+        """
+        prefix = f"{external_req_id}-"
+        for req_id in list(self._captured_qk):
+            if req_id.startswith(prefix):
+                payload = self._build_qk_payload(req_id)
+                return _ZSTD_COMPRESSOR.compress(pickle.dumps(payload))
+        return None
+
+    def get_captured_qk_batch(self, external_req_ids: list[str]) -> bytes | None:
+        """Batched :meth:`get_captured_qk` for the offline path (plain pickle)."""
+        if not external_req_ids:
+            return None
+        out: dict[str, dict[str, Any]] = {}
+        for req_id in list(self._captured_qk):
+            for external_req_id in external_req_ids:
+                if req_id.startswith(f"{external_req_id}-"):
+                    out[external_req_id] = self._build_qk_payload(req_id)
+                    break
+        if not out:
+            return None
+        return pickle.dumps(out, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def clear_captured_qk(self, external_req_id: str) -> None:
+        """Remove captured Q/K without returning it (abort/disconnect cleanup)."""
+        prefix = f"{external_req_id}-"
+        for req_id in list(self._captured_qk):
+            if req_id.startswith(prefix):
+                del self._captured_qk[req_id]
+                logger.debug("Cleared leaked Q/K capture for %s", req_id)
+
+    def _debug_captured_qk_count(self) -> int:
+        """Return the number of entries in _captured_qk (for testing)."""
+        return len(self._captured_qk)
 
     # ------------------------------------------------------------------
     # Hook data management (called via collective_rpc)

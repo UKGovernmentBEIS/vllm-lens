@@ -82,17 +82,31 @@ def deserialize_tensor(d: dict[str, Any]) -> torch.Tensor:
 
 
 def serialize_activations(tensor_dict: dict[str, Any]) -> dict[str, Any]:
-    """Convert a flat dict of torch tensors to a JSON-serializable form.
+    """Convert a flat activations dict to a JSON-serializable form.
+
+    Tensors keep the existing wire format (see :func:`serialize_tensor`);
+    JSON-safe non-tensor values (e.g. ``qk_layers`` / ``qk_meta`` from
+    attention Q/K capture) are wrapped as ``{"__json__": value}``.
 
     Input::
 
-        {"residual_stream": Tensor(n_layers, total_pos, d)}
+        {"residual_stream": Tensor(n_layers, total_pos, d), "qk_layers": [2]}
 
     Output::
 
-        {"residual_stream": {"data": "<b64>", "dtype": "...", "shape": [...]}}
+        {"residual_stream": {"data": "<b64>", ...}, "qk_layers": {"__json__": [2]}}
     """
-    return {name: serialize_tensor(t) for name, t in tensor_dict.items()}
+    return {
+        name: serialize_tensor(t) if isinstance(t, torch.Tensor) else {"__json__": t}
+        for name, t in tensor_dict.items()
+    }
+
+
+def decode_activation_entry(encoded: Any) -> Any:
+    """Decode one value of a serialized activations dict."""
+    if isinstance(encoded, dict) and "__json__" in encoded:
+        return encoded["__json__"]
+    return deserialize_tensor(encoded)
 
 
 def decode_activations(response_json: dict[str, Any]) -> dict[str, Any]:
@@ -100,7 +114,8 @@ def decode_activations(response_json: dict[str, Any]) -> dict[str, Any]:
 
     Takes the raw JSON response dict from ``/v1/completions`` or
     ``/v1/chat/completions`` and converts any base64 activation tensors
-    back to ``torch.Tensor``.
+    back to ``torch.Tensor`` (non-tensor ``__json__`` entries pass
+    through as-is).
 
     Returns a dict like::
 
@@ -111,7 +126,7 @@ def decode_activations(response_json: dict[str, Any]) -> dict[str, Any]:
     raw = response_json.get("activations")
     if raw is None:
         return {}
-    return {name: deserialize_tensor(encoded) for name, encoded in raw.items()}
+    return {name: decode_activation_entry(encoded) for name, encoded in raw.items()}
 
 
 _JSON_SAFE_TYPES = (str, int, float, bool, type(None))
