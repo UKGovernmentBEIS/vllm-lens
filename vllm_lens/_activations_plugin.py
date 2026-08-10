@@ -331,7 +331,7 @@ async def _patched_generate(
         effective_params.skip_reading_prefix_cache = True
     if needs_hooks and not getattr(self, "_hooks_installed", False):
         await self.collective_rpc("install_hooks")
-        self._hooks_installed = True
+        setattr(self, "_hooks_installed", True)
 
     # Send steering data to workers before the forward pass begins.
     if steering_vectors is not None:
