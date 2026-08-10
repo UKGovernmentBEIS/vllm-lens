@@ -39,8 +39,8 @@ import requests
 import torch
 
 from vllm_lens._helpers._serialize import (
+    decode_activations,
     deserialize_hook_results,
-    deserialize_tensor,
 )
 from vllm_lens._helpers.types import Hook, SteeringVector
 
@@ -101,10 +101,13 @@ class VLLMLensClient:
         hooks: list[Hook] | None,
         capture_layers: list[int] | None,
         steering_vectors: list[SteeringVector] | None,
+        activations_transport: str | None = None,
     ) -> dict[str, str]:
         xargs: dict[str, str] = {}
         if capture_layers is not None:
             xargs["output_residual_stream"] = json.dumps(capture_layers)
+        if activations_transport is not None:
+            xargs["activations_transport"] = activations_transport
         if hooks is not None:
             xargs["apply_hooks"] = json.dumps([h.model_dump() for h in hooks])
         if steering_vectors is not None:
@@ -112,6 +115,19 @@ class VLLMLensClient:
                 [sv.model_dump() for sv in steering_vectors]
             )
         return xargs
+
+    def _fetch_activation_bytes(self, handle: str) -> bytes:
+        """Fetch a binary activation payload by handle (issue #31 transport).
+
+        Used as the ``fetch_bytes`` callback for :func:`decode_activations` when
+        a response carries an ``activations_transport="binary"`` handle instead
+        of inline base64.
+        """
+        resp = self._session.get(
+            f"{self.base_url}/v1/activations/{handle}", timeout=self._timeout
+        )
+        resp.raise_for_status()
+        return resp.content
 
     def _parse_response(self, resp: dict[str, Any]) -> GenerateOutput:
         if "error" in resp:
@@ -122,12 +138,9 @@ class VLLMLensClient:
         choice = resp["choices"][0]
         text = choice.get("message", {}).get("content") or choice.get("text", "")
 
-        activations = None
-        if "activations" in resp:
-            activations = {
-                name: deserialize_tensor(encoded)
-                for name, encoded in resp["activations"].items()
-            }
+        activations = (
+            decode_activations(resp, fetch_bytes=self._fetch_activation_bytes) or None
+        )
 
         hook_results = None
         if "hook_results" in resp:
@@ -152,6 +165,7 @@ class VLLMLensClient:
         hooks: list[Hook] | None = None,
         capture_layers: list[int] | None = None,
         steering_vectors: list[SteeringVector] | None = None,
+        activations_transport: str | None = None,
         logprobs: int | None = None,
         echo: bool = False,
         **kwargs: Any,
@@ -159,6 +173,11 @@ class VLLMLensClient:
         """Generate a completion from a raw prompt.
 
         Uses ``/v1/completions``. For chat messages, use :meth:`chat`.
+
+        ``activations_transport="binary"`` returns captured activations as a
+        handle fetched from ``GET /v1/activations/{handle}`` (no base64); the
+        default inlines them as base64 in the JSON response. Decoding is
+        transparent either way.
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -172,7 +191,9 @@ class VLLMLensClient:
         if echo:
             body["echo"] = True
 
-        xargs = self._build_xargs(hooks, capture_layers, steering_vectors)
+        xargs = self._build_xargs(
+            hooks, capture_layers, steering_vectors, activations_transport
+        )
         if xargs:
             body["vllm_xargs"] = xargs
 
@@ -190,11 +211,13 @@ class VLLMLensClient:
         hooks: list[Hook] | None = None,
         capture_layers: list[int] | None = None,
         steering_vectors: list[SteeringVector] | None = None,
+        activations_transport: str | None = None,
         **kwargs: Any,
     ) -> GenerateOutput:
         """Generate a chat completion from a list of messages.
 
-        Uses ``/v1/chat/completions``.
+        Uses ``/v1/chat/completions``. See :meth:`generate` for
+        ``activations_transport``.
 
         Example::
 
@@ -210,7 +233,9 @@ class VLLMLensClient:
             **kwargs,
         }
 
-        xargs = self._build_xargs(hooks, capture_layers, steering_vectors)
+        xargs = self._build_xargs(
+            hooks, capture_layers, steering_vectors, activations_transport
+        )
         if xargs:
             body["vllm_xargs"] = xargs
 

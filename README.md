@@ -106,6 +106,21 @@ print(out.activations["residual_stream"].shape)
 
 Layers are stacked in ascending order along dim 0. Capture runs on TP rank 0 only (residual streams are identical across TP ranks after all-reduce).
 
+#### Binary transport for large captures
+
+By default activations come back base64-encoded inside the JSON response, which adds ~33% overhead on top of the zstd compression and materializes the whole blob in one piece on both ends. For large all-layer captures, pass `activations_transport="binary"` to fetch the raw bytes out-of-band instead:
+
+```python
+out = client.generate(
+    "Hello world",
+    capture_layers=list(range(32)),
+    activations_transport="binary",
+)
+print(out.activations["residual_stream"].shape)  # decoded transparently
+```
+
+The completion JSON then carries only an unguessable handle plus the dtype/shape metadata; the client fetches the raw zstd bytes from `GET /v1/activations/{handle}` as `application/octet-stream`. The server-side buffer is bounded (`VLLM_LENS_ACT_MAX_BYTES`, default 8 GiB) and per-entry TTL'd (`VLLM_LENS_ACT_TTL_S`, default 300 s). It is process-local, so behind a load balancer either pin activation fetches to the replica that produced the completion (sticky routing) or keep the default base64 transport.
+
 ### Steering vectors
 
 Add activation vectors to the residual stream in-flight with `apply_steering_vectors`. A `SteeringVector` carries the activations plus how to apply them:

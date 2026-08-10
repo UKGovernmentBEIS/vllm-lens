@@ -1,5 +1,7 @@
 ## Unreleased
 
+- Activations: Added an opt-in **binary transport** for activation payloads over the HTTP API (`activations_transport="binary"` in `vllm_xargs` / the client). Instead of base64-inlining the (already zstd-compressed) tensors in the JSON body — which inflates ~33% and forces the whole blob to be materialized and parsed in one piece on both ends — the raw bytes are parked in a bounded, TTL'd, process-local store under an unguessable handle, and the client fetches them from `GET /v1/activations/{handle}` as `application/octet-stream`. Default responses are byte-identical (base64); `decode_activations` and `VLLMLensClient` handle both transports transparently. The store is bounded by `VLLM_LENS_ACT_MAX_BYTES` (default 8 GiB) and `VLLM_LENS_ACT_TTL_S` (default 300 s), and is process-local (pin fetches to the producing replica in multi-replica deployments). (#31)
+
 ## v1.2.1 (22 July 2026)
 
 - Steering: Fixed offline steering via `LLM.chat` — the plugin now patches `LLM.chat` (which submits requests to the engine directly rather than routing through `LLM.generate`). Previously, live `SteeringVector` objects raised a msgpack `TypeError`, and JSON-serialized vectors ran **silently unsteered**. Activation capture (`output_residual_stream`) and per-request hooks (`apply_hooks`) now also work through `LLM.chat`. (#28)

@@ -25,6 +25,7 @@ import zstandard as zstd
 
 from vllm_lens._helpers._serialize import (
     serialize_activations,
+    serialize_activations_binary,
     serialize_hook_results,
 )
 from vllm_lens._helpers.types import Hook, SteeringVector
@@ -300,6 +301,9 @@ async def _patched_generate(
 
     extra = effective_params.extra_args or {}
     wants_activations = extra.get("output_residual_stream") is not None
+    # Response-transport negotiation (issue #31): "binary" parks activation
+    # bytes in the process-local store and returns a handle instead of base64.
+    activations_transport = extra.get("activations_transport")
     # Extract steering data and remove from extra_args before vLLM
     # serialises the SamplingParams (tensors don't survive msgspec).
     # When arriving via the OpenAI API (vllm_xargs), complex values
@@ -327,7 +331,7 @@ async def _patched_generate(
         effective_params.skip_reading_prefix_cache = True
     if needs_hooks and not getattr(self, "_hooks_installed", False):
         await self.collective_rpc("install_hooks")
-        setattr(self, "_hooks_installed", True)
+        self._hooks_installed = True
 
     # Send steering data to workers before the forward pass begins.
     if steering_vectors is not None:
@@ -359,6 +363,7 @@ async def _patched_generate(
                         n_gen = len(output.outputs[0].token_ids)
                         _trim_activations(activations, n_prompt + n_gen - 1)
                         output.activations = activations
+                        output._vllm_lens_transport = activations_transport
                 if hooks_list is not None:
                     raw_results = await self.collective_rpc(
                         "get_hook_results", args=(request_id,)
@@ -566,18 +571,36 @@ def _patched_llm_chat(
 # ---------------------------------------------------------------------------
 
 
+def _serialize_activations_for(obj: Any) -> dict[str, Any] | None:
+    """Serialize ``obj.activations`` for the wire, honouring the negotiated transport.
+
+    Returns ``None`` when the request captured nothing. ``"binary"`` (set on the
+    output by :func:`_patched_generate`) parks the bytes in the process-local
+    store and emits handle descriptors; anything else keeps the default
+    base64-in-JSON form, byte-identical to before this feature.
+    """
+    activations = getattr(obj, "activations", None)
+    if activations is None:
+        return None
+    if getattr(obj, "_vllm_lens_transport", None) == "binary":
+        from vllm_lens._helpers._activation_store import store
+
+        return serialize_activations_binary(activations, store)
+    return serialize_activations(activations)
+
+
 def _patched_completion_response(self, final_res_batch, *args, **kwargs):
     """Wrap the completion response builder to inject serialized activations and hook results."""
     assert _original_completion_response is not None
     response = _original_completion_response(self, final_res_batch, *args, **kwargs)
     for res in final_res_batch or ():
-        activations = getattr(res, "activations", None)
-        if activations is not None:
-            response.activations = serialize_activations(activations)
+        serialized = _serialize_activations_for(res)
+        if serialized is not None:
+            response.activations = serialized
         hook_results = getattr(res, "hook_results", None)
         if hook_results is not None:
             response.hook_results = serialize_hook_results(hook_results)
-        if activations is not None or hook_results is not None:
+        if serialized is not None or hook_results is not None:
             break
     return response
 
@@ -608,9 +631,9 @@ async def _patched_chat_full_generator(
 
     # Only inject for successful responses (not ErrorResponse).
     if last_output is not None and hasattr(response, "model_dump"):
-        activations = getattr(last_output, "activations", None)
-        if activations is not None:
-            response.activations = serialize_activations(activations)
+        serialized = _serialize_activations_for(last_output)
+        if serialized is not None:
+            response.activations = serialized
         hook_results = getattr(last_output, "hook_results", None)
         if hook_results is not None:
             response.hook_results = serialize_hook_results(hook_results)
@@ -645,9 +668,9 @@ async def _patched_chat_stream_generator(
             import json as _json
 
             extra: dict[str, Any] = {}
-            activations = getattr(last_output, "activations", None)
-            if activations is not None:
-                extra["activations"] = serialize_activations(activations)
+            serialized = _serialize_activations_for(last_output)
+            if serialized is not None:
+                extra["activations"] = serialized
             hook_results = getattr(last_output, "hook_results", None)
             if hook_results is not None:
                 extra["hook_results"] = serialize_hook_results(hook_results)
@@ -665,9 +688,11 @@ def _patched_register_routers(app):
     """Inject vllm-lens hook router after vLLM registers its own routes."""
     assert _original_register_routers is not None
     _original_register_routers(app)
+    from vllm_lens._hooks_router import activations_router
     from vllm_lens._hooks_router import router as hooks_router
 
     app.include_router(hooks_router)
+    app.include_router(activations_router)
 
 
 # ---------------------------------------------------------------------------
