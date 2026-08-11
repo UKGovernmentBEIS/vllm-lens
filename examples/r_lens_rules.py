@@ -4,9 +4,11 @@ An R-lens is a J-lens fit with Layer-wise Relevance Propagation (LRP) rules
 installed in the backward pass, which makes the readout markedly more faithful
 on early layers (see "R-lens: making J-lens more faithful on early layers",
 https://www.greaterwrong.com/posts/nv8oedrnLXKRzNEL9). The rules are pure
-stop-gradients: every patched forward is numerically unchanged, so the fit
-loop, the ``.pt`` format and the readout side need no changes — only the
-quantity transported by ``torch.autograd.backward`` differs.
+stop-gradients: every patched forward returns the original module's value
+*exactly* (the value is computed by the module's own kernels; a surrogate
+carries only the backward), so the fit loop, the ``.pt`` format and the
+readout side need no changes — only the quantity transported by
+``torch.autograd.backward`` differs.
 
 Dense-model recipe (the only one implemented; MoE fails fast):
 
@@ -45,21 +47,32 @@ _GELU_EXACT_CLASS_NAMES = {"GELU", "GELUActivation"}
 _GELU_TANH_CLASS_NAMES = {"PytorchGELUTanh", "NewGELUActivation", "GELUTanh"}
 
 
+def _exact_value(true_value: torch.Tensor, surrogate: torch.Tensor) -> torch.Tensor:
+    """Return exactly ``true_value`` in the forward, ``surrogate``'s backward.
+
+    ``surrogate - surrogate.detach()`` is exactly zero elementwise in the
+    forward (for finite values), so the result equals ``true_value`` while
+    gradients flow only through ``surrogate``.
+    """
+    return true_value.detach() + (surrogate - surrogate.detach())
+
+
 def lrp_rmsnorm_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
     """RMSNorm forward with the LN-rule installed (LRP).
 
-    Identical op sequence to prime-rl's reference RMSNorm forward — fp32
-    compute, cast back before the weight multiply — with one ``.detach()`` on
-    the ``rsqrt`` factor, so the output is bitwise-equal and only the backward
-    changes: the normalization denominator is treated as a constant.
+    The value is the module's original forward, exactly (whatever kernel it
+    uses — reference path, quack, hub); the backward comes from a
+    reference-path surrogate with one ``.detach()`` on the ``rsqrt`` factor,
+    treating the normalization denominator as a constant.
     """
     input_dtype = hidden_states.dtype
-    hidden_states = hidden_states.to(torch.float32)
-    variance = hidden_states.pow(2).mean(-1, keepdim=True)
-    hidden_states = (
-        hidden_states * torch.rsqrt(variance + self.variance_epsilon).detach()
-    )
-    return self.weight * hidden_states.to(input_dtype)
+    hs = hidden_states.to(torch.float32)
+    variance = hs.pow(2).mean(-1, keepdim=True)
+    hs = hs * torch.rsqrt(variance + self.variance_epsilon).detach()
+    surrogate = self.weight * hs.to(input_dtype)
+    with torch.no_grad():
+        true_value = self._lrp_orig_forward(hidden_states)
+    return _exact_value(true_value, surrogate)
 
 
 def _classify_gate_act(act_fn) -> str:
@@ -68,6 +81,8 @@ def _classify_gate_act(act_fn) -> str:
     Only activations that factor exactly as ``g * m(g)`` with ``m`` smooth
     everywhere are supported — the identity rule then needs no division and no
     near-zero guard. Anything else raises at install time, before any compute.
+    The classification selects the *backward* multiplier only; the forward
+    value always comes from the module's own ``gate_act_fn``.
     """
     name = type(act_fn).__name__
     if isinstance(act_fn, nn.SiLU) or name in _SILU_CLASS_NAMES:
@@ -106,23 +121,26 @@ def _identity_rule_act(kind: str, g: torch.Tensor) -> torch.Tensor:
 def lrp_gated_mlp_forward(self, x: torch.Tensor, routed_experts=None) -> torch.Tensor:
     """Gated-MLP forward with identity + half rules installed (LRP).
 
-    ``0.5 * (a * b.detach() + a.detach() * b)`` is bitwise ``a * b`` in the
-    forward while each branch receives half of the ordinary product gradient.
+    The value of ``act(gate) * up`` comes from the module's own activation
+    kernel, exactly; the surrogate applies the identity rule (linearized
+    activation) and the half rule (each branch gets half of the ordinary
+    product gradient) in the backward only.
     """
     g = self.gate_proj(x)
     u = self.up_proj(x)
     a = _identity_rule_act(self._lrp_act_kind, g)
-    h = 0.5 * (a * u.detach() + a.detach() * u)
-    return self.down_proj(h)
+    surrogate = 0.5 * (a * u.detach() + a.detach() * u)
+    with torch.no_grad():
+        true_h = self.gate_act_fn(g) * u
+    return self.down_proj(_exact_value(true_h, surrogate))
 
 
-def _bind(module: nn.Module, fn) -> None:
+def _check_unpatched(module: nn.Module) -> None:
     if "forward" in module.__dict__:
         raise RuntimeError(
             f"LRP rules already installed on {type(module).__name__} "
             "(instance forward is already overridden)"
         )
-    module.forward = types.MethodType(fn, module)
 
 
 def install_lrp_rules(decoder_layers) -> int:
@@ -132,8 +150,12 @@ def install_lrp_rules(decoder_layers) -> int:
     ``mlp`` (identity + half rules) per instance; q/k norms inside
     ``self_attn`` and everything outside ``decoder_layers`` are untouched.
     Forward values are unchanged. Returns the number of modules patched.
+
+    Every target is validated before anything is bound, so a failure (MoE
+    layer, unsupported activation, double install) leaves the model unpatched.
     """
-    n_patched = 0
+    norms: list[nn.Module] = []
+    mlps: list[tuple[nn.Module, str]] = []
     for i, layer in enumerate(decoder_layers):
         for name in ("input_layernorm", "post_attention_layernorm"):
             norm = getattr(layer, name, None)
@@ -142,8 +164,8 @@ def install_lrp_rules(decoder_layers) -> int:
                     f"layer {i}: {name} ({type(norm).__name__}) does not look "
                     f"like an RMSNorm (needs {_RMSNORM_ATTRS})"
                 )
-            _bind(norm, lrp_rmsnorm_forward)
-            n_patched += 1
+            _check_unpatched(norm)
+            norms.append(norm)
         mlp = getattr(layer, "mlp", None)
         if mlp is None or any(not hasattr(mlp, a) for a in _MLP_ATTRS):
             raise ValueError(
@@ -151,7 +173,12 @@ def install_lrp_rules(decoder_layers) -> int:
                 f"MLP (needs {_MLP_ATTRS}) — MoE models are not supported by "
                 "the R-lens fit yet"
             )
-        mlp._lrp_act_kind = _classify_gate_act(mlp.gate_act_fn)
-        _bind(mlp, lrp_gated_mlp_forward)
-        n_patched += 1
-    return n_patched
+        _check_unpatched(mlp)
+        mlps.append((mlp, _classify_gate_act(mlp.gate_act_fn)))
+    for norm in norms:
+        norm._lrp_orig_forward = norm.forward
+        norm.forward = types.MethodType(lrp_rmsnorm_forward, norm)
+    for mlp, kind in mlps:
+        mlp._lrp_act_kind = kind
+        mlp.forward = types.MethodType(lrp_gated_mlp_forward, mlp)
+    return len(norms) + len(mlps)

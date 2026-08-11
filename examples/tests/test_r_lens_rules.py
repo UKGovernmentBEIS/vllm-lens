@@ -69,6 +69,12 @@ class _DecoderLayer(nn.Module):
         self.post_attention_layernorm = _RMSNorm(D)
         self.mlp = _MLP(act)
 
+    def forward(self, x):
+        # A decoder block with attention stood in by the normed residual
+        # branch — keeps input_layernorm in the differentiated graph.
+        h = x + self.input_layernorm(x)
+        return h + self.mlp(self.post_attention_layernorm(h))
+
 
 def _randomize(module: nn.Module) -> nn.Module:
     """Randomize all params (unit norm weights would mask placement bugs)."""
@@ -80,6 +86,7 @@ def _randomize(module: nn.Module) -> nn.Module:
 
 def _patched_norm(norm: _RMSNorm) -> _RMSNorm:
     norm = copy.deepcopy(norm)
+    norm._lrp_orig_forward = norm.forward
     norm.forward = lrp_rmsnorm_forward.__get__(norm)
     return norm
 
@@ -123,10 +130,12 @@ def test_rmsnorm_forward_bitwise_equal(dtype):
 
 @pytest.mark.parametrize("kind", list(ACTS))
 def test_mlp_forward_matches(kind):
+    # The value is computed by the module's own gate_act_fn (straight-through
+    # construction), so the patched forward is exactly the unpatched one.
     torch.manual_seed(1)
     mlp = _randomize(_MLP(ACTS[kind][0]))
     x = torch.randn(3, 5, D)
-    torch.testing.assert_close(_patched_mlp(mlp, kind)(x), mlp(x))
+    assert torch.equal(_patched_mlp(mlp, kind)(x), mlp(x))
 
 
 def test_no_grad_input_flows_through():
@@ -263,6 +272,64 @@ def test_fit_loop_replica_matches_closed_form():
     assert not torch.allclose(lens, true_jac)
 
 
+def test_fit_style_multi_source_hook_rooted():
+    """Full replica of the fitter's capture pattern on a 3-layer stack.
+
+    Frozen params, grad-less input, graph rooted by a forward hook calling
+    ``requires_grad_(True)`` on the earliest source's output, two intermediate
+    sources harvested per backward with ``inputs=srcs`` and retained-graph
+    reuse — exactly ``jacobian_lens_fit.py``'s loop. Verified against
+    ``torch.autograd.functional.jacobian`` of the same patched blocks.
+    """
+    torch.manual_seed(7)
+    layers = nn.ModuleList([_randomize(_DecoderLayer()) for _ in range(3)])
+    layers.requires_grad_(False)
+    install_lrp_rules(layers)
+
+    acts = {}
+
+    def make_hook(idx):
+        def hook(_m, _in, out):
+            if idx == 0 and not out.requires_grad:
+                out.requires_grad_(True)  # root the graph at the earliest source
+            acts[idx] = out
+
+        return hook
+
+    handles = [layers[i].register_forward_hook(make_hook(i)) for i in range(3)]
+    dim_batch = 3
+    x = torch.randn(D).repeat(dim_batch, 1)  # identical rows, requires_grad=False
+    with torch.enable_grad():
+        y = layers[2](layers[1](layers[0](x)))
+    for h in handles:
+        h.remove()
+    target, srcs = acts[2], [acts[0], acts[1]]
+    assert y.requires_grad and not x.requires_grad
+    for s in srcs:
+        s.retain_grad()
+    lens = {0: torch.zeros(D, D), 1: torch.zeros(D, D)}
+    b = torch.arange(dim_batch)
+    starts = list(range(0, D, dim_batch))
+    for bi, start in enumerate(starts):
+        n = min(dim_batch, D - start)
+        for s in srcs:
+            s.grad = None
+        cot = torch.zeros_like(target)
+        cot[b[:n], start + b[:n]] = 1.0
+        torch.autograd.backward(
+            target, grad_tensors=cot, retain_graph=(bi < len(starts) - 1), inputs=srcs
+        )
+        for lyr, s in zip((0, 1), srcs):
+            lens[lyr][start : start + n] = s.grad[:n]
+
+    # Reference: independent autograd through the same patched blocks.
+    out0, out1 = acts[0][0].detach(), acts[1][0].detach()
+    j1 = torch.autograd.functional.jacobian(layers[1], out0)
+    j2 = torch.autograd.functional.jacobian(layers[2], out1)
+    torch.testing.assert_close(lens[1], j2)
+    torch.testing.assert_close(lens[0], j2 @ j1)
+
+
 # --- (e) install scope and failure modes --------------------------------------
 
 
@@ -296,6 +363,17 @@ def test_install_rejects_unknown_activation():
     layer = _DecoderLayer(act=nn.Tanh())
     with pytest.raises(NotImplementedError, match="Tanh"):
         install_lrp_rules([layer])
+
+
+def test_failed_install_leaves_model_unpatched():
+    # Validation runs over every layer before anything is bound, so a bad
+    # layer anywhere leaves the whole model untouched.
+    good, bad = _DecoderLayer(), _DecoderLayer(act=nn.Tanh())
+    with pytest.raises(NotImplementedError):
+        install_lrp_rules([good, bad])
+    for layer in (good, bad):
+        for mod in (layer.input_layernorm, layer.post_attention_layernorm, layer.mlp):
+            assert "forward" not in mod.__dict__
 
 
 def test_forward_hooks_still_fire_on_patched_module():
