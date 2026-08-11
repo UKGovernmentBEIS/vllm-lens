@@ -40,6 +40,16 @@ layers you will read out, since each adds a ``d_model x d_model`` matrix).
 ``--ep`` sets the expert-parallelism degree for MoE models (must divide the
 world size; no-op for dense). ``--n-prompts`` is the number of web-text contexts
 to average over (default 1000). Only rank 0 writes the lens.
+
+``--rules lrp`` fits an **R-lens** instead: the same estimator, but with LRP
+(layer-wise relevance propagation) rules installed in the backward pass
+(``r_lens_rules.py``), which makes early-layer readouts markedly more faithful
+(https://www.greaterwrong.com/posts/nv8oedrnLXKRzNEL9). The rules are pure
+stop-gradients — the forward pass is unchanged — so the output format is
+identical and ``jacobian_lens.py`` / ``jacobian_lens_chat.py`` consume the
+lens as-is; ``provenance["rules"]`` records which backward was used. The lrp
+fit is somewhat slower per prompt (patched norms bypass fused kernels).
+Dense models only for now — MoE layers fail fast at startup.
 """
 
 # Patch ring_flash_attn compat before torch imports (prime-rl requirement).
@@ -120,6 +130,16 @@ def _parse_args():
         "When omitted, rank 0 streams FineWeb once and caches it to "
         "'<out>.prompts.jsonl' (all ranks read that — 16 ranks streaming at once "
         "trips HF Hub rate limits).",
+    )
+    ap.add_argument(
+        "--rules",
+        choices=("gradient", "lrp"),
+        default="gradient",
+        help="backward rules for the vector-Jacobian products. 'gradient' = "
+        "exact autograd (J-lens, default). 'lrp' = R-lens: LN-rule on "
+        "residual-stream RMSNorms, identity+half rules on the gated MLP — "
+        "forward pass unchanged, backward made per-element linear through "
+        "the nonlinearities (dense models only).",
     )
     args = ap.parse_args()
     args.ep = args.ep if args.ep == "auto" else int(args.ep)
@@ -220,6 +240,18 @@ def fit(args):
     )
 
     layers, n_layers, d_model = _resolve_geometry(model)
+    if args.rules == "lrp":
+        # R-lens: stop-gradient-only LRP rules; forward values are unchanged.
+        # The rules module lives next to this script (torchrun puts the script
+        # dir on sys.path already; the insert covers other launchers).
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from r_lens_rules import install_lrp_rules
+
+        n_patched = install_lrp_rules(layers)
+        logger.info(
+            f"R-lens: LRP rules installed on {n_patched} modules "
+            f"across {n_layers} layers"
+        )
     target_layer = n_layers - 1
     if args.layers is not None:
         source_layers = sorted({int(x) for x in args.layers.split(",")})
@@ -369,6 +401,7 @@ def fit(args):
             "max_seq_len": args.max_seq_len,
             "skip_first": args.skip_first,
             "dim_batch": args.dim_batch,
+            "rules": args.rules,  # 'gradient' = J-lens, 'lrp' = R-lens
         }
         os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
         torch.save(
