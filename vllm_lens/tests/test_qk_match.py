@@ -188,11 +188,23 @@ class TestMLARefusal:
     def test_install_qk_hooks_rejects_mla(self):
         from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 
+        # A one-layer fake model whose decoder layer holds an MLA module;
+        # discovery goes through the registry, so register it there too.
+        mla = object.__new__(MLAAttention)
+        layer = torch.nn.Module()
+        layer.self_attn = torch.nn.Module()
+        layer.self_attn.attn = mla
+        model = torch.nn.Module()
+        model.model = torch.nn.Module()
+        model.model.layers = torch.nn.ModuleList([layer])
         worker = HiddenStatesExtension()
         worker.compilation_config = SimpleNamespace(  # type: ignore[attr-defined]
-            static_forward_context={
-                "model.layers.0.self_attn.attn": object.__new__(MLAAttention)
-            }
+            static_forward_context={"model.layers.0.self_attn.attn": mla}
         )
+        worker.model_runner = SimpleNamespace(model=model)  # type: ignore[attr-defined]
+        worker.model_config = SimpleNamespace(  # type: ignore[attr-defined]
+            get_total_num_hidden_layers=lambda: 1, get_num_layers=lambda _pc: 1
+        )
+        worker.parallel_config = SimpleNamespace()  # type: ignore[attr-defined]
         with pytest.raises(RuntimeError, match="MLA"):
             worker.install_qk_hooks()
