@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import pickle
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -52,111 +53,175 @@ def _dtype_to_idx(dtype: torch.dtype) -> int:
 _ZSTD_COMPRESSOR = zstd.ZstdCompressor(level=1)
 
 
-def _discover_layer_modules(worker: Any) -> dict[int, torch.nn.Module] | None:
-    """Map global decoder-layer index → decoder-layer module on this rank.
+_LAYER_PATH_ENV = "VLLM_LENS_LAYER_PATH"
 
-    Uses vLLM's ``static_forward_context`` registry: every attention-like
-    layer (``AttentionLayerBase`` — standard attention, MLA, Mamba-style
-    mixers, …) registers itself there at construction time under its full
-    module prefix (e.g. ``model.layers.7.self_attn.attn``).  The decoder
-    layer is the prefix truncated at its first integer segment, which is a
-    *global* layer index even under pipeline parallelism (non-owned layers
-    never construct, so they never register).
 
-    Returns ``None`` when the registry is unavailable or yields an
-    incoherent mapping; callers fall back to ``_get_layers``.
+class LayerDiscoveryError(RuntimeError):
+    """vllm-lens could not locate the model's decoder layers."""
+
+
+def _decoder_mixer_types() -> tuple[type, ...]:
+    """Registry classes that live inside a decoder block.
+
+    Only these are treated as decoder-layer markers.  Anything else that
+    registers in ``static_forward_context`` (``FusedMoE``, multimodal
+    encoder attention, ``CacheOnlyAttentionLayer`` KV-cache dummies,
+    DeepSeek-V3.2 indexer caches, future unknowns) is ignored rather than
+    guessed at, so a new vLLM layer type can't silently masquerade as a
+    decoder layer.
     """
+    types: list[type] = []
+    from vllm.model_executor.layers.attention import Attention, MLAAttention
+
+    types += [Attention, MLAAttention]
     try:
-        from vllm.model_executor.layers.attention_layer_base import (
-            AttentionLayerBase,
-        )
-    except ImportError:
-        return None
+        from vllm.model_executor.layers.mamba.abstract import MambaBase
 
-    registry = getattr(
-        getattr(worker, "compilation_config", None), "static_forward_context", None
-    )
-    if not registry:
-        return None
+        types.append(MambaBase)
+    except ImportError:  # pragma: no cover - older vLLM without Mamba
+        pass
+    return tuple(types)
 
-    model = worker.model_runner.model
+
+def _is_decoder_mixer(module: Any, mixer_types: tuple[type, ...]) -> bool:
+    if not isinstance(module, mixer_types):
+        return False
+    # Encoder / cross-attention is not part of the decoder residual
+    # stream.  Only ``Attention`` carries ``attn_type``; MLA and Mamba
+    # mixers are decoder-only by construction.
+    attn_type = getattr(module, "attn_type", None)
+    return attn_type is None or str(attn_type) == "decoder"
+
+
+def _layers_from_registry(
+    model: torch.nn.Module, registry: dict[str, Any]
+) -> dict[int, torch.nn.Module]:
+    """Map global decoder-layer index → module via ``static_forward_context``.
+
+    Every attention-like layer registers there at construction under its
+    full module prefix (e.g. ``model.layers.7.self_attn.attn``).  The
+    decoder layer is the prefix truncated at its first integer segment,
+    which is a *global* index even under pipeline parallelism (non-owned
+    layers never construct, so they never register).
+    """
+    mixer_types = _decoder_mixer_types()
     layer_map: dict[int, torch.nn.Module] = {}
     for prefix, module in registry.items():
-        # FusedMoE and multimodal-encoder layers also register here.
-        if not isinstance(module, AttentionLayerBase):
-            continue
-        # Encoder / cross-attention is not part of the decoder residual
-        # stream.  Mamba-style mixers carry no attn_type and are kept so
-        # hybrid models still get every decoder layer hooked.
-        if getattr(module, "attn_type", "decoder") != "decoder":
+        if not _is_decoder_mixer(module, mixer_types):
             continue
         segments = prefix.split(".")
         idx_pos = next((i for i, seg in enumerate(segments) if seg.isdigit()), None)
         if idx_pos is None:
-            logger.warning(
-                "Registered layer %r has no integer layer index in its prefix; "
-                "falling back to attribute-path layer discovery.",
-                prefix,
+            raise LayerDiscoveryError(
+                f"Registered layer {prefix!r} has no integer layer index in its "
+                f"module path, so its decoder layer cannot be inferred."
             )
-            return None
         layer_idx = int(segments[idx_pos])
         parent_path = ".".join(segments[: idx_pos + 1])
         try:
             layer = model.get_submodule(parent_path)
-        except AttributeError:
-            logger.warning(
-                "Could not resolve decoder layer %r from registered layer %r; "
-                "falling back to attribute-path layer discovery.",
-                parent_path,
-                prefix,
-            )
-            return None
+        except AttributeError as e:
+            raise LayerDiscoveryError(
+                f"Could not resolve decoder layer {parent_path!r} (from registered "
+                f"layer {prefix!r}) on {type(model).__name__}."
+            ) from e
         existing = layer_map.get(layer_idx)
         if existing is not None and existing is not layer:
-            logger.warning(
-                "Layer index %d resolves to two different modules (%r); "
-                "falling back to attribute-path layer discovery.",
-                layer_idx,
-                prefix,
+            raise LayerDiscoveryError(
+                f"Layer index {layer_idx} resolves to two different modules "
+                f"({prefix!r} vs an earlier registry entry)."
             )
-            return None
         layer_map[layer_idx] = layer
+    return layer_map
 
-    return layer_map or None
+
+def _layers_from_path_template(
+    model: torch.nn.Module, template: str, total_layers: int
+) -> dict[int, torch.nn.Module]:
+    """Map layer index → module from a user-supplied path template.
+
+    ``template`` is a dotted ``get_submodule`` path containing ``{i}``,
+    e.g. ``"model.blocks.{i}"``.  Every index in ``range(total_layers)``
+    must resolve; layers that resolve to ``PPMissingLayer`` belong to
+    another pipeline stage and are skipped.
+    """
+    if "{i}" not in template:
+        raise LayerDiscoveryError(
+            f"{_LAYER_PATH_ENV}={template!r} must contain a '{{i}}' placeholder "
+            f"for the layer index, e.g. 'model.layers.{{i}}'."
+        )
+    layer_map: dict[int, torch.nn.Module] = {}
+    for i in range(total_layers):
+        path = template.format(i=i)
+        try:
+            layer = model.get_submodule(path)
+        except AttributeError as e:
+            raise LayerDiscoveryError(
+                f"{_LAYER_PATH_ENV}={template!r}: {path!r} does not exist on "
+                f"{type(model).__name__}."
+            ) from e
+        if isinstance(layer, PPMissingLayer):
+            continue
+        layer_map[i] = layer
+    return layer_map
+
+
+def _discover_layer_modules(worker: Any) -> dict[int, torch.nn.Module]:
+    """Map global decoder-layer index → decoder-layer module on this rank.
+
+    Resolution order:
+
+    1. ``VLLM_LENS_LAYER_PATH`` (a ``get_submodule`` path template such as
+       ``"model.layers.{i}"``), if set — used exclusively.
+    2. vLLM's ``static_forward_context`` registry (see
+       :func:`_layers_from_registry`).
+
+    The result is checked against the config's ``num_hidden_layers`` —
+    every index must be in range and this rank must own exactly the
+    layers pipeline parallelism assigns it.  Any failure raises
+    :class:`LayerDiscoveryError` naming the fix; there is deliberately no
+    silent fallback, since a wrong layer map yields wrong activations.
+    """
+    model = worker.model_runner.model
+    total = _get_total_num_layers(worker)
+    expected_local = int(worker.model_config.get_num_layers(worker.parallel_config))
+
+    template = os.environ.get(_LAYER_PATH_ENV, "").strip()
+    if template:
+        layer_map = _layers_from_path_template(model, template, total)
+        source = f"{_LAYER_PATH_ENV}={template!r}"
+    else:
+        registry = getattr(
+            getattr(worker, "compilation_config", None), "static_forward_context", None
+        )
+        if not registry:
+            raise LayerDiscoveryError(
+                f"vLLM's static_forward_context registry is empty on "
+                f"{type(model).__name__}; cannot discover decoder layers. "
+                f"Set {_LAYER_PATH_ENV} (e.g. 'model.layers.{{i}}') to override."
+            )
+        layer_map = _layers_from_registry(model, registry)
+        source = "static_forward_context registry"
+
+    found = sorted(layer_map)
+    out_of_range = [i for i in found if i < 0 or i >= total]
+    if out_of_range or len(found) != expected_local:
+        raise LayerDiscoveryError(
+            f"Decoder-layer discovery via {source} found {len(found)} layer(s) "
+            f"on this rank (indices {found}), but the model config declares "
+            f"num_hidden_layers={total} with {expected_local} layer(s) on this "
+            f"pipeline stage"
+            + (f"; indices out of range: {out_of_range}" if out_of_range else "")
+            + f". Set {_LAYER_PATH_ENV} to a get_submodule path template "
+            f"(e.g. 'model.layers.{{i}}') to specify the decoder layers manually."
+        )
+    logger.info("vllm-lens: discovered %d decoder layer(s) via %s", len(found), source)
+    return layer_map
 
 
 def _get_total_num_layers(worker: Any) -> int:
-    """Total decoder layers across all PP ranks, for layer-index validation."""
-    try:
-        return int(worker.model_config.get_total_num_hidden_layers())
-    except Exception:
-        return len(_get_layers(worker.model_runner.model))
-
-
-def _get_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
-    """Find the transformer decoder layers by attribute-path traversal.
-
-    Fallback for when the ``static_forward_context`` registry is
-    unavailable (see ``_discover_layer_modules``).
-    """
-    # Module.__getattr__ returns Tensor | Module, so pyright can't narrow
-    # through chained attribute access.  Use Any for duck-typed traversal.
-    m: Any = model
-    if hasattr(m, "language_model") and hasattr(m.language_model, "model"):
-        return m.language_model.model.layers
-    if (
-        hasattr(m, "model")
-        and hasattr(m.model, "decoder")
-        and hasattr(m.model.decoder, "layers")
-    ):
-        return m.model.decoder.layers
-    if hasattr(m, "model") and hasattr(m.model, "layers"):
-        return m.model.layers
-    raise AttributeError(
-        f"Cannot find decoder layers on {type(model).__name__}. "
-        "Expected model.language_model.model.layers, "
-        "model.model.decoder.layers, or model.model.layers"
-    )
+    """Total decoder layers across all PP ranks (from the HF config)."""
+    return int(worker.model_config.get_total_num_hidden_layers())
 
 
 def _find_steering_configs(
@@ -787,13 +852,6 @@ class HiddenStatesExtension:
         # Hooks must be installed on ALL ranks so steering vectors are
         # applied everywhere (not just rank 0).
         layer_map = _discover_layer_modules(self)
-        if layer_map is None:
-            layers = _get_layers(self.model_runner.model)
-            layer_map = {
-                layer_idx: layer
-                for layer_idx, layer in enumerate(layers)
-                if not isinstance(layer, PPMissingLayer)
-            }
         for layer_idx, layer in sorted(layer_map.items()):
             layer.register_forward_pre_hook(_make_pre_hook(self, layer_idx))
             layer.register_forward_hook(_make_hook(self, layer_idx))
@@ -944,8 +1002,8 @@ class HiddenStatesExtension:
         return len(self._captured_states)
 
     def _debug_layer_discovery(self) -> list[int]:
-        """Global indices of decoder layers found via the registry (testing)."""
-        return sorted((_discover_layer_modules(self) or {}).keys())
+        """Global indices of decoder layers found by discovery (testing)."""
+        return sorted(_discover_layer_modules(self))
 
     # ------------------------------------------------------------------
     # Hook data management (called via collective_rpc)

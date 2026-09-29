@@ -55,3 +55,37 @@ def test_registry_discovery_and_capture(hf_model):
         del llm
         gc.collect()
         torch.cuda.empty_cache()
+
+
+def test_layer_path_override(monkeypatch):
+    """``VLLM_LENS_LAYER_PATH`` bypasses the registry and finds the same layers.
+
+    Workers inherit the environment from the launching process, so setting
+    the variable before constructing ``LLM`` is sufficient.
+    """
+    monkeypatch.setenv("VLLM_LENS_LAYER_PATH", "model.layers.{i}")
+    llm = LLM(
+        model=MODEL_NAME,
+        dtype="auto",
+        gpu_memory_utilization=0.3,
+    )
+    try:
+        per_rank = llm.collective_rpc("_debug_layer_discovery")
+        assert per_rank, "no ranks responded"
+        for indices in per_rank:
+            assert indices == list(range(NUM_LAYERS)), (
+                f"path-template discovery returned {indices}"
+            )
+        # Hooks installed from the override path still capture.
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            extra_args={"output_residual_stream": [LAYER_IDX]},
+        )
+        outputs = llm.generate([PROMPT], sampling_params)
+        stream = outputs[0].activations["residual_stream"]  # type: ignore[attr-defined]
+        assert stream.shape[0] == 1 and stream.shape[-1] > 0
+    finally:
+        del llm
+        gc.collect()
+        torch.cuda.empty_cache()

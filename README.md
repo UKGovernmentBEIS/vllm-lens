@@ -59,6 +59,16 @@ vllm-lens auto-loads in **every** vLLM process (via the `vllm.general_plugins` e
 VLLM_LENS_DISABLE=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
 ```
 
+## Layer discovery
+
+vllm-lens finds the decoder layers to hook via vLLM's attention-layer registry (`static_forward_context`), which covers standard attention, MLA (DeepSeek/GLM-5), and Mamba/linear-attention hybrids without per-architecture code. The discovered layers are checked against the config's `num_hidden_layers`; on any mismatch the first request that needs hooks fails with a `LayerDiscoveryError` rather than silently hooking the wrong modules. If that happens on a model with an unusual layout, point vllm-lens at the layers directly with a `get_submodule` path template containing `{i}` for the layer index:
+
+```bash
+VLLM_LENS_LAYER_PATH="model.layers.{i}" vllm serve my-org/unusual-model
+```
+
+The template is used exclusively when set (no auto-discovery), and every index in `range(num_hidden_layers)` must resolve.
+
 ## Examples
 
 Runnable examples live in [`examples/`](examples/) — each is standalone; run any
