@@ -67,6 +67,42 @@ def test_store_newest_is_never_evicted_by_its_own_insert() -> None:
     assert store.get(handle) == (b"payload-bigger-than-cap", {})
 
 
+def test_store_put_many_is_atomic_per_batch() -> None:
+    """A multi-tensor response never evicts its own earlier tensors."""
+    store = ActivationStore(max_bytes=10)
+    h_old = store.put(b"oooo", {})
+    h1, h2, h3 = store.put_many([(b"aaaaa", {}), (b"bbbbb", {}), (b"ccccc", {})])
+    # Batch alone (15 bytes) exceeds the cap: the older entry goes, the whole
+    # batch stays.
+    assert store.get(h_old) is None
+    assert [store.get(h) is not None for h in (h1, h2, h3)] == [True, True, True]
+    assert store.total_bytes == 15
+
+
+def test_store_put_many_batch_is_evicted_by_later_captures() -> None:
+    store = ActivationStore(max_bytes=10)
+    h1, h2 = store.put_many([(b"aaaaa", {}), (b"bbbbb", {})])
+    h3 = store.put(b"ccccc", {})  # 15 > 10 → evict oldest (h1) only
+    assert store.get(h1) is None
+    assert store.get(h2) is not None and store.get(h3) is not None
+
+
+def test_serialize_activations_binary_uses_single_batch() -> None:
+    store = ActivationStore(max_bytes=1)  # every tensor alone exceeds the cap
+    acts = {
+        "attn_q": torch.randn(4, 8),
+        "attn_k": torch.randn(4, 8),
+        "residual_stream": torch.randn(2, 4, 8),
+    }
+    desc = serialize_activations_binary(acts, store)
+    # All three handles must still be live — per-tensor puts would have
+    # evicted the first two.
+    for name, t in acts.items():
+        got = store.get(desc[name]["handle"])
+        assert got is not None, f"{name} was evicted by its sibling insert"
+        assert torch.equal(tensor_from_bytes(got[0], got[1]), t)
+
+
 def test_store_handles_are_unique_and_high_entropy() -> None:
     store = ActivationStore()
     handles = {store.put(b"x", {}) for _ in range(64)}

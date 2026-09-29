@@ -119,7 +119,7 @@ out = client.generate(
 print(out.activations["residual_stream"].shape)  # decoded transparently
 ```
 
-The completion JSON then carries only an unguessable handle plus the dtype/shape metadata; the client fetches the raw zstd bytes from `GET /v1/activations/{handle}` as `application/octet-stream`. The server-side buffer is bounded (`VLLM_LENS_ACT_MAX_BYTES`, default 8 GiB) and per-entry TTL'd (`VLLM_LENS_ACT_TTL_S`, default 300 s). It is process-local, so behind a load balancer either pin activation fetches to the replica that produced the completion (sticky routing) or keep the default base64 transport.
+The completion JSON then carries only an unguessable handle plus the dtype/shape metadata; the client fetches the raw zstd bytes from `GET /v1/activations/{handle}` as `application/octet-stream`. The server-side buffer is bounded (`VLLM_LENS_ACT_MAX_BYTES`, default 8 GiB) and per-entry TTL'd (`VLLM_LENS_ACT_TTL_S`, default 300 s). It is process-local, so behind a load balancer either pin activation fetches to the replica that produced the completion (sticky routing) or keep the default base64 transport. The same applies within one replica to vLLM's `--api-server-count N` (multiple frontend processes behind one port): a handle is only valid on the frontend that minted it, so use `--api-server-count=1` with binary transport (the plugin logs a warning otherwise).
 
 ### Steering vectors
 

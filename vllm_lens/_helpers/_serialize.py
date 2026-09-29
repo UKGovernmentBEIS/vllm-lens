@@ -134,8 +134,24 @@ def serialize_tensor_binary(
 def serialize_activations_binary(
     tensor_dict: dict[str, Any], store: ActivationStore
 ) -> dict[str, Any]:
-    """Binary-transport counterpart of :func:`serialize_activations`."""
-    return {name: serialize_tensor_binary(t, store) for name, t in tensor_dict.items()}
+    """Binary-transport counterpart of :func:`serialize_activations`.
+
+    All tensors of one response are stored in a single atomic
+    :meth:`ActivationStore.put_many`, so a later tensor's insert can never
+    evict an earlier one's handle before the client has fetched it.
+    """
+    names = list(tensor_dict)
+    encoded = [_encode_tensor(tensor_dict[n]) for n in names]
+    handles = store.put_many(encoded)
+    return {
+        name: {
+            "handle": handle,
+            "nbytes": len(compressed),
+            "transport": "binary",
+            **meta,
+        }
+        for name, handle, (compressed, meta) in zip(names, handles, encoded)
+    }
 
 
 def decode_activations(

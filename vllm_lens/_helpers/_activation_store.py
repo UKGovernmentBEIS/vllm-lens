@@ -36,7 +36,7 @@ import secrets
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -77,20 +77,37 @@ class ActivationStore:
 
     def put(self, payload: bytes, meta: dict[str, Any]) -> str:
         """Store ``payload`` under a fresh handle and return the handle."""
+        return self.put_many([(payload, meta)])[0]
+
+    def put_many(self, items: Sequence[tuple[bytes, dict[str, Any]]]) -> list[str]:
+        """Store several payloads atomically; return their handles in order.
+
+        All of one response's tensors go in under a single sweep/evict pass
+        and none of them can be evicted by that pass — so a multi-tensor
+        capture (e.g. ``attn_q`` + ``attn_k`` + ``residual_stream``) is
+        either fully retrievable or, if the store is later over cap, evicted
+        oldest-first as a unit relative to other captures.
+        """
         now = self._clock()
-        entry = _Entry(
-            payload=payload,
-            meta=dict(meta),
-            expires_at=now + self._ttl_s,
-            nbytes=len(payload),
-        )
-        handle = secrets.token_urlsafe(_HANDLE_NBYTES)
+        entries = [
+            (
+                secrets.token_urlsafe(_HANDLE_NBYTES),
+                _Entry(
+                    payload=payload,
+                    meta=dict(meta),
+                    expires_at=now + self._ttl_s,
+                    nbytes=len(payload),
+                ),
+            )
+            for payload, meta in items
+        ]
         with self._lock:
             self._drop_expired_locked(now)
-            self._entries[handle] = entry
-            self._total_bytes += entry.nbytes
-            self._evict_to_fit_locked()
-        return handle
+            for handle, entry in entries:
+                self._entries[handle] = entry
+                self._total_bytes += entry.nbytes
+            self._evict_to_fit_locked(protect=len(entries))
+        return [handle for handle, _ in entries]
 
     def get(self, handle: str) -> tuple[bytes, dict[str, Any]] | None:
         """Return ``(payload, meta)`` for a live handle, else ``None``.
@@ -130,18 +147,18 @@ class ActivationStore:
         for h in expired:
             self._remove_locked(h)
 
-    def _evict_to_fit_locked(self) -> None:
+    def _evict_to_fit_locked(self, *, protect: int = 1) -> None:
         # Oldest-first on either the byte cap or the entry-count cap, but never
-        # evict the entry we just added: the ``len > 1`` guard keeps the most
-        # recent capture retrievable even if it alone exceeds ``max_bytes`` (a
-        # single all-layer capture can be large — rejecting it would defeat the
-        # feature). Peak retained memory is therefore
-        # ``max_bytes + largest_single_payload``; the count cap bounds per-entry
-        # object/metadata overhead independently.
+        # evict the ``protect`` newest entries (the batch just added): this
+        # keeps the most recent capture retrievable even if it alone exceeds
+        # ``max_bytes`` (a single all-layer capture can be large — rejecting
+        # it would defeat the feature). Peak retained memory is therefore
+        # ``max_bytes + largest_single_capture``; the count cap bounds
+        # per-entry object/metadata overhead independently.
         while (
             self._total_bytes > self._max_bytes
             or len(self._entries) > self._max_entries
-        ) and len(self._entries) > 1:
+        ) and len(self._entries) > protect:
             oldest, _ = next(iter(self._entries.items()))
             self._remove_locked(oldest)
 

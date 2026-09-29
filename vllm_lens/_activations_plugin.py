@@ -303,7 +303,10 @@ async def _patched_generate(
     wants_activations = extra.get("output_residual_stream") is not None
     # Response-transport negotiation (issue #31): "binary" parks activation
     # bytes in the process-local store and returns a handle instead of base64.
-    activations_transport = extra.get("activations_transport")
+    # Popped so it doesn't ride along to the workers with the SamplingParams.
+    activations_transport = extra.pop("activations_transport", None)
+    if activations_transport == "binary":
+        _warn_if_multi_api_server(self)
     # Extract steering data and remove from extra_args before vLLM
     # serialises the SamplingParams (tensors don't survive msgspec).
     # When arriving via the OpenAI API (vllm_xargs), complex values
@@ -569,6 +572,35 @@ def _patched_llm_chat(
 # ---------------------------------------------------------------------------
 # Response builder patches for vllm serve (OpenAI-compatible API)
 # ---------------------------------------------------------------------------
+
+
+_multi_api_server_warned = False
+
+
+def _warn_if_multi_api_server(engine: Any) -> None:
+    """Warn once if binary transport is used with ``--api-server-count > 1``.
+
+    The activation store is per API-server process, so a handle minted by one
+    frontend 404s when the follow-up ``GET`` lands on another.
+    """
+    global _multi_api_server_warned
+    if _multi_api_server_warned:
+        return
+    _multi_api_server_warned = True
+    count = getattr(
+        getattr(getattr(engine, "vllm_config", None), "parallel_config", None),
+        "_api_process_count",
+        1,
+    )
+    if count and count > 1:
+        logger.warning(
+            "activations_transport='binary' with --api-server-count=%d: the "
+            "activation store is per API-server process, so GET "
+            "/v1/activations/{handle} will 404 unless it reaches the same "
+            "process that served the completion. Use --api-server-count=1 or "
+            "the default base64 transport.",
+            count,
+        )
 
 
 def _serialize_activations_for(obj: Any) -> dict[str, Any] | None:
