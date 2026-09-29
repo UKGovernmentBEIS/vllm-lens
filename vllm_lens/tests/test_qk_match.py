@@ -191,6 +191,7 @@ class TestMLARefusal:
         # A one-layer fake model whose decoder layer holds an MLA module;
         # discovery goes through the registry, so register it there too.
         mla = object.__new__(MLAAttention)
+        torch.nn.Module.__init__(mla)  # skip MLAAttention.__init__, keep Module state
         layer = torch.nn.Module()
         layer.self_attn = torch.nn.Module()
         layer.self_attn.attn = mla
