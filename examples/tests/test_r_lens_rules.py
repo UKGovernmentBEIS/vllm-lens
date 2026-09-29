@@ -94,6 +94,7 @@ def _patched_norm(norm: _RMSNorm) -> _RMSNorm:
 def _patched_mlp(mlp: _MLP, kind: str) -> _MLP:
     mlp = copy.deepcopy(mlp)
     mlp._lrp_act_kind = kind
+    mlp._lrp_orig_forward = mlp.forward
     mlp.forward = lrp_gated_mlp_forward.__get__(mlp)
     return mlp
 
@@ -385,3 +386,60 @@ def test_forward_hooks_still_fire_on_patched_module():
     layer.mlp.register_forward_hook(lambda m, i, o: seen.append(o))
     out = layer.mlp(torch.randn(2, D))
     assert len(seen) == 1 and torch.equal(seen[0], out)
+
+
+# --- (f) structural parity check -----------------------------------------------
+
+
+class _ScaledMLP(_MLP):
+    """Passes the attribute check but computes a different function."""
+
+    def forward(self, x, routed_experts=None):
+        return 0.5 * super().forward(x)
+
+
+class _OffsetNorm(_RMSNorm):
+    """Gemma-style ``(1 + weight)`` norm — same attributes, different function."""
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hs = hidden_states.to(torch.float32)
+        hs = hs * torch.rsqrt(hs.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
+        return (1.0 + self.weight) * hs.to(input_dtype)
+
+
+def test_parity_check_rejects_mlp_with_extra_logic():
+    torch.manual_seed(7)
+    layer = _DecoderLayer()
+    layer.mlp = _randomize(_ScaledMLP())
+    install_lrp_rules([layer])
+    with pytest.raises(RuntimeError, match="does not match the structure"):
+        layer.mlp(torch.randn(2, 3, D))
+
+
+def test_parity_check_rejects_offset_norm():
+    torch.manual_seed(8)
+    layer = _DecoderLayer()
+    layer.input_layernorm = _randomize(_OffsetNorm(D))
+    install_lrp_rules([layer])
+    with pytest.raises(RuntimeError, match="does not match the structure"):
+        layer.input_layernorm(torch.randn(2, 3, D))
+
+
+def test_parity_check_passes_and_runs_once():
+    torch.manual_seed(9)
+    layer = _randomize(_DecoderLayer())
+    install_lrp_rules([layer])
+    calls = {"n": 0}
+    orig = layer.mlp._lrp_orig_forward
+
+    def counting(x, routed_experts=None):
+        calls["n"] += 1
+        return orig(x)
+
+    layer.mlp._lrp_orig_forward = counting
+    x = torch.randn(2, 3, D)
+    layer.mlp(x)
+    layer.mlp(x)
+    assert layer.mlp._lrp_parity_checked is True
+    assert calls["n"] == 1, "reference forward should run only on the first call"

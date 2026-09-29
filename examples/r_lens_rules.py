@@ -57,6 +57,41 @@ def _exact_value(true_value: torch.Tensor, surrogate: torch.Tensor) -> torch.Ten
     return true_value.detach() + (surrogate - surrogate.detach())
 
 
+# Structural parity check tolerance (relative to the output's max magnitude).
+# Both sides are computed with the module's own kernels, so genuine matches are
+# at or near bitwise; anything past bf16 rounding means the module computes a
+# different function from the one the surrogate linearizes.
+_PARITY_RTOL = 1e-2
+
+
+def _check_same_function(
+    module: nn.Module, ours: torch.Tensor, ref: torch.Tensor, what: str
+) -> None:
+    """Once per instance: assert the surrogate's structure matches the module.
+
+    ``_exact_value`` guarantees the *forward* is the original module's value
+    regardless, but the *backward* is the surrogate's — so if the module's
+    real forward is not the function the surrogate re-expresses (an extra
+    scale, a ``(1 + weight)`` norm, a bias path, ...), the fit would run with
+    silently wrong gradients. Compare the surrogate-structured value against
+    the module's own forward on the first call and fail loudly on mismatch.
+    """
+    if getattr(module, "_lrp_parity_checked", False):
+        return
+    ours32, ref32 = ours.detach().float(), ref.detach().float()
+    scale = ref32.abs().max().clamp_min(1e-6)
+    err = (ours32 - ref32).abs().max() / scale
+    if not torch.isfinite(err) or err > _PARITY_RTOL:
+        raise RuntimeError(
+            f"R-lens: {type(module).__name__}.{what} does not match the structure "
+            f"the LRP surrogate assumes (max rel. diff {err.item():.3e} > "
+            f"{_PARITY_RTOL}). The module computes a different function from "
+            "the one the rules linearize, so its backward would be wrong. "
+            "Add explicit support for this module type in r_lens_rules.py."
+        )
+    module._lrp_parity_checked = True
+
+
 def lrp_rmsnorm_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
     """RMSNorm forward with the LN-rule installed (LRP).
 
@@ -72,6 +107,7 @@ def lrp_rmsnorm_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
     surrogate = self.weight * hs.to(input_dtype)
     with torch.no_grad():
         true_value = self._lrp_orig_forward(hidden_states)
+    _check_same_function(self, surrogate, true_value, "forward")
     return _exact_value(true_value, surrogate)
 
 
@@ -132,7 +168,12 @@ def lrp_gated_mlp_forward(self, x: torch.Tensor, routed_experts=None) -> torch.T
     surrogate = 0.5 * (a * u.detach() + a.detach() * u)
     with torch.no_grad():
         true_h = self.gate_act_fn(g) * u
-    return self.down_proj(_exact_value(true_h, surrogate))
+    out = self.down_proj(_exact_value(true_h, surrogate))
+    if not getattr(self, "_lrp_parity_checked", False):
+        with torch.no_grad():
+            ref = self._lrp_orig_forward(x)
+        _check_same_function(self, out, ref, "forward")
+    return out
 
 
 def _check_unpatched(module: nn.Module) -> None:
@@ -153,6 +194,10 @@ def install_lrp_rules(decoder_layers) -> int:
 
     Every target is validated before anything is bound, so a failure (MoE
     layer, unsupported activation, double install) leaves the model unpatched.
+    Structure is verified on each module's *first forward* (parameters may not
+    be materialized at install time under FSDP): the surrogate's value must
+    match the module's own forward, else ``RuntimeError`` — see
+    :func:`_check_same_function`.
     """
     norms: list[nn.Module] = []
     mlps: list[tuple[nn.Module, str]] = []
@@ -180,5 +225,6 @@ def install_lrp_rules(decoder_layers) -> int:
         norm.forward = types.MethodType(lrp_rmsnorm_forward, norm)
     for mlp, kind in mlps:
         mlp._lrp_act_kind = kind
+        mlp._lrp_orig_forward = mlp.forward
         mlp.forward = types.MethodType(lrp_gated_mlp_forward, mlp)
     return len(norms) + len(mlps)
