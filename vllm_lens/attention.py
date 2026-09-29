@@ -82,9 +82,8 @@ def compute_attention_weights(
         raise ValueError(
             f"num_heads ({num_heads}) not divisible by num_kv_heads ({num_kv_heads})"
         )
-    if q_start is None:
-        q_start = kv_len - q_len
-    if q_start < 0:
+    start: int = kv_len - q_len if q_start is None else q_start
+    if start < 0:
         raise ValueError(f"q_len ({q_len}) exceeds kv_len ({kv_len})")
 
     qf = q.to(dtype)
@@ -98,7 +97,7 @@ def compute_attention_weights(
         logits = logits_soft_cap * torch.tanh(logits / logits_soft_cap)
 
     # Relative distance (key position j) - (absolute query position i).
-    q_pos = torch.arange(q_start, q_start + q_len, device=logits.device)
+    q_pos = torch.arange(start, start + q_len, device=logits.device)
     k_pos = torch.arange(kv_len, device=logits.device)
     rel = k_pos.unsqueeze(0) - q_pos.unsqueeze(1)  # (q_len, kv_len)
 

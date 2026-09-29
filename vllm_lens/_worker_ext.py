@@ -772,6 +772,22 @@ def _make_pre_hook(extension: HiddenStatesExtension, layer_idx: int) -> Callable
     return hook
 
 
+def _warn_qk_skipped(extension: HiddenStatesExtension, reason: str) -> None:
+    """Log once per worker when Q/K capture has to bail out of a forward.
+
+    The hook otherwise returns silently and the client only sees a missing
+    ``qk_layers`` key, which points at the wrong cause.
+    """
+    if extension._qk_skip_warned:
+        return
+    extension._qk_skip_warned = True
+    logger.warning(
+        "vllm-lens: output_qk capture skipped a forward pass (%s); attention "
+        "Q/K for this request may be incomplete or missing.",
+        reason,
+    )
+
+
 def _qk_hook_inner(
     extension: HiddenStatesExtension,
     layer_idx: int,
@@ -801,12 +817,11 @@ def _qk_hook_inner(
 
     ctx = get_forward_context()
     attn_metadata = ctx.attn_metadata
-    if attn_metadata is None:
-        return
     if isinstance(attn_metadata, list):
-        attn_metadata = attn_metadata[0]
-        if attn_metadata is None:
-            return
+        attn_metadata = attn_metadata[0] if attn_metadata else None
+    if attn_metadata is None:
+        _warn_qk_skipped(extension, "forward context carries no attn_metadata")
+        return
     # attn_metadata is keyed by layer name — prefer this layer's own entry,
     # falling back to the first entry with query_start_loc (hybrid models).
     query_start_loc: torch.Tensor | None = None
@@ -822,6 +837,7 @@ def _qk_hook_inner(
     else:
         query_start_loc = getattr(attn_metadata, "query_start_loc", None)
     if query_start_loc is None:
+        _warn_qk_skipped(extension, "attn_metadata has no query_start_loc")
         return
 
     req_ids = runner.input_batch.req_ids
@@ -966,6 +982,7 @@ class HiddenStatesExtension:
     # internal_req_id → { layer_idx → {"q": [tensor, ...], "k": [tensor, ...]} }
     _captured_qk: dict[str, dict[int, dict[str, list[torch.Tensor]]]] = {}
     _qk_hooks_installed: bool = False
+    _qk_skip_warned: bool = False
 
     # Per-layer kernel metadata recorded at install time, keyed by global
     # layer index (scale, sliding window, soft-cap, ... — see install_qk_hooks).
@@ -1205,9 +1222,9 @@ class HiddenStatesExtension:
                     "sees materialized per-head Q/K, so there is nothing to "
                     "capture. Residual-stream capture and steering still work."
                 )
-            if not isinstance(module, Attention):
-                continue
-            if getattr(module, "attn_type", "decoder") != "decoder":
+            # Same decoder filter as layer discovery, restricted to the
+            # softmax-attention wrapper (Mamba mixers have no Q/K).
+            if not _is_decoder_mixer(module, (Attention,)):
                 continue
             segments = prefix.split(".")
             idx_pos = next((i for i, seg in enumerate(segments) if seg.isdigit()), None)
