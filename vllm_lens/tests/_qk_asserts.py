@@ -29,6 +29,14 @@ MEAN_TV_MAX = 0.15
 ROW_TV_MAX = 0.6
 CONFIDENT_MARGIN = 0.05
 CONFIDENT_AGREE_MIN = 0.98
+# Absolute allowance on top of the ratio.  Single prompts have only ~60-100
+# confident rows, so one bf16 near-tie flip is already 1-1.6%.  Measured on
+# 8xH100 (FlashInfer) vs HF eager bf16, Qwen2.5-0.5B layer 2, the 10-prompt
+# batch: 8 flips / 819 confident rows (99.0%), every flip a row where vLLM's
+# top-2 differ by <= 0.08 and row TV <= 0.15 -- vs TV ~ 1 and near-total
+# argmax disagreement for a mis-attended layer, so this allowance costs no
+# detection power.
+CONFIDENT_FLIPS_ALLOWED = 2
 
 
 def row_total_variation(got: torch.Tensor, want: torch.Tensor) -> torch.Tensor:
@@ -63,8 +71,10 @@ def assert_attention_matches(
     confident = (top2[..., 0] - top2[..., 1]) > CONFIDENT_MARGIN
     if confident.sum().item() == 0:
         return
-    agree = (got.argmax(-1) == want.argmax(-1))[confident].float().mean().item()
-    assert agree >= CONFIDENT_AGREE_MIN, (
-        f"{label} argmax agreement on {int(confident.sum())} confident rows: "
-        f"{agree:.2%}"
+    n_conf = int(confident.sum())
+    flips = int((got.argmax(-1) != want.argmax(-1))[confident].sum())
+    agree = 1.0 - flips / n_conf
+    assert agree >= CONFIDENT_AGREE_MIN or flips <= CONFIDENT_FLIPS_ALLOWED, (
+        f"{label} argmax agreement on {n_conf} confident rows: {agree:.2%} "
+        f"({flips} flips)"
     )
