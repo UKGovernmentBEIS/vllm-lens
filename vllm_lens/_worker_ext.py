@@ -89,8 +89,10 @@ def _is_decoder_mixer(module: Any, mixer_types: tuple[type, ...]) -> bool:
     # Encoder / cross-attention is not part of the decoder residual
     # stream.  Only ``Attention`` carries ``attn_type``; MLA and Mamba
     # mixers are decoder-only by construction.
+    # ``attn_type`` is vLLM's ``AttentionType`` (a ``str`` Enum): compare by
+    # value — ``str()`` of a str-Enum member is its *name* on Python ≥3.11.
     attn_type = getattr(module, "attn_type", None)
-    return attn_type is None or str(attn_type) == "decoder"
+    return attn_type is None or attn_type == "decoder"
 
 
 def _layers_from_registry(

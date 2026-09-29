@@ -83,6 +83,21 @@ def test_mixer_allowlist_excludes_unknown_types():
     assert not _is_decoder_mixer(nn.Identity(), (_FakeMixer,))
 
 
+def test_mixer_allowlist_accepts_vllm_str_enum_attn_type():
+    """Real vLLM ``Attention`` carries an ``AttentionType`` str-Enum, whose
+    ``str()`` is the member *name* — the filter must compare by value."""
+    from vllm.v1.attention.backend import AttentionType
+
+    class _EnumMixer(nn.Module):
+        attn_type = AttentionType.DECODER
+
+    class _EnumEncoder(nn.Module):
+        attn_type = AttentionType.ENCODER
+
+    assert _is_decoder_mixer(_EnumMixer(), (_EnumMixer,))
+    assert not _is_decoder_mixer(_EnumEncoder(), (_EnumEncoder,))
+
+
 def test_mixer_allowlist_excludes_non_decoder_attn_type():
     assert not _is_decoder_mixer(_FakeEncoderMixer(), (_FakeEncoderMixer,))
 
