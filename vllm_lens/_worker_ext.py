@@ -1195,44 +1195,36 @@ class HiddenStatesExtension:
         if self._qk_hooks_installed:
             return
 
-        try:
-            from vllm.model_executor.layers.attention.attention import Attention
-            from vllm.model_executor.layers.attention.mla_attention import (
-                MLAAttention,
-            )
-        except ImportError as e:
-            raise RuntimeError(
-                "output_qk requires a vLLM version with the attention-layer "
-                f"registry (could not import Attention/MLAAttention: {e})"
-            ) from e
+        from vllm.model_executor.layers.attention import Attention, MLAAttention
 
-        registry = getattr(self.compilation_config, "static_forward_context", None)
-        if not registry:
-            raise RuntimeError(
-                "output_qk requires vLLM's static_forward_context registry, "
-                "which is empty — cannot locate attention layers."
-            )
-
+        # Reuse decoder-layer discovery (registry or VLLM_LENS_LAYER_PATH,
+        # count-checked) so Q/K layer indices are exactly the residual-stream
+        # ones, then locate the softmax-attention wrapper inside each layer.
+        # Layers without one (Mamba / linear-attention blocks in hybrids)
+        # are simply not hooked.
+        layer_map = _discover_layer_modules(self)
         selected: dict[int, Any] = {}
-        for prefix, module in registry.items():
-            if isinstance(module, MLAAttention):
+        for layer_idx, layer in layer_map.items():
+            attn_modules = [
+                m
+                for m in layer.modules()
+                if isinstance(m, (Attention, MLAAttention))
+                and _is_decoder_mixer(m, (Attention, MLAAttention))
+            ]
+            if any(isinstance(m, MLAAttention) for m in attn_modules):
                 raise RuntimeError(
                     "output_qk is not supported for MLA models (DeepSeek-style "
                     "multi-head latent attention): the Attention wrapper never "
                     "sees materialized per-head Q/K, so there is nothing to "
                     "capture. Residual-stream capture and steering still work."
                 )
-            # Same decoder filter as layer discovery, restricted to the
-            # softmax-attention wrapper (Mamba mixers have no Q/K).
-            if not _is_decoder_mixer(module, (Attention,)):
-                continue
-            segments = prefix.split(".")
-            idx_pos = next((i for i, seg in enumerate(segments) if seg.isdigit()), None)
-            if idx_pos is None:
+            if len(attn_modules) > 1:
                 raise RuntimeError(
-                    f"Cannot parse a layer index from attention layer {prefix!r}."
+                    f"Decoder layer {layer_idx} contains {len(attn_modules)} "
+                    "decoder Attention modules; output_qk expects exactly one."
                 )
-            selected[int(segments[idx_pos])] = module
+            if attn_modules:
+                selected[layer_idx] = attn_modules[0]
 
         if not selected:
             raise RuntimeError(
