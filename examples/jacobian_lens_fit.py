@@ -49,7 +49,8 @@ stop-gradients — the forward pass is unchanged — so the output format is
 identical and ``jacobian_lens.py`` / ``jacobian_lens_chat.py`` consume the
 lens as-is; ``provenance["rules"]`` records which backward was used. The lrp
 fit is somewhat slower per prompt (patched norms bypass fused kernels).
-Dense models only for now — MoE layers fail fast at startup.
+Dense models only for now — MoE checkpoints are rejected from the HF
+config before any weights load.
 """
 
 # Patch ring_flash_attn compat before torch imports (prime-rl requirement).
@@ -190,6 +191,17 @@ def fit(args):
     logger = setup_logger("info", tag="jacobian-lens-fit")
     logger.info(f"Starting Jacobian-lens fitter in {world}")
 
+    if args.rules == "lrp":
+        # R-lens supports dense models only.  Reject MoE from the HF config
+        # now rather than after setup_model has spent minutes materializing
+        # and converting a 100B+ checkpoint.
+        from transformers import AutoConfig
+
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from r_lens_rules import check_config_supports_lrp
+
+        check_config_supports_lrp(AutoConfig.from_pretrained(args.model))
+
     # --- Distributed + parallel-dims setup ---
     setup_torch_distributed(timeout=timedelta(seconds=600))
     torch.set_float32_matmul_precision("high")
@@ -244,7 +256,6 @@ def fit(args):
         # R-lens: stop-gradient-only LRP rules; forward values are unchanged.
         # The rules module lives next to this script (torchrun puts the script
         # dir on sys.path already; the insert covers other launchers).
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from r_lens_rules import install_lrp_rules
 
         n_patched = install_lrp_rules(layers)

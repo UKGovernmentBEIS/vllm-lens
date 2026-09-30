@@ -11,10 +11,12 @@ import copy
 import math
 
 import pytest
+from types import SimpleNamespace
 import torch
 from torch import nn
 
 from r_lens_rules import (
+    check_config_supports_lrp,
     _identity_rule_act,
     install_lrp_rules,
     lrp_gated_mlp_forward,
@@ -443,3 +445,29 @@ def test_parity_check_passes_and_runs_once():
     layer.mlp(x)
     assert layer.mlp._lrp_parity_checked is True
     assert calls["n"] == 1, "reference forward should run only on the first call"
+
+
+# --- (g) config-level MoE pre-check --------------------------------------------
+
+
+def test_config_precheck_accepts_dense():
+    check_config_supports_lrp({"architectures": ["Qwen3ForCausalLM"], "hidden_size": 8})
+    check_config_supports_lrp(SimpleNamespace(architectures=["LlamaForCausalLM"]))
+
+
+@pytest.mark.parametrize(
+    "key", ["num_experts", "num_local_experts", "n_routed_experts"]
+)
+def test_config_precheck_rejects_moe(key):
+    with pytest.raises(ValueError, match="mixture-of-experts"):
+        check_config_supports_lrp({"architectures": ["Glm4MoeForCausalLM"], key: 128})
+    with pytest.raises(ValueError, match="mixture-of-experts"):
+        check_config_supports_lrp(SimpleNamespace(architectures=["X"], **{key: 8}))
+
+
+def test_config_precheck_looks_inside_text_config():
+    cfg = SimpleNamespace(
+        text_config=SimpleNamespace(architectures=["Y"], num_experts=64)
+    )
+    with pytest.raises(ValueError, match="mixture-of-experts"):
+        check_config_supports_lrp(cfg)

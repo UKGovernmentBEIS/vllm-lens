@@ -176,6 +176,45 @@ def lrp_gated_mlp_forward(self, x: torch.Tensor, routed_experts=None) -> torch.T
     return out
 
 
+# HF config keys that mark a mixture-of-experts architecture (transformers'
+# naming varies: Mixtral/Qwen-MoE ``num_local_experts`` / ``num_experts``,
+# DeepSeek/GLM ``n_routed_experts``).
+_MOE_CONFIG_KEYS = ("num_experts", "num_local_experts", "n_routed_experts")
+
+
+def check_config_supports_lrp(config) -> None:
+    """Fail fast from the HF config, *before* any weights are materialized.
+
+    ``install_lrp_rules`` also rejects MoE layers, but it runs after
+    ``setup_model`` — for a 100B+ MoE that is 25+ minutes of loading and
+    weight conversion before the error appears.  Call this on
+    ``AutoConfig.from_pretrained(model)`` right after argument parsing.
+    Accepts a config object or a plain dict (nested ``text_config`` is
+    checked too, for multimodal wrappers).
+    """
+    cfgs = [config]
+    text = getattr(config, "text_config", None)
+    if text is None and isinstance(config, dict):
+        text = config.get("text_config")
+    if text is not None:
+        cfgs.append(text)
+    for cfg in cfgs:
+        for key in _MOE_CONFIG_KEYS:
+            n = cfg.get(key) if isinstance(cfg, dict) else getattr(cfg, key, None)
+            if n is not None and int(n) > 1:
+                arch = (
+                    cfg.get("architectures")
+                    if isinstance(cfg, dict)
+                    else getattr(cfg, "architectures", None)
+                ) or ["?"]
+                raise ValueError(
+                    f"{arch[0]} is a mixture-of-experts model ({key}={n}) — "
+                    "MoE models are not supported by the R-lens fit yet "
+                    "(dense gated MLPs only). Use --rules gradient, or a dense "
+                    "checkpoint."
+                )
+
+
 def _check_unpatched(module: nn.Module) -> None:
     if "forward" in module.__dict__:
         raise RuntimeError(
