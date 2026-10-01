@@ -39,7 +39,7 @@ def show_attention(
         temperature=0.0,
         capture_qk=[layer],
     )
-    weights = attention_patterns(output.activations, layer)
+    weights = attention_patterns(output.activations, layer=layer)
     num_heads, seq_len, _ = weights.shape
 
     # Token strings for display, via the served model's tokenizer.

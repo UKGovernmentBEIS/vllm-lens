@@ -143,20 +143,21 @@ from vllm import LLM, SamplingParams
 from vllm_lens.attention import attention_patterns
 
 llm = LLM("meta-llama/Llama-3.1-8B-Instruct")
-sp = SamplingParams(max_tokens=8, extra_args={"output_qk": [15]})  # or True for all layers
+layer = 15  # decoder-layer index to capture
+sp = SamplingParams(max_tokens=8, extra_args={"output_qk": [layer]})  # or True for all layers
 out = llm.generate(["Hello world"], sp)
 
-weights = attention_patterns(out[0].activations, 15)  # (num_heads, n_positions, n_positions)
+weights = attention_patterns(out[0].activations, layer=layer)  # (num_heads, n_positions, n_positions)
 ```
 
 Over HTTP, use the client's `capture_qk`:
 
 ```python
-out = client.generate("Hello world", capture_qk=[15])
-weights = attention_patterns(out.activations, 15)
+out = client.generate("Hello world", capture_qk=[layer])
+weights = attention_patterns(out.activations, layer=layer)
 ```
 
-The captured entries are `attn_q` (`n_layers, n_positions, num_heads, head_dim`), `attn_k` (same with KV heads), `qk_layers`, and `qk_meta` (the per-layer kernel parameters). Unlike the residual stream, Q/K are sharded by head under tensor parallelism, so **every** TP rank captures and the shards are concatenated along the head dimension at merge time; grouped-query attention, sliding windows, and Gemma-style soft-capping are handled from the shipped metadata. The reconstruction is exact up to floating-point rounding (roughly bf16 precision against HuggingFace's eager attention). MLA models (DeepSeek-style latent attention) are rejected with a clear error — their Q/K never exist in per-head form. Reconstructing a full pattern materializes an `(num_heads, n, n)` matrix client-side, so reconstruct per layer rather than all at once for long sequences. Capture itself copies each hooked layer's Q/K to host memory every forward step on every TP rank, so `output_qk=True` on a deep model at high TP is noticeably slower than capturing a few layers — pass an explicit layer list where you can.
+The captured entries are `attn_q` (`n_layers, n_positions, num_heads, head_dim`), `attn_k` (same with KV heads), `qk_layers`, and `qk_meta` (the per-layer kernel parameters). Unlike the residual stream, Q/K are sharded by head under tensor parallelism, so **every** TP rank captures and the shards are concatenated along the head dimension at merge time; grouped-query attention, sliding windows, and Gemma-style soft-capping are handled from the shipped metadata. The reconstruction is exact up to floating-point rounding: in fp32 it matches HuggingFace's eager attention to ~1e-5 per probability (the test suite asserts ≤ 1e-4), and the capture itself is verified bit-for-bit against raw hooks on the same modules. MLA models (DeepSeek-style latent attention) are rejected with a clear error — their Q/K never exist in per-head form. Reconstructing a full pattern materializes an `(num_heads, n, n)` matrix client-side, so reconstruct per layer rather than all at once for long sequences. Capture itself copies each hooked layer's Q/K to host memory every forward step on every TP rank, so `output_qk=True` on a deep model at high TP is noticeably slower than capturing a few layers — pass an explicit layer list where you can.
 
 ### Steering vectors
 
@@ -375,7 +376,7 @@ output = await model.generate(state.messages, config=capture_config)
 residual_stream = output.metadata["activations"]["residual_stream"]
 ```
 
-Attention Q/K capture works the same way — pass `"output_qk": [layer, ...]` in `extra_args` and reconstruct with `vllm_lens.attention.attention_patterns(output.metadata["activations"], layer)`.
+Attention Q/K capture works the same way — pass `"output_qk": [layer, ...]` in `extra_args` and reconstruct with `vllm_lens.attention.attention_patterns(output.metadata["activations"], layer=layer)`.
 
 #### Steering with an Activation Oracle
 
