@@ -36,10 +36,11 @@ _LONG_PROMPT = (
 
 @pytest.fixture(scope="module")
 def llm_chunked():
-    os.environ["VLLM_FLOAT32_MATMUL_PRECISION"] = "highest"
-    # vLLM picks TRITON_ATTN for fp32 and Triton's tl.dot defaults to TF32,
-    # which leaks ~1e-3 into every later layer's Q/K; force IEEE fp32.
-    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    # True fp32 relies on vLLM's default VLLM_FLOAT32_MATMUL_PRECISION=highest
+    # and on vllm-lens defaulting TRITON_F32_DEFAULT=ieee for fp32 models (see
+    # _patched_create_engine_config) — deliberately not pinned here so the
+    # tight tolerance also verifies that default.
+    os.environ.pop("TRITON_F32_DEFAULT", None)
     llm = LLM(
         model=MODEL_NAME,
         dtype="float32",
