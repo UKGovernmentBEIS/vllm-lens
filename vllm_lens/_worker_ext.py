@@ -1178,30 +1178,16 @@ class HiddenStatesExtension:
     # Attention Q/K capture (called via collective_rpc)
     # ------------------------------------------------------------------
 
-    def install_qk_hooks(self) -> None:
-        """Register a pre-hook on every decoder ``Attention`` module. Idempotent.
+    def _select_qk_attention_modules(self) -> dict[int, Any]:
+        """Global layer index → the decoder ``Attention`` module inside it.
 
-        Separate from :meth:`install_hooks` so residual-stream/steering
-        users pay no extra per-forward cost.  Installed — and capturing —
-        on **every** TP rank, because ``Attention`` inputs are sharded by
-        head (unlike the residual stream, which is replicated post
-        all-reduce).
-
-        Also records, per layer, the exact kernel parameters needed to
-        replay the attention softmax offline (``vllm_lens.attention``):
-        vLLM has already normalized model-specific conventions (custom
-        scales, sliding-window forms, ...) into these values.
+        Reuses decoder-layer discovery (registry or ``VLLM_LENS_LAYER_PATH``,
+        count-checked) so Q/K layer indices are exactly the residual-stream
+        ones.  Layers without a softmax-attention wrapper (Mamba /
+        linear-attention blocks in hybrids) are omitted; MLA is refused.
         """
-        if self._qk_hooks_installed:
-            return
-
         from vllm.model_executor.layers.attention import Attention, MLAAttention
 
-        # Reuse decoder-layer discovery (registry or VLLM_LENS_LAYER_PATH,
-        # count-checked) so Q/K layer indices are exactly the residual-stream
-        # ones, then locate the softmax-attention wrapper inside each layer.
-        # Layers without one (Mamba / linear-attention blocks in hybrids)
-        # are simply not hooked.
         layer_map = _discover_layer_modules(self)
         selected: dict[int, Any] = {}
         for layer_idx, layer in layer_map.items():
@@ -1225,6 +1211,88 @@ class HiddenStatesExtension:
                 )
             if attn_modules:
                 selected[layer_idx] = attn_modules[0]
+        return selected
+
+    # -- raw Q/K reference capture (testing only) ------------------------------
+    #
+    # Plain torch pre-hooks on the same ``Attention`` modules, recording the
+    # *whole* batch's Q/K per forward with no per-request slicing, merging or
+    # serialization.  Tests compare the production capture against this
+    # bit-for-bit (``torch.equal``) to verify the plumbing exactly — hook
+    # firing under chunked prefill, query_start_loc slicing, TP head-shard
+    # order, KV-replication dedupe, PP layer concat, wire round-trip.
+
+    def _debug_raw_qk_install(self, layer_indices: list[int]) -> list[int]:
+        self._debug_raw_qk = {i: {"q": [], "k": []} for i in layer_indices}
+        self._debug_raw_qk_handles = []
+        selected = self._select_qk_attention_modules()
+        for layer_idx in layer_indices:
+            if layer_idx not in selected:  # not on this PP stage
+                continue
+            module = selected[layer_idx]
+
+            def hook(_m, args, kwargs, *, _idx=layer_idx, _mod=module):
+                query = kwargs.get("query", args[0] if args else None)
+                key = kwargs.get("key", args[1] if len(args) > 1 else None)
+                if query is None or key is None:
+                    return None
+                store = self._debug_raw_qk[_idx]
+                store["q"].append(
+                    query.reshape(-1, _mod.num_heads, _mod.head_size).cpu()
+                )
+                store["k"].append(
+                    key.reshape(-1, _mod.num_kv_heads, _mod.head_size).cpu()
+                )
+                return None
+
+            self._debug_raw_qk_handles.append(
+                module.register_forward_pre_hook(hook, with_kwargs=True)
+            )
+        return sorted(selected)
+
+    def _debug_raw_qk_pop(self) -> bytes:
+        """Return and clear the raw capture: pickled ``{layer: {q, k}}`` plus ranks."""
+        from vllm.distributed import parallel_state as ps
+
+        out: dict[str, Any] = {
+            "tp_rank": int(ps.get_tensor_model_parallel_rank()),
+            "pp_rank": int(ps.get_pp_group().rank_in_group),
+            "layers": {},
+        }
+        for idx, st in self._debug_raw_qk.items():
+            if st["q"]:
+                out["layers"][idx] = {
+                    "q": torch.cat(st["q"], dim=0),
+                    "k": torch.cat(st["k"], dim=0),
+                }
+            st["q"].clear()
+            st["k"].clear()
+        return pickle.dumps(out, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def _debug_raw_qk_remove(self) -> None:
+        for h in getattr(self, "_debug_raw_qk_handles", []):
+            h.remove()
+        self._debug_raw_qk_handles = []
+        self._debug_raw_qk = {}
+
+    def install_qk_hooks(self) -> None:
+        """Register a pre-hook on every decoder ``Attention`` module. Idempotent.
+
+        Separate from :meth:`install_hooks` so residual-stream/steering
+        users pay no extra per-forward cost.  Installed — and capturing —
+        on **every** TP rank, because ``Attention`` inputs are sharded by
+        head (unlike the residual stream, which is replicated post
+        all-reduce).
+
+        Also records, per layer, the exact kernel parameters needed to
+        replay the attention softmax offline (``vllm_lens.attention``):
+        vLLM has already normalized model-specific conventions (custom
+        scales, sliding-window forms, ...) into these values.
+        """
+        if self._qk_hooks_installed:
+            return
+
+        selected = self._select_qk_attention_modules()
 
         if not selected:
             raise RuntimeError(

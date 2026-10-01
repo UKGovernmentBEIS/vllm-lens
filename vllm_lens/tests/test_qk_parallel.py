@@ -7,6 +7,7 @@ captures its own layers, concatenated along the layer dimension.
 """
 
 import gc
+import os
 
 import pytest
 import torch
@@ -28,9 +29,10 @@ _HEAD_SIZE = 64
 
 @pytest.fixture(scope="module")
 def hf_attention():
+    torch.backends.cuda.matmul.allow_tf32 = False
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        dtype="auto",
+        dtype=torch.float32,
         device_map="cuda",
         attn_implementation="eager",
     ).eval()
@@ -50,9 +52,10 @@ def hf_attention():
 
 
 def _run_engine(weights_layer: int, **engine_kwargs):
+    os.environ["VLLM_FLOAT32_MATMUL_PRECISION"] = "highest"
     llm = LLM(
         model=MODEL_NAME,
-        dtype="auto",
+        dtype="float32",
         gpu_memory_utilization=0.3,
         **engine_kwargs,
     )
@@ -72,7 +75,7 @@ def _run_engine(weights_layer: int, **engine_kwargs):
         torch.cuda.empty_cache()
 
 
-from ._qk_asserts import assert_attention_matches as _assert_close
+from ._qk_asserts import assert_attention_close as _assert_close
 
 
 def test_tp2_merges_head_shards(hf_attention):

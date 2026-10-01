@@ -1,42 +1,38 @@
-"""Shared assertions for attention-pattern parity tests.
+"""Shared assertions for attention-pattern tests.
 
-Metric design (deliberately length-independent — see PR discussion):
+Two kinds of comparison, deliberately kept apart:
 
-- Mean-abs-diff over a probability row shrinks as 1/n with sequence
-  length (two disjoint one-hot rows differ by only 2/n), so it becomes
-  vacuous for long prompts.  We assert on **per-row total variation**
-  (``0.5 * Σ|got - want|``, in [0, 1]) instead: a row attending to
-  entirely the wrong position scores TV ≈ 1 regardless of length.
-- Diffuse (near-uniform) rows — ubiquitous in layer 0 — are genuinely
-  noisy between two valid bf16 computations, both in TV and argmax.  So
-  the strict argmax check is restricted to **confident rows**, where the
-  reference's top-1 probability exceeds its runner-up by a margin; on
-  those rows the reconstruction must pick the same position.
+- :func:`assert_attention_close` — the **fp32 ground-truth check** against
+  HuggingFace eager attention.  With both engines in true fp32
+  (``VLLM_FLOAT32_MATMUL_PRECISION=highest`` on the vLLM side) the only
+  remaining differences are accumulation order, so a tight absolute
+  tolerance on the probabilities is a near-exact test.
+- :func:`assert_attention_tv` — a loose **bf16 canary** for the production
+  dtype (used by the opt-in multi-architecture sweep).  Two valid bf16
+  computations through different kernels legitimately disagree on
+  near-tied rows, so this bounds per-row total variation
+  (``0.5 * Σ|got - want|`` ∈ [0, 1]; a mis-attended row scores ≈ 1) rather
+  than anything elementwise.  It is a sanity net, not the oracle.
+
+Exact plumbing (hook firing, per-request slicing, TP/PP merge, wire
+round-trip) is tested bit-for-bit elsewhere (``test_qk_exact.py``); neither
+helper here is meant to stand in for that.
 """
 
 from __future__ import annotations
 
 import torch
 
-# Calibrated from recorded sweep numbers (PR #34 discussion): correct
-# reconstructions measured mean row TV ≈ 0.10 on the noisiest case
-# (near-uniform layer-0 rows, where bf16 logit noise between two *valid*
-# computations legitimately moves mass) and ≲ 0.02 elsewhere, while a
-# mis-attended row scores TV ≈ 1.  The sharp check for "attends to the
-# wrong place" is the confident-row argmax below, which is immune to
-# diffuse-row noise.
-MEAN_TV_MAX = 0.15
-ROW_TV_MAX = 0.6
-CONFIDENT_MARGIN = 0.05
-CONFIDENT_AGREE_MIN = 0.98
-# Absolute allowance on top of the ratio.  Single prompts have only ~60-100
-# confident rows, so one bf16 near-tie flip is already 1-1.6%.  Measured on
-# 8xH100 (FlashInfer) vs HF eager bf16, Qwen2.5-0.5B layer 2, the 10-prompt
-# batch: 8 flips / 819 confident rows (99.0%), every flip a row where vLLM's
-# top-2 differ by <= 0.08 and row TV <= 0.15 -- vs TV ~ 1 and near-total
-# argmax disagreement for a mis-attended layer, so this allowance costs no
-# detection power.
-CONFIDENT_FLIPS_ALLOWED = 2
+# fp32-vs-fp32: measured max |Δp| is at the 1e-5 level (see PR #34); 1e-3
+# leaves two orders of magnitude of headroom while still rejecting any
+# bf16-scale (≥ 0.05) discrepancy outright.
+FP32_ATOL = 1e-3
+
+# bf16 canary: measured on H100 (FlashInfer) vs HF eager bf16 across
+# Qwen2.5-0.5B / 1.5B layers 2–27: mean row TV 0.015–0.03, max row TV ≤ 0.27
+# (a diffuse early-layer row).  A wrong row scores TV ≈ 1.
+MEAN_TV_MAX = 0.05
+ROW_TV_MAX = 0.4
 
 
 def row_total_variation(got: torch.Tensor, want: torch.Tensor) -> torch.Tensor:
@@ -44,7 +40,31 @@ def row_total_variation(got: torch.Tensor, want: torch.Tensor) -> torch.Tensor:
     return 0.5 * (got - want).abs().sum(-1)
 
 
-def assert_attention_matches(
+def assert_attention_close(
+    got: torch.Tensor,
+    want: torch.Tensor,
+    *,
+    label: str = "",
+    atol: float = FP32_ATOL,
+) -> None:
+    """fp32 ground truth: every probability within ``atol`` of HF's."""
+    assert got.shape == want.shape, f"{label} shape: {got.shape} vs {want.shape}"
+    diff = (got.float() - want.float()).abs()
+    max_diff = diff.max().item()
+    assert torch.isfinite(got).all(), f"{label} non-finite weights"
+    # Always report the measured error (visible with ``pytest -s``) so the
+    # tolerance can be audited against real numbers, not just pass/fail.
+    print(
+        f"[qk fp32] {label}: max |Δp| = {max_diff:.3e}, mean = {diff.mean().item():.3e}"
+    )
+    assert max_diff <= atol, (
+        f"{label} max |Δp| = {max_diff:.3e} > {atol} "
+        f"(mean |Δp| = {diff.mean().item():.3e}, "
+        f"max row TV = {row_total_variation(got, want).max().item():.3e})"
+    )
+
+
+def assert_attention_tv(
     got: torch.Tensor,
     want: torch.Tensor,
     *,
@@ -52,29 +72,10 @@ def assert_attention_matches(
     mean_tv_max: float = MEAN_TV_MAX,
     row_tv_max: float = ROW_TV_MAX,
 ) -> None:
-    """Assert two (num_heads, q_len, kv_len) attention tensors agree.
-
-    Bounds mean and worst-case per-row total variation, and requires
-    argmax agreement on rows where the reference is confident.
-    """
+    """bf16 canary: bounded per-row total variation (see module docstring)."""
     assert got.shape == want.shape, f"{label} shape: {got.shape} vs {want.shape}"
-
     tv = row_total_variation(got, want)
     mean_tv = tv.mean().item()
     max_tv = tv.max().item()
-    assert mean_tv < mean_tv_max, f"{label} mean row TV {mean_tv:.4f}"
-    assert max_tv < row_tv_max, f"{label} max row TV {max_tv:.4f}"
-
-    top2 = want.topk(min(2, want.shape[-1]), dim=-1).values
-    if top2.shape[-1] < 2:
-        return
-    confident = (top2[..., 0] - top2[..., 1]) > CONFIDENT_MARGIN
-    if confident.sum().item() == 0:
-        return
-    n_conf = int(confident.sum())
-    flips = int((got.argmax(-1) != want.argmax(-1))[confident].sum())
-    agree = 1.0 - flips / n_conf
-    assert agree >= CONFIDENT_AGREE_MIN or flips <= CONFIDENT_FLIPS_ALLOWED, (
-        f"{label} argmax agreement on {n_conf} confident rows: {agree:.2%} "
-        f"({flips} flips)"
-    )
+    assert mean_tv < mean_tv_max, f"{label} mean row TV {mean_tv:.4f} ≥ {mean_tv_max}"
+    assert max_tv < row_tv_max, f"{label} max row TV {max_tv:.4f} ≥ {row_tv_max}"

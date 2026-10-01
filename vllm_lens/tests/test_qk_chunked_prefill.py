@@ -10,6 +10,7 @@ served from the prefix cache).
 """
 
 import gc
+import os
 
 import pytest
 import torch
@@ -35,9 +36,10 @@ _LONG_PROMPT = (
 
 @pytest.fixture(scope="module")
 def llm_chunked():
+    os.environ["VLLM_FLOAT32_MATMUL_PRECISION"] = "highest"
     llm = LLM(
         model=MODEL_NAME,
-        dtype="auto",
+        dtype="float32",
         gpu_memory_utilization=0.3,
         enable_chunked_prefill=True,
         max_num_batched_tokens=64,
@@ -68,9 +70,10 @@ def test_chunked_prefill_covers_full_prompt(llm_chunked):
 
 
 def test_chunked_prefill_matches_hf(llm_chunked):
+    torch.backends.cuda.matmul.allow_tf32 = False
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        dtype="auto",
+        dtype=torch.float32,
         device_map="cuda",
         attn_implementation="eager",
     ).eval()
@@ -92,14 +95,9 @@ def test_chunked_prefill_matches_hf(llm_chunked):
             out = model(ids, output_attentions=True, use_cache=False)
         hf_weights = out.attentions[LAYER_IDX][0].float().cpu()
 
-        # Per-row total variation, NOT mean-abs-diff: at this prompt
-        # length (~400 tokens) mean-abs-diff shrinks as 1/n and would
-        # accept grossly wrong rows.
-        from ._qk_asserts import assert_attention_matches
+        from ._qk_asserts import assert_attention_close
 
-        assert_attention_matches(
-            weights[:, :n, :n], hf_weights, label="chunked prefill"
-        )
+        assert_attention_close(weights[:, :n, :n], hf_weights, label="chunked prefill")
     finally:
         del model
         gc.collect()

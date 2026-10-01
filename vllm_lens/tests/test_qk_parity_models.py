@@ -134,11 +134,11 @@ def test_parity_with_hf(model_name, engine_kwargs, env, monkeypatch):
     layers = list(acts["qk_layers"])
     hf_by_layer = _hf_attentions(model_name, layers, n)
 
-    from ._qk_asserts import assert_attention_matches
+    from ._qk_asserts import assert_attention_tv
 
     for layer in layers:
         got = attention_patterns(acts, layer)[:, :n, :n]
-        assert_attention_matches(got, hf_by_layer[layer], label=f"L{layer}")
+        assert_attention_tv(got, hf_by_layer[layer], label=f"L{layer}")
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="KV replication needs TP=4")
@@ -158,11 +158,11 @@ def test_kv_head_replication_dedupe_on_real_hardware():
     pick = sorted({layers[0], layers[len(layers) // 2], layers[-1]})
     hf_by_layer = _hf_attentions(model_name, pick, n)
 
-    from ._qk_asserts import assert_attention_matches
+    from ._qk_asserts import assert_attention_tv
 
     for layer in pick:
         got = attention_patterns(acts, layer)[:, :n, :n]
-        assert_attention_matches(got, hf_by_layer[layer], label=f"tp4 L{layer}")
+        assert_attention_tv(got, hf_by_layer[layer], label=f"tp4 L{layer}")
 
 
 def test_hybrid_model_captures_attention_layers_only():

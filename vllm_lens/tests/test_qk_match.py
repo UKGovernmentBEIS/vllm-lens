@@ -4,9 +4,16 @@ Captures post-RoPE Q/K via ``extra_args={"output_qk": ...}`` from a real
 vLLM engine and checks that ``vllm_lens.attention.attention_patterns``
 reproduces HuggingFace's real attention weights (eager attention with
 ``output_attentions=True``) for the same token ids.
+
+Both engines run in **true fp32** (vLLM with
+``VLLM_FLOAT32_MATMUL_PRECISION=highest`` so TF32 is off), which makes the
+comparison tight (``FP32_ATOL``) instead of a bf16 tolerance exercise.  The
+production bf16 dtype is covered by the exact plumbing tests
+(``test_qk_exact.py``) and the opt-in bf16 canary sweep.
 """
 
 import gc
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -17,7 +24,7 @@ from vllm import LLM, SamplingParams
 from vllm_lens._worker_ext import HiddenStatesExtension
 from vllm_lens.attention import attention_patterns
 
-from ._qk_asserts import assert_attention_matches
+from ._qk_asserts import assert_attention_close
 from .conftest import LAYER_IDX, MODEL_NAME, NUM_LAYERS, PROMPT, PROMPTS
 
 _NUM_Q_HEADS = 14  # Qwen2.5-0.5B
@@ -27,9 +34,10 @@ _HEAD_SIZE = 64
 
 @pytest.fixture(scope="module")
 def llm_model():
+    os.environ["VLLM_FLOAT32_MATMUL_PRECISION"] = "highest"
     llm = LLM(
         model=MODEL_NAME,
-        dtype="auto",
+        dtype="float32",
         gpu_memory_utilization=0.3,
     )
     yield llm
@@ -41,9 +49,10 @@ def llm_model():
 @pytest.fixture(scope="module")
 def hf_eager():
     """HF model with eager attention — required for output_attentions."""
+    torch.backends.cuda.matmul.allow_tf32 = False
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        dtype="auto",
+        dtype=torch.float32,
         device_map="cuda",
         attn_implementation="eager",
     ).eval()
@@ -72,10 +81,6 @@ def _capture(llm: LLM, prompt: str, output_qk, max_tokens: int = 1):
     return outputs[0]
 
 
-# Attention comparisons use per-row total variation + confident-row
-# argmax (see _qk_asserts) — length-independent, unlike mean-abs-diff.
-
-
 class TestMatchesTransformers:
     def test_prefill_pattern_matches_hf(self, llm_model, hf_eager):
         model, tokenizer = hf_eager
@@ -87,7 +92,7 @@ class TestMatchesTransformers:
         weights = attention_patterns(acts, LAYER_IDX)
 
         hf_weights = _hf_attention(model, token_ids, LAYER_IDX)
-        assert_attention_matches(weights[:, :n, :n], hf_weights, label="prefill")
+        assert_attention_close(weights[:, :n, :n], hf_weights, label="prefill")
 
     def test_decode_rows_match_hf(self, llm_model, hf_eager):
         model, tokenizer = hf_eager
@@ -103,12 +108,12 @@ class TestMatchesTransformers:
         assert weights.shape[1] == len(all_ids)
 
         hf_weights = _hf_attention(model, all_ids, LAYER_IDX)
-        assert_attention_matches(weights, hf_weights, label="full")
+        assert_attention_close(weights, hf_weights, label="full")
         # The decode rows on their own — a full-matrix comparison is
         # dominated by prefill rows, so a wrong decode capture could
         # otherwise hide inside the aggregate.
         assert weights.shape[1] > p
-        assert_attention_matches(
+        assert_attention_close(
             weights[:, p:, :], hf_weights[:, p:, :], label="decode rows"
         )
 
@@ -135,7 +140,7 @@ class TestMatchesTransformers:
             weights = attention_patterns(output.activations, LAYER_IDX)
             assert weights.shape[1] == n, f"{prompt!r}: {weights.shape} vs n={n}"
             hf_weights = _hf_attention(model, token_ids, LAYER_IDX)
-            assert_attention_matches(
+            assert_attention_close(
                 weights[:, :n, :n], hf_weights, label=f"batch {prompt[:20]!r}"
             )
 
@@ -176,7 +181,7 @@ class TestMatchesTransformers:
 
         weights = attention_patterns(acts, LAYER_IDX)
         hf_weights = _hf_attention(model, tokenizer(PROMPT).input_ids, LAYER_IDX)
-        assert_attention_matches(weights[:, :n, :n], hf_weights, label="combined")
+        assert_attention_close(weights[:, :n, :n], hf_weights, label="combined")
 
     def test_no_leaked_state(self, llm_model):
         _capture(llm_model, PROMPT, output_qk=[LAYER_IDX], max_tokens=2)
