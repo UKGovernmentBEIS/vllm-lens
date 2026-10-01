@@ -1,5 +1,7 @@
 # vLLM and its matching torch are installed separately, without uv.lock or
 # the development environment's CUDA index overrides.
+# Hugging Face reference fixtures load models with device_map="cuda".
+accelerate>=1.1.0
 # FlashInfer builds sampling kernels at runtime.
 ninja>=1.11
 pytest>=9.0.2
