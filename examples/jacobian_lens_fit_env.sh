@@ -32,6 +32,7 @@ cd "$PRIME_RL_DIR"
 echo ">> checking out $PRIME_RL_COMMIT"
 git fetch --all --tags
 git checkout "$PRIME_RL_COMMIT"
+git submodule update --init --recursive  # editable deps/ packages need this before uv sync
 
 echo ">> uv sync --all-extras (downloads large wheels; takes a while)"
 uv sync --all-extras
