@@ -341,6 +341,22 @@ def _patched_create_engine_config(self, *args, **kwargs):
     assert _original_create_engine_config is not None
     config = _original_create_engine_config(self, *args, **kwargs)
 
+    # vLLM serves fp32 models with the Triton attention backend, and Triton's
+    # tl.dot defaults to TF32 for fp32 inputs — so an "fp32" model is not fp32
+    # end-to-end (each layer's attention output carries ~1e-3 relative error
+    # into the next layer's activations; measured 2.9e-3 vs 3.5e-6 in attention
+    # probabilities). vLLM already defaults VLLM_FLOAT32_MATMUL_PRECISION=highest
+    # for the linears; make the attention kernel consistent. setdefault => an
+    # explicit TRITON_F32_DEFAULT still wins. Triton reads it lazily at kernel
+    # compile time in the workers, which inherit this environment.
+    if getattr(getattr(config, "model_config", None), "dtype", None) == torch.float32:
+        if os.environ.setdefault("TRITON_F32_DEFAULT", "ieee") == "ieee":
+            logger.info(
+                "vllm-lens: fp32 model — defaulting TRITON_F32_DEFAULT=ieee so the "
+                "Triton attention kernel computes in true fp32 (set TRITON_F32_DEFAULT "
+                "explicitly to override)."
+            )
+
     # Fail loudly rather than silently no-op if the V2 runner ended up active anyway
     # (e.g. the user explicitly set VLLM_USE_V2_MODEL_RUNNER=1). getattr keeps this a
     # no-op on vLLM versions with no such property (pre-V2, e.g. 0.19).
