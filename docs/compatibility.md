@@ -15,15 +15,15 @@ and a recent stable release. We do not promise every intermediate vLLM version.
 | 0.30.0 | 3.12 | Selected by vLLM | V1, eager | Candidate target; full compatibility run pending |
 
 These rows are **test targets, not declarations that the new suite has passed**.
-No GPU runner was registered when this workflow was added. Update a row to
-validated only after attaching a passing run for the relevant repository SHA,
+GPU compatibility tests run locally. Update a row to validated only after
+attaching a passing local run for the relevant repository SHA,
 including the exact Python/PyTorch/vLLM versions and GPU/driver from its
 `environment.json`. CPU CI results alone do not validate inference.
 
-The [compatibility workflow](../.github/workflows/compatibility.yaml) retains
-environment metadata, per-suite logs and JUnit reports as artifacts. Copy the
-environment summary and run link into the release notes for durable evidence;
-GitHub artifacts expire. Keep the baseline when advancing the candidate to a
+The [local compatibility script](../scripts/check_compatibility.py) saves
+environment metadata, per-suite logs and JUnit reports in `--output-dir`.
+Attach the reports to the PR or release and include the environment summary in
+the release notes. Keep the baseline when advancing the candidate to a
 new stable vLLM release. Do not silently label an untested replacement supported.
 
 The package's existing `vllm>=0.16.0` dependency remains an installation range,
@@ -56,7 +56,7 @@ Layer-discovery unit tests additionally import real vLLM classes. They run in th
 compatibility environment alongside the GPU discovery tests, not in the minimal
 CPU job. The existing lint, format and type checks still run separately.
 
-## Reproduce a GPU matrix entry
+## Run a GPU matrix entry locally
 
 Use Linux, Python 3.12 and a CUDA GPU/driver supported by the selected vLLM wheel.
 The smoke suite uses the ungated `Qwen/Qwen2.5-0.5B-Instruct` model. Allow room for
@@ -99,21 +99,17 @@ of an injected vector at the capture layer. Zeroing hooks must change the
 captured state; the following request must restore the baseline. This catches
 silent no-ops that a successful completion or shape-only check would miss.
 
-## Runner setup and release cadence
+## Local validation before a release
 
-1. Register a dedicated Linux x64 self-hosted GPU runner with an identifying
-   label, e.g. `vllm-lens-gpu`. Ensure its driver supports both target releases.
-2. Set the repository Actions variable `VLLM_LENS_GPU_RUNNER` to that label.
-   Weekly smoke runs are disabled until it is configured; a manual dispatch
-   without the variable fails with setup guidance.
-3. Dispatch **vLLM compatibility** on the branch/commit to validate, selecting
-   `smoke` or `parallel`. Matrix versions run sequentially to avoid contending
-   for GPU memory. Only trusted maintainer-selected refs should run on this
-   runner; the workflow does not execute on pull-request events.
-4. Before a release, require passing smoke and parallel evidence for both
-   targets at the release commit. Review failures before publishing and update
-   this matrix and release notes with the evidence. This is a maintainer release
-   checklist; the PyPI publication workflow does not enforce the GPU evidence.
+CI runs CPU checks only. Run GPU compatibility tests manually on a local GPU
+machine using the commands above; there are no scheduled or manually dispatched
+GPU jobs in GitHub Actions.
+
+Before a release, run the smoke and parallel suites for both targets at the
+release commit, using a fresh environment for each vLLM version. Run suites
+sequentially to avoid GPU memory contention. Review failures and attach the
+reports before updating this matrix and the release notes. This is a maintainer
+release checklist; the PyPI publication workflow does not enforce GPU evidence.
 
 Until GPU validation is available, keep the rows pending and the compatibility
 PR in draft. Do not mark issue #39 complete based on CPU results alone.

@@ -396,7 +396,7 @@ The template is used exclusively when set (no auto-discovery), and every index i
 
 CPU regression tests run on PRs without a GPU or vLLM installation. The
 [compatibility guide](docs/compatibility.md) describes their setup and the
-separate single-GPU and TP/PP validation commands.
+local single-GPU and TP/PP validation commands. GPU tests run locally only.
 
 Integration tests in `tests/` run against a live vLLM server. You can either let the fixture start one automatically, or point at an existing server:
 
