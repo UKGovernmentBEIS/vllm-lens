@@ -17,6 +17,10 @@ The module auto-registers as a [vLLM general plugin](https://docs.vllm.ai/en/lat
 uv add vllm-lens
 ```
 
+See the [vLLM compatibility matrix and validation guide](docs/compatibility.md)
+for version test targets, recorded validation status, and reproducible checks.
+The package dependency range is broader than the tested configurations.
+
 ## Quickstart
 
 vllm-lens auto-registers as a vLLM plugin — just start a server normally:
@@ -389,6 +393,10 @@ VLLM_LENS_LAYER_PATH="model.layers.{i}" vllm serve my-org/unusual-model
 The template is used exclusively when set (no auto-discovery), and every index in `range(num_hidden_layers)` must resolve.
 
 ## Running tests
+
+CPU regression tests run on PRs without a GPU or vLLM installation. The
+[compatibility guide](docs/compatibility.md) describes their setup and the
+separate single-GPU and TP/PP validation commands.
 
 Integration tests in `tests/` run against a live vLLM server. You can either let the fixture start one automatically, or point at an existing server:
 

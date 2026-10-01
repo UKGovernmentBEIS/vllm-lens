@@ -17,7 +17,7 @@ import pytest
 import torch
 from vllm import LLM, RequestOutput, SamplingParams
 
-from vllm_lens import SteeringVector
+from vllm_lens import Hook, SteeringVector
 
 from .conftest import LAYER_IDX, MODEL_NAME, PROMPT
 
@@ -86,6 +86,49 @@ def _wire_format(sv: SteeringVector) -> str:
 
 
 class TestOfflineSteeringEntryPoints:
+    @pytest.mark.parametrize("run", [_generate, _chat], ids=["generate", "chat"])
+    def test_hook_values_and_request_cleanup(self, llm_model, run):
+        """Both offline entry points must execute hooks and return their values."""
+
+        def capture(ctx, h):
+            ctx.saved.setdefault("parts", []).append(h.detach().cpu())
+
+        baseline = run(llm_model, {"output_residual_stream": [LAYER_IDX]}, max_tokens=1)
+        captured = run(
+            llm_model,
+            {
+                "output_residual_stream": [LAYER_IDX],
+                "apply_hooks": [Hook(fn=capture, layer_indices=[LAYER_IDX])],
+            },
+            max_tokens=1,
+        )
+        saved = torch.cat(captured.hook_results["0"]["parts"], dim=0)
+        native = captured.activations["residual_stream"][0]
+        assert saved.shape[0] >= native.shape[0]
+        torch.testing.assert_close(saved[: native.shape[0]], native, rtol=0, atol=0)
+
+        def zero(ctx, h):
+            return torch.zeros_like(h)
+
+        modified = run(
+            llm_model,
+            {
+                "output_residual_stream": [LAYER_IDX],
+                "apply_hooks": [Hook(fn=zero, layer_indices=[LAYER_IDX])],
+            },
+            max_tokens=1,
+        )
+        assert baseline.activations["residual_stream"].abs().max() > 0.1
+        assert modified.activations["residual_stream"].abs().max() < 0.02
+        restored = run(llm_model, {"output_residual_stream": [LAYER_IDX]}, max_tokens=1)
+        torch.testing.assert_close(
+            restored.activations["residual_stream"],
+            baseline.activations["residual_stream"],
+            rtol=0.02,
+            atol=0.02,
+        )
+        assert not getattr(restored, "hook_results", None)
+
     def test_generate_accepts_json_wire_format(self, llm_model, steering_vector):
         """``LLM.generate`` must decode the JSON-string wire format.
 

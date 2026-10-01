@@ -1,0 +1,10 @@
+# Install torch separately from the CPU wheel index; no vLLM or CUDA required.
+cloudpickle>=3.0.0
+fastapi
+httpx
+numpy
+pydantic>=2.0
+pytest>=9.0.2
+pytest-asyncio>=1.3.0
+requests
+zstandard>=0.23.0

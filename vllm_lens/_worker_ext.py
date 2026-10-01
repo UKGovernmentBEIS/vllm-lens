@@ -385,6 +385,7 @@ def _apply_hook_delta(
             modified_output = (output[0].clone(), output[1])
         else:
             modified_output = output.clone()
+    assert modified_output is not None
     if isinstance(modified_output, tuple):
         modified_output[0][start:end] = modified_output[0][start:end] + delta
     else:

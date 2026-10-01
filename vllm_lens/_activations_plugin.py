@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import pickle
+from importlib.metadata import PackageNotFoundError, version
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -780,6 +781,28 @@ def _llm_clear_prefetched(self: LLM) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _report_integration_failure(component: str, error: Exception) -> None:
+    """Expose API drift; compatibility runs treat missing integrations as errors.
+
+    Offline installations may intentionally lack serving dependencies, so normal
+    registration warns rather than making those installations unusable.
+    """
+    try:
+        vllm_version = version("vllm")
+    except PackageNotFoundError:
+        vllm_version = "unknown"
+    message = (
+        f"vllm-lens could not install {component} on vLLM {vllm_version}: "
+        f"{type(error).__name__}: {error}. This integration is unavailable; "
+        "HTTP responses may omit activations or hook results. "
+        "See docs/compatibility.md for tested configurations. "
+        "Set VLLM_LENS_STRICT_COMPATIBILITY=1 to fail startup on integration errors."
+    )
+    if os.environ.get("VLLM_LENS_STRICT_COMPATIBILITY") == "1":
+        raise RuntimeError(message) from error
+    logger.warning(message)
+
+
 def register() -> None:
     """Entry point called by vLLM's plugin system at engine startup.
 
@@ -854,8 +877,8 @@ def register() -> None:
         OpenAIServingCompletion.request_output_to_completion_response = (
             _patched_completion_response
         )
-    except Exception:
-        pass
+    except Exception as error:
+        _report_integration_failure("completion response patch", error)
 
     try:
         from vllm.entrypoints.openai.chat_completion.serving import (
@@ -870,8 +893,8 @@ def register() -> None:
         OpenAIServingChat.chat_completion_stream_generator = (
             _patched_chat_stream_generator
         )
-    except Exception:
-        pass
+    except Exception as error:
+        _report_integration_failure("chat response patches", error)
 
     # Patch the serve router registration to inject our hooks API.
     try:
@@ -879,5 +902,5 @@ def register() -> None:
 
         _original_register_routers = _serve_mod.register_vllm_serve_api_routers
         _serve_mod.register_vllm_serve_api_routers = _patched_register_routers
-    except Exception:
-        pass
+    except Exception as error:
+        _report_integration_failure("hook and activation HTTP routes", error)

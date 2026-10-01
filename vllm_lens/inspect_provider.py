@@ -215,7 +215,7 @@ class VLLMLensAPI(VLLMAPI):
         """Merge additional keys into ``ModelOutput.metadata``."""
         if isinstance(result, tuple):
             output, call = result
-            if isinstance(output, ModelOutput):
+            if not isinstance(output, Exception):
                 if output.metadata is None:
                     output.metadata = {}
                 output.metadata.update(metadata)
