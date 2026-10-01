@@ -4,17 +4,18 @@ vllm-lens integrates with private vLLM runner and serving APIs. A successful
 installation or server startup is not sufficient evidence of compatibility:
 capture and interventions must also produce the expected values.
 
-We target a small matrix: the repository's established development baseline
-and a recent stable release. We do not promise every intermediate vLLM version.
+We validate one vLLM release at a time, starting with 0.30.0. After a release
+passes local GPU validation, pin the package to that exact version. Test newer
+stable releases as they become available and advance the pin only when they
+pass; if a candidate fails, retain the last validated pin and investigate.
 
 ## Matrix and evidence
 
 | vLLM | Python | PyTorch | Runner | Status |
 | --- | --- | --- | --- | --- |
-| 0.19.0 | 3.12 | Selected by vLLM; the development lock uses 2.10.0 | V1, eager | Baseline target; full compatibility run pending |
-| 0.30.0 | 3.12 | Selected by vLLM | V1, eager | Candidate target; full compatibility run pending |
+| 0.30.0 | 3.12 | Selected by vLLM | V1, eager | Initial target; full compatibility run pending |
 
-These rows are **test targets, not declarations that the new suite has passed**.
+This row is a **test target, not a declaration that the new suite has passed**.
 GPU compatibility tests run locally. Update a row to validated only after
 attaching a passing local run for the relevant repository SHA,
 including the exact Python/PyTorch/vLLM versions and GPU/driver from its
@@ -23,14 +24,15 @@ including the exact Python/PyTorch/vLLM versions and GPU/driver from its
 The [local compatibility script](../scripts/check_compatibility.py) saves
 environment metadata, per-suite logs and JUnit reports in `--output-dir`.
 Attach the reports to the PR or release and include the environment summary in
-the release notes. Keep the baseline when advancing the candidate to a
-new stable vLLM release. Do not silently label an untested replacement supported.
+the release notes. Keep previous validation results when testing a new stable
+vLLM release. Do not label an untested replacement supported.
 
-The package's existing `vllm>=0.16.0` dependency remains an installation range,
-not a tested support guarantee. Other versions are unvalidated by this matrix.
-Do not narrow that range based solely on missing coverage; add an exclusion or
-upper bound when a reproducible failure establishes the boundary. Applications
-should pin the vLLM version they validated rather than rely on the open range.
+The package's existing `vllm>=0.16.0` dependency remains temporarily unchanged
+while the first validation is pending; it is not a tested support guarantee.
+Once 0.30.0 passes both suites, change it to `vllm==0.30.0` and update the
+development lock and dependency sources to match. The existing lock uses
+0.19.0, but that is not an additional support target. Never advance the pin
+based only on successful installation, CPU checks or a planned GPU test.
 
 V2 model-runner mode is unsupported and rejected by the plugin. The plugin
 defaults to V1 and forces eager execution; native V2/CUDA-graph support is outside
@@ -70,14 +72,28 @@ the selected vLLM release with its own dependencies.
 
 ```bash
 uv venv --python 3.12 .venv-compatibility
-uv pip install --python .venv-compatibility/bin/python 'vllm==0.19.0' -e . -r requirements/compatibility-tests.txt
+uv pip install --python .venv-compatibility/bin/python 'vllm==0.30.0' -e . -r requirements/compatibility-tests.txt
 .venv-compatibility/bin/python scripts/check_compatibility.py \
-  --expected-vllm 0.19.0 --suite smoke --output-dir compatibility-results/0.19.0-smoke
+  --expected-vllm 0.30.0 --suite smoke --output-dir compatibility-results/0.30.0-smoke
 
-# Use a separate, fresh environment to repeat for vllm==0.30.0.
 # On a two-GPU machine, also run:
 .venv-compatibility/bin/python scripts/check_compatibility.py \
-  --expected-vllm 0.19.0 --suite parallel --output-dir compatibility-results/0.19.0-parallel
+  --expected-vllm 0.30.0 --suite parallel --output-dir compatibility-results/0.30.0-parallel
+```
+
+When testing a newer candidate after an exact package pin is in place, use a
+temporary dependency override. This override is only for compatibility testing:
+
+```bash
+# Replace X.Y.Z with the explicit candidate release and use a fresh environment.
+uv venv --python 3.12 .venv-candidate
+printf 'vllm==X.Y.Z\n' > .venv-candidate/overrides.txt
+uv pip install --python .venv-candidate/bin/python \
+  --overrides .venv-candidate/overrides.txt -e . -r requirements/compatibility-tests.txt
+.venv-candidate/bin/python scripts/check_compatibility.py \
+  --expected-vllm X.Y.Z --suite smoke --output-dir compatibility-results/X.Y.Z-smoke
+.venv-candidate/bin/python scripts/check_compatibility.py \
+  --expected-vllm X.Y.Z --suite parallel --output-dir compatibility-results/X.Y.Z-parallel
 ```
 
 The script checks the installed vLLM version and visible GPUs before running,
@@ -105,13 +121,13 @@ CI runs CPU checks only. Run GPU compatibility tests manually on a local GPU
 machine using the commands above; there are no scheduled or manually dispatched
 GPU jobs in GitHub Actions.
 
-Before a release, run the smoke and parallel suites for both targets at the
-release commit, using a fresh environment for each vLLM version. Run suites
+Before a release, run the smoke and parallel suites for the proposed pinned
+version at the release commit, using a fresh environment. Run suites
 sequentially to avoid GPU memory contention. Review failures and attach the
 reports before updating this matrix and the release notes. This is a maintainer
 release checklist; the PyPI publication workflow does not enforce GPU evidence.
 
-Until GPU validation is available, keep the rows pending and the compatibility
+Until GPU validation is available, keep the target pending and the compatibility
 PR in draft. Do not mark issue #39 complete based on CPU results alone.
 
 ## Diagnosing integration drift

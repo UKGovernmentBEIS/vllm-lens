@@ -35,4 +35,5 @@ vllm_lens/_benchmarks/logs/
 *.pt
 .venv-compatibility/
 .venv-cpu/
+.venv-candidate/
 compatibility-results/
