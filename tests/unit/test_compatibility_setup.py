@@ -24,7 +24,7 @@ def launcher(monkeypatch, tmp_path):
     monkeypatch.setattr(module.sys, "platform", "linux")
     for name in ("SLURM_JOB_ID", "SLURM_STEP_ID", "CUDA_VISIBLE_DEVICES"):
         monkeypatch.delenv(name, raising=False)
-    # main sets these for its child test processes; restore them after each test.
+    # The launcher should sanitize these only in its child environment.
     monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "0")
     monkeypatch.setenv("RAY_ADDRESS", "test-cluster")
     return module
@@ -147,9 +147,78 @@ def test_slurm_preserves_device_mask_and_ignores_dotenv(launcher, monkeypatch):
     def succeed(command, **kwargs):
         assert os.environ["CUDA_VISIBLE_DEVICES"] == "3,5"
         if "--suite" in command:
-            assert os.environ["PYTHON_DOTENV_DISABLED"] == "1"
-            assert "RAY_ADDRESS" not in os.environ
+            env = kwargs["env"]
+            assert env["CUDA_VISIBLE_DEVICES"] == "3,5"
+            assert env["PYTHON_DOTENV_DISABLED"] == "1"
+            assert "RAY_ADDRESS" not in env
         return subprocess.CompletedProcess(command, 0, stdout="GPU\nGPU\n")
 
     monkeypatch.setattr(launcher.subprocess, "run", succeed)
     assert launcher.main() == 0
+
+
+def make_ninja(bin_dir):
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    ninja = bin_dir / "ninja"
+    ninja.write_text("#!/bin/sh\necho environment-ninja\n")
+    ninja.chmod(0o755)
+
+
+def test_launcher_children_find_environment_tools(launcher, monkeypatch, tmp_path):
+    real_run = subprocess.run
+    probes = []
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
+    monkeypatch.setattr(sys, "argv", ["run_compatibility.py"])
+
+    def run(command, **kwargs):
+        if command[:2] == ["uv", "venv"]:
+            make_ninja(Path(command[-1]) / "bin")
+        if command[0].endswith("/bin/python"):
+            env = kwargs["env"]
+            assert env["VIRTUAL_ENV"] == str(Path(command[0]).parent.parent)
+            # Exercise actual child/grandchild executable lookup, as FlashInfer does.
+            result = real_run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import subprocess; subprocess.run(['ninja'], check=True)",
+                ],
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            assert result.stdout.strip() == "environment-ninja"
+            probes.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="GPU\nGPU\n")
+
+    monkeypatch.setattr(launcher.subprocess, "run", run)
+    assert launcher.main() == 0
+    assert len(probes) == 3  # CUDA preflight, smoke, parallel
+    assert os.environ["PATH"] == str(tmp_path / "empty-path")
+    assert os.environ["RAY_ADDRESS"] == "test-cluster"
+
+
+def test_direct_checker_children_find_environment_tools(monkeypatch, tmp_path):
+    path = Path(__file__).resolve().parents[2] / "scripts" / "check_compatibility.py"
+    spec = importlib.util.spec_from_file_location("compatibility_checker", path)
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    bin_dir = tmp_path / "venv" / "bin"
+    make_ninja(bin_dir)
+    # Preserve the venv bin directory even when Python is a symlink.
+    python = bin_dir / "python"
+    python.symlink_to(sys.executable)
+    monkeypatch.setattr(sys, "executable", str(python))
+    monkeypatch.setattr(sys, "prefix", str(bin_dir.parent))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
+    env = checker.subprocess_environment()
+    result = subprocess.run(
+        [str(python), "-c", "import subprocess; subprocess.run(['ninja'], check=True)"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == "environment-ninja"
+    assert env["VIRTUAL_ENV"] == str(bin_dir.parent)

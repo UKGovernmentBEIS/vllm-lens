@@ -1,5 +1,7 @@
 # vLLM and its matching torch are installed separately, without uv.lock or
 # the development environment's CUDA index overrides.
+# FlashInfer builds sampling kernels at runtime.
+ninja>=1.11
 pytest>=9.0.2
 pytest-asyncio>=1.3.0
 python-dotenv>=1.2.1

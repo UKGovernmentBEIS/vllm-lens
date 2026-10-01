@@ -60,6 +60,17 @@ def command_output(args: list[str]) -> str:
         return str(error)
 
 
+def subprocess_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    # Also support invoking this script directly by the environment's Python.
+    # Do not resolve symlinks: venv Python may link to a system interpreter.
+    env["PATH"] = (
+        str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", os.defpath)
+    )
+    env["VIRTUAL_ENV"] = sys.prefix
+    return env
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=["smoke", "parallel"], default="smoke")
@@ -120,7 +131,13 @@ def main() -> int:
         if torch.cuda.device_count() < required:
             raise RuntimeError(f"{args.suite} requires {required} visible CUDA GPU(s)")
         report["torch_cuda"] = torch.version.cuda
-        env = os.environ.copy()
+        env = subprocess_environment()
+        if not shutil.which("ninja", path=env["PATH"]):
+            raise RuntimeError(
+                "FlashInfer requires ninja; install requirements/compatibility-tests.txt "
+                "in this Python environment"
+            )
+        subprocess.run(["ninja", "--version"], env=env, check=True, timeout=30)
         env.pop("VLLM_LENS_DISABLE", None)
         env.pop("VLLM_LENS_LAYER_PATH", None)
         env.pop("RAY_ADDRESS", None)

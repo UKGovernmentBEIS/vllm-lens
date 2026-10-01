@@ -79,6 +79,12 @@ provisions Python 3.12 and vLLM **0.30.0** in a fresh environment, then runs smo
 and parallel suites sequentially. It stops at the first failure. Ensure any
 site-required modules are available in the batch environment.
 
+The test dependencies include `ninja` for FlashInfer's runtime kernel builds.
+The launcher and direct suite runner put the test environment's executables on
+`PATH`; no shell activation is needed. The suite runner checks `ninja` before
+starting a model. A missing build tool is a setup failure, so fix the environment
+and rerun before drawing conclusions about vLLM compatibility.
+
 Slurm's `CUDA_VISIBLE_DEVICES` is preserved. Compatibility runs disable `.env`
 loading and clear inherited `RAY_ADDRESS` so they cannot override the assigned
 GPUs or connect to another job's Ray instance. The batch script uses a private

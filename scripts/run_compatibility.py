@@ -20,9 +20,9 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run(command: list[str]) -> None:
+def run(command: list[str], *, env: dict[str, str] | None = None) -> None:
     print(f"\n$ {shlex.join(command)}", flush=True)
-    subprocess.run(command, cwd=ROOT, check=True)
+    subprocess.run(command, cwd=ROOT, check=True, env=env)
 
 
 def main() -> int:
@@ -98,6 +98,15 @@ def main() -> int:
                 str(ROOT / "requirements" / "compatibility-tests.txt"),
             ]
         )
+        # An absolute Python path does not activate console tools for children.
+        env = os.environ.copy()
+        env["PATH"] = (
+            str(environment / "bin") + os.pathsep + env.get("PATH", os.defpath)
+        )
+        env["VIRTUAL_ENV"] = str(environment)
+        # Test conftests must not load .env over scheduler-provided settings.
+        env["PYTHON_DOTENV_DISABLED"] = "1"
+        env.pop("RAY_ADDRESS", None)
         # nvidia-smi lists host GPUs; torch also checks wheel/driver compatibility
         # and honors CUDA_VISIBLE_DEVICES before either suite starts an engine.
         run(
@@ -112,7 +121,8 @@ def main() -> int:
                     "f'Need {required} visible CUDA GPUs, found {count}. Check the driver, "
                     "CUDA_VISIBLE_DEVICES, and installed vLLM/PyTorch wheels.'"
                 ),
-            ]
+            ],
+            env=env,
         )
 
         results_root = ROOT / "compatibility-results" / args.vllm_version
@@ -120,9 +130,6 @@ def main() -> int:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         output = Path(tempfile.mkdtemp(prefix=f"{stamp}-", dir=results_root))
         print(f"\nEnvironment: {environment}\nResults: {output}", flush=True)
-        # Test conftests must not load .env over scheduler-provided settings.
-        os.environ["PYTHON_DOTENV_DISABLED"] = "1"
-        os.environ.pop("RAY_ADDRESS", None)
         suites = ["smoke", "parallel"] if args.suite == "all" else [args.suite]
         for suite in suites:
             run(
@@ -135,7 +142,8 @@ def main() -> int:
                     suite,
                     "--output-dir",
                     str(output / suite),
-                ]
+                ],
+                env=env,
             )
         print(
             f"\nPassed: {', '.join(suites)} on vLLM {args.vllm_version}. Reports: {output}"
