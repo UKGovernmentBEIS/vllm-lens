@@ -58,42 +58,54 @@ Layer-discovery unit tests additionally import real vLLM classes. They run in th
 compatibility environment alongside the GPU discovery tests, not in the minimal
 CPU job. The existing lint, format and type checks still run separately.
 
-## Run a GPU matrix entry locally
+## Run GPU tests on a new machine
 
-Use Linux, Python 3.12 and a CUDA GPU/driver supported by the selected vLLM wheel.
-The smoke suite uses the ungated `Qwen/Qwen2.5-0.5B-Instruct` model. Allow room for
-both the vLLM engine and a Hugging Face reference model (a 16 GiB GPU is a sensible
-starting point). The parallel suite requires two visible GPUs. Model downloads
-require network access on the first run.
-
-Create a fresh environment per version. Use `uv pip`, not `uv sync`: the latter
-restores the development lock and its CUDA index overrides instead of testing
-the selected vLLM release with its own dependencies.
+Check out the PR branch (`ci/vllm-compatibility-matrix`) on Linux with working
+NVIDIA drivers, Python 3 and [uv](https://docs.astral.sh/uv/getting-started/installation/).
+Then, from the repository root:
 
 ```bash
-uv venv --python 3.12 .venv-compatibility
-uv pip install --python .venv-compatibility/bin/python 'vllm==0.30.0' -e . -r requirements/compatibility-tests.txt
-.venv-compatibility/bin/python scripts/check_compatibility.py \
-  --expected-vllm 0.30.0 --suite smoke --output-dir compatibility-results/0.30.0-smoke
-
-# On a two-GPU machine, also run:
-.venv-compatibility/bin/python scripts/check_compatibility.py \
-  --expected-vllm 0.30.0 --suite parallel --output-dir compatibility-results/0.30.0-parallel
+python3 scripts/run_compatibility.py
 ```
 
-When testing a newer candidate after an exact package pin is in place, use a
-temporary dependency override. This override is only for compatibility testing:
+This defaults to **vLLM 0.30.0 and both suites**, so it requires **two GPUs**.
+It checks the driver before downloading dependencies, uses uv to provision
+Python 3.12 in a fresh environment under `.venv-compatibility/`, installs the
+selected vLLM and test dependencies, checks CUDA visibility, then runs smoke
+and TP/PP tests sequentially. It stops on the first failure.
+
+The smoke suite uses the ungated `Qwen/Qwen2.5-0.5B-Instruct` model. Allow room for
+both the vLLM engine and a Hugging Face reference model (16 GiB per GPU is a
+sensible starting point). The first run needs network access and several GB
+of disk space for Python packages and model weights. Subsequent runs reuse uv
+and Hugging Face download caches but create fresh test environments.
+
+For a single-GPU machine, or to select a different candidate explicitly:
 
 ```bash
-# Replace X.Y.Z with the explicit candidate release and use a fresh environment.
-uv venv --python 3.12 .venv-candidate
-printf 'vllm==X.Y.Z\n' > .venv-candidate/overrides.txt
-uv pip install --python .venv-candidate/bin/python \
-  --overrides .venv-candidate/overrides.txt -e . -r requirements/compatibility-tests.txt
-.venv-candidate/bin/python scripts/check_compatibility.py \
-  --expected-vllm X.Y.Z --suite smoke --output-dir compatibility-results/X.Y.Z-smoke
-.venv-candidate/bin/python scripts/check_compatibility.py \
-  --expected-vllm X.Y.Z --suite parallel --output-dir compatibility-results/X.Y.Z-parallel
+python3 scripts/run_compatibility.py --suite smoke
+python3 scripts/run_compatibility.py --vllm-version X.Y.Z
+# Run just the two-GPU tests:
+python3 scripts/run_compatibility.py --suite parallel
+```
+
+A smoke-only pass does not validate TP/PP or justify advancing the package pin.
+The launcher prints its environment and results paths. Reports are saved under
+`compatibility-results/<version>/<timestamp>-<unique-id>/{smoke,parallel}/`,
+including `environment.json`, per-suite logs and JUnit XML. Previous runs are
+preserved. Attach the complete results directory to the PR after testing.
+
+The launcher uses `uv pip` with an explicit candidate override, so it can test a
+new release even after the package has an exact vLLM pin. It does not change
+`pyproject.toml`, `uv.lock`, or an existing environment. Avoid `uv sync` in this
+test environment: that restores the development lock and CUDA index overrides.
+
+For debugging, rerun an individual suite with the environment path printed by
+the launcher and a new output directory:
+
+```bash
+/path/to/test-environment/bin/python scripts/check_compatibility.py \
+  --expected-vllm 0.30.0 --suite smoke --output-dir compatibility-results/retry-smoke
 ```
 
 The script checks the installed vLLM version and visible GPUs before running,
