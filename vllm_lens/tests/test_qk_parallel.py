@@ -53,6 +53,9 @@ def hf_attention():
 
 def _run_engine(weights_layer: int, **engine_kwargs):
     os.environ["VLLM_FLOAT32_MATMUL_PRECISION"] = "highest"
+    # vLLM picks TRITON_ATTN for fp32 and Triton's tl.dot defaults to TF32,
+    # which leaks ~1e-3 into every later layer's Q/K; force IEEE fp32.
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
     llm = LLM(
         model=MODEL_NAME,
         dtype="float32",

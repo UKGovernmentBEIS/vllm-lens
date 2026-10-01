@@ -4,9 +4,10 @@ Two kinds of comparison, deliberately kept apart:
 
 - :func:`assert_attention_close` — the **fp32 ground-truth check** against
   HuggingFace eager attention.  With both engines in true fp32
-  (``VLLM_FLOAT32_MATMUL_PRECISION=highest`` on the vLLM side) the only
-  remaining differences are accumulation order, so a tight absolute
-  tolerance on the probabilities is a near-exact test.
+  (``VLLM_FLOAT32_MATMUL_PRECISION=highest`` and ``TRITON_F32_DEFAULT=ieee``
+  on the vLLM side, ``allow_tf32=False`` for HF) the only remaining
+  differences are accumulation order, so a tight absolute tolerance on the
+  probabilities is a near-exact test.
 - :func:`assert_attention_tv` — a loose **bf16 canary** for the production
   dtype (used by the opt-in multi-architecture sweep).  Two valid bf16
   computations through different kernels legitimately disagree on
@@ -23,10 +24,13 @@ from __future__ import annotations
 
 import torch
 
-# fp32-vs-fp32: measured max |Δp| is at the 1e-5 level (see PR #34); 1e-3
-# leaves two orders of magnitude of headroom while still rejecting any
-# bf16-scale (≥ 0.05) discrepancy outright.
-FP32_ATOL = 1e-3
+# fp32-vs-fp32 with TF32 disabled on both sides (VLLM_FLOAT32_MATMUL_PRECISION
+# =highest, TRITON_F32_DEFAULT=ieee, torch allow_tf32=False).  Measured on
+# H100, Qwen2.5-0.5B, layers 0/1/2/11, 5- and 168-token prompts: max |Δp|
+# 3.5e-6 … 2.8e-5 (accumulation order only).  Without TRITON_F32_DEFAULT=ieee
+# the Triton fp32 attention kernel uses TF32 and max |Δp| jumps to ~3e-3 —
+# so this bound also guards the test setup itself.
+FP32_ATOL = 1e-4
 
 # bf16 canary: measured on H100 (FlashInfer) vs HF eager bf16 across
 # Qwen2.5-0.5B / 1.5B layers 2–27: mean row TV 0.015–0.03, max row TV ≤ 0.27

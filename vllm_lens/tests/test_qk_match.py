@@ -6,8 +6,10 @@ reproduces HuggingFace's real attention weights (eager attention with
 ``output_attentions=True``) for the same token ids.
 
 Both engines run in **true fp32** (vLLM with
-``VLLM_FLOAT32_MATMUL_PRECISION=highest`` so TF32 is off), which makes the
-comparison tight (``FP32_ATOL``) instead of a bf16 tolerance exercise.  The
+``VLLM_FLOAT32_MATMUL_PRECISION=highest`` and ``TRITON_F32_DEFAULT=ieee`` so
+TF32 is off in both the linears and the Triton attention kernel), which
+makes the comparison tight (``FP32_ATOL``) instead of a bf16 tolerance
+exercise.  The
 production bf16 dtype is covered by the exact plumbing tests
 (``test_qk_exact.py``) and the opt-in bf16 canary sweep.
 """
@@ -35,6 +37,9 @@ _HEAD_SIZE = 64
 @pytest.fixture(scope="module")
 def llm_model():
     os.environ["VLLM_FLOAT32_MATMUL_PRECISION"] = "highest"
+    # vLLM picks TRITON_ATTN for fp32 and Triton's tl.dot defaults to TF32,
+    # which leaks ~1e-3 into every later layer's Q/K; force IEEE fp32.
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
     llm = LLM(
         model=MODEL_NAME,
         dtype="float32",
