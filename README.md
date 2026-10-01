@@ -59,16 +59,6 @@ vllm-lens auto-loads in **every** vLLM process (via the `vllm.general_plugins` e
 VLLM_LENS_DISABLE=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
 ```
 
-## Layer discovery
-
-vllm-lens finds the decoder layers to hook via vLLM's attention-layer registry (`static_forward_context`), which covers standard attention, MLA (DeepSeek/GLM-5), and Mamba/linear-attention hybrids without per-architecture code. The discovered layers are checked against the config's `num_hidden_layers`; on any mismatch the first request that needs hooks fails with a `LayerDiscoveryError` rather than silently hooking the wrong modules. If that happens on a model with an unusual layout, point vllm-lens at the layers directly with a `get_submodule` path template containing `{i}` for the layer index:
-
-```bash
-VLLM_LENS_LAYER_PATH="model.layers.{i}" vllm serve my-org/unusual-model
-```
-
-The template is used exclusively when set (no auto-discovery), and every index in `range(num_hidden_layers)` must resolve.
-
 ## Examples
 
 Runnable examples live in [`examples/`](examples/) — each is standalone; run any
@@ -387,6 +377,16 @@ vllm-lens registers as a [vLLM plugin](https://docs.vllm.ai/en/stable/design/plu
 1. **Intercepting generate calls.** To utilise the plugin, you can pass [extra args](https://docs.vllm.ai/en/stable/api/vllm/sampling_params/#vllm.sampling_params.SamplingParams.extra_args) such as `output_residual_stream`, `apply_steering_vectors`, or `apply_hooks` in the sampling parameters. The plugin extracts these, initialises relevant [PyTorch hooks](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.register_hook.html) if they're not already setup (by adding a [worker extension](https://docs.vllm.ai/en/stable/cli/run-batch/?h=worker+extension#-worker-extension-cls)) and sends steering vectors and hook definitions directly to workers (vLLM typically has one worker per GPU).
 2. **Per-sample hook operations**. vLLM dynamically batches tokens from multiple concurrent requests into a single forward pass, so a core challenge is "book-keeping" - working out which operations (e.g., activation extraction) should be applied to which parts of the request. To do this we read the `forward_context` metadata, utilising the `query_start_loc` (a tensor of token boundaries per request) and `req_ids` (mapping batch index to request ID). We then, for example, apply hooks to just the slices that correspond to the request. Any extracted activations are moved to CPU ram and compressed (lossless), ready to be requested by the vLLM scheduler process. Steering runs on all tensor-parallel ranks (since it modifies the forward pass), but capture only runs on TP rank 0 (residual streams are identical across TP replicas after all-reduce).
 3. **Response collation.** The plugin intercepts the response before it is sent to the client, at which point it queries the relevant vLLM processes for any requested activations. It trims surplus activations, since vLLM can run an extra forward pass under the hood (the scheduler often gets ahead of the number of tokens it needs to generate, before stopping). Activations are then returned to the client.
+
+### Layer discovery
+
+vllm-lens finds the decoder layers to hook via vLLM's attention-layer registry (`static_forward_context`), which covers standard attention, MLA (DeepSeek/GLM-5), and Mamba/linear-attention hybrids without per-architecture code. The discovered layers are checked against the config's `num_hidden_layers`; on any mismatch the first request that needs hooks fails with a `LayerDiscoveryError` rather than silently hooking the wrong modules. If that happens on a model with an unusual layout, point vllm-lens at the layers directly with a `get_submodule` path template containing `{i}` for the layer index:
+
+```bash
+VLLM_LENS_LAYER_PATH="model.layers.{i}" vllm serve my-org/unusual-model
+```
+
+The template is used exclusively when set (no auto-discovery), and every index in `range(num_hidden_layers)` must resolve.
 
 ## Running tests
 
