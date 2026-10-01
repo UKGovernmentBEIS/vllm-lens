@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 import re
 import shlex
@@ -37,6 +38,14 @@ def main() -> int:
         parser.error("--vllm-version must be an explicit stable version, e.g. 0.30.0")
     if sys.platform != "linux":
         parser.error("GPU compatibility checks require Linux")
+    if os.environ.get("SLURM_JOB_ID") or shutil.which("srun") or shutil.which("sbatch"):
+        if not (os.environ.get("SLURM_JOB_ID") and os.environ.get("SLURM_STEP_ID")):
+            parser.error(
+                "Run inside a Slurm job step: submit scripts/compatibility.slurm "
+                "with sbatch, or use srun inside your allocation"
+            )
+        if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+            parser.error("Slurm must set CUDA_VISIBLE_DEVICES for the allocated GPUs")
     if not shutil.which("uv"):
         parser.error(
             "uv is required; see https://docs.astral.sh/uv/getting-started/installation/"
@@ -111,6 +120,9 @@ def main() -> int:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         output = Path(tempfile.mkdtemp(prefix=f"{stamp}-", dir=results_root))
         print(f"\nEnvironment: {environment}\nResults: {output}", flush=True)
+        # Test conftests must not load .env over scheduler-provided settings.
+        os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+        os.environ.pop("RAY_ADDRESS", None)
         suites = ["smoke", "parallel"] if args.suite == "all" else [args.suite]
         for suite in suites:
             run(

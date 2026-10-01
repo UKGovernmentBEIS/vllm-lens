@@ -37,3 +37,4 @@ vllm_lens/_benchmarks/logs/
 .venv-cpu/
 .venv-candidate/
 compatibility-results/
+slurm-vllm-lens-compat-*.out

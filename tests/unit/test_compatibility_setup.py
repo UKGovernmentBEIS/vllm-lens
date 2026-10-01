@@ -1,6 +1,7 @@
 """Exercise launcher failure handling without downloads or CUDA."""
 
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -15,8 +16,17 @@ def launcher(monkeypatch, tmp_path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     monkeypatch.setattr(module, "ROOT", tmp_path)
-    monkeypatch.setattr(module.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(
+        module.shutil,
+        "which",
+        lambda name: None if name in ("srun", "sbatch") else f"/bin/{name}",
+    )
     monkeypatch.setattr(module.sys, "platform", "linux")
+    for name in ("SLURM_JOB_ID", "SLURM_STEP_ID", "CUDA_VISIBLE_DEVICES"):
+        monkeypatch.delenv(name, raising=False)
+    # main sets these for its child test processes; restore them after each test.
+    monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "0")
+    monkeypatch.setenv("RAY_ADDRESS", "test-cluster")
     return module
 
 
@@ -93,3 +103,53 @@ def test_smoke_failure_prevents_parallel_run(launcher, monkeypatch):
     monkeypatch.setattr(launcher.subprocess, "run", fail_smoke)
     assert launcher.main() == 1
     assert not any("parallel" in command for command in commands)
+
+
+@pytest.mark.parametrize("job_id", [None, "123"])
+def test_slurm_requires_job_step_before_touching_gpus(
+    launcher, monkeypatch, tmp_path, job_id
+):
+    monkeypatch.setattr(sys, "argv", ["run_compatibility.py"])
+    monkeypatch.setattr(launcher.shutil, "which", lambda name: f"/bin/{name}")
+    if job_id:
+        monkeypatch.setenv("SLURM_JOB_ID", job_id)
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("must not run commands without allocation"),
+    )
+    with pytest.raises(SystemExit, match="2"):
+        launcher.main()
+    assert not (tmp_path / ".venv-compatibility").exists()
+
+
+def test_slurm_requires_device_mask(launcher, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["run_compatibility.py"])
+    monkeypatch.setenv("SLURM_JOB_ID", "123")
+    monkeypatch.setenv("SLURM_STEP_ID", "0")
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail(
+            "must not run commands without device mask"
+        ),
+    )
+    with pytest.raises(SystemExit, match="2"):
+        launcher.main()
+
+
+def test_slurm_preserves_device_mask_and_ignores_dotenv(launcher, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["run_compatibility.py"])
+    monkeypatch.setenv("SLURM_JOB_ID", "123")
+    monkeypatch.setenv("SLURM_STEP_ID", "0")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,5")
+
+    def succeed(command, **kwargs):
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == "3,5"
+        if "--suite" in command:
+            assert os.environ["PYTHON_DOTENV_DISABLED"] == "1"
+            assert "RAY_ADDRESS" not in os.environ
+        return subprocess.CompletedProcess(command, 0, stdout="GPU\nGPU\n")
+
+    monkeypatch.setattr(launcher.subprocess, "run", succeed)
+    assert launcher.main() == 0

@@ -58,42 +58,66 @@ Layer-discovery unit tests additionally import real vLLM classes. They run in th
 compatibility environment alongside the GPU discovery tests, not in the minimal
 CPU job. The existing lint, format and type checks still run separately.
 
-## Run GPU tests on a new machine
+## Run GPU tests through Slurm
 
-Check out the PR branch (`ci/vllm-compatibility-matrix`) on Linux with working
-NVIDIA drivers, Python 3 and [uv](https://docs.astral.sh/uv/getting-started/installation/).
-Then, from the repository root:
+Check out the PR branch (`ci/vllm-compatibility-matrix`) on the cluster. From the
+repository root, submit:
 
 ```bash
-python3 scripts/run_compatibility.py
+sbatch scripts/compatibility.slurm
 ```
 
-This defaults to **vLLM 0.30.0 and both suites**, so it requires **two GPUs**.
-It checks the driver before downloading dependencies, uses uv to provision
-Python 3.12 in a fresh environment under `.venv-compatibility/`, installs the
-selected vLLM and test dependencies, checks CUDA visibility, then runs smoke
-and TP/PP tests sequentially. It stops on the first failure.
+The job uses the cluster's default account and partition and requests **one node,
+`--gres=gpu:2`, eight CPUs, 32 GiB host memory and two hours**. Slurm queues the job
+until those resources are available. A single `srun` task launches the tests
+inside the allocation; vLLM spawns its TP/PP workers within that step. The script
+does not request an exclusive node or modify other jobs.
 
-The smoke suite uses the ungated `Qwen/Qwen2.5-0.5B-Instruct` model. Allow room for
-both the vLLM engine and a Hugging Face reference model (16 GiB per GPU is a
-sensible starting point). The first run needs network access and several GB
-of disk space for Python packages and model weights. Subsequent runs reuse uv
-and Hugging Face download caches but create fresh test environments.
+The compute environment needs Linux, working NVIDIA drivers, Python 3 and
+[uv](https://docs.astral.sh/uv/getting-started/installation/) on `PATH`. The job
+provisions Python 3.12 and vLLM **0.30.0** in a fresh environment, then runs smoke
+and parallel suites sequentially. It stops at the first failure. Ensure any
+site-required modules are available in the batch environment.
 
-For a single-GPU machine, or to select a different candidate explicitly:
+Slurm's `CUDA_VISIBLE_DEVICES` is preserved. Compatibility runs disable `.env`
+loading and clear inherited `RAY_ADDRESS` so they cannot override the assigned
+GPUs or connect to another job's Ray instance. The batch script uses a private
+job temporary directory and a job-derived HTTP port; an occupied port fails
+validation rather than reusing the existing server. Only its own temporary
+directory is removed at exit. Slurm manages worker cleanup when the job ends.
+
+For a single-GPU smoke run or a different explicit candidate:
 
 ```bash
-python3 scripts/run_compatibility.py --suite smoke
-python3 scripts/run_compatibility.py --vllm-version X.Y.Z
+sbatch --gres=gpu:1 scripts/compatibility.slurm --suite smoke
+sbatch scripts/compatibility.slurm --vllm-version X.Y.Z
 # Run just the two-GPU tests:
-python3 scripts/run_compatibility.py --suite parallel
+sbatch scripts/compatibility.slurm --suite parallel
 ```
+
+Resource overrides such as `--time=04:00:00` go **before** the script path;
+launcher arguments such as `--suite smoke` go **after** it. Both suites require
+two GPUs on the same node. A 16 GiB GPU is a sensible minimum starting point for
+the small ungated `Qwen/Qwen2.5-0.5B-Instruct` model and its Hugging Face reference.
+The first run needs network access on the compute node and several GB of disk
+space for packages and model weights; later runs reuse download caches.
+
+`sbatch` prints the job ID. Monitor it with `squeue -j JOB_ID`, read the combined
+setup/test output in `slurm-vllm-lens-compat-JOB_ID.out`, and use `scancel JOB_ID`
+to cancel that job if needed. Environments and reports are kept in the checkout,
+so it must be on storage accessible from the compute node.
+
+Inside an existing GPU allocation, use `srun python3 scripts/run_compatibility.py`.
+On a standalone GPU machine without Slurm, `python3 scripts/run_compatibility.py`
+also works. When Slurm is detected, the launcher and test harness require a job
+step and a device mask before touching GPUs; an `salloc` shell on a login node
+alone is insufficient.
 
 A smoke-only pass does not validate TP/PP or justify advancing the package pin.
-The launcher prints its environment and results paths. Reports are saved under
+The job log records the environment and results paths. Reports are saved under
 `compatibility-results/<version>/<timestamp>-<unique-id>/{smoke,parallel}/`,
-including `environment.json`, per-suite logs and JUnit XML. Previous runs are
-preserved. Attach the complete results directory to the PR after testing.
+including `environment.json` (with Slurm job/step IDs and the device mask),
+per-suite logs and JUnit XML. Previous runs are preserved. Attach the complete results directory to the PR after testing.
 
 The launcher uses `uv pip` with an explicit candidate override, so it can test a
 new release even after the package has an exact vLLM pin. It does not change
@@ -104,7 +128,7 @@ For debugging, rerun an individual suite with the environment path printed by
 the launcher and a new output directory:
 
 ```bash
-/path/to/test-environment/bin/python scripts/check_compatibility.py \
+srun /path/to/test-environment/bin/python scripts/check_compatibility.py \
   --expected-vllm 0.30.0 --suite smoke --output-dir compatibility-results/retry-smoke
 ```
 
@@ -129,8 +153,8 @@ silent no-ops that a successful completion or shape-only check would miss.
 
 ## Local validation before a release
 
-CI runs CPU checks only. Run GPU compatibility tests manually on a local GPU
-machine using the commands above; there are no scheduled or manually dispatched
+CI runs CPU checks only. Run GPU compatibility tests in a Slurm allocation
+using the commands above; there are no scheduled or manually dispatched
 GPU jobs in GitHub Actions.
 
 Before a release, run the smoke and parallel suites for the proposed pinned

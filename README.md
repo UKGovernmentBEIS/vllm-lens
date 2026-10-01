@@ -397,13 +397,15 @@ The template is used exclusively when set (no auto-discovery), and every index i
 CPU regression tests run on PRs without a GPU or vLLM installation. The
 [compatibility guide](docs/compatibility.md) describes their setup and the
 local single-GPU and TP/PP validation commands. GPU tests run locally only.
-On a Linux machine with `uv` and two NVIDIA GPUs, set up and run both suites with:
+On a Slurm cluster, submit both suites from the repository root:
 
 ```bash
-python3 scripts/run_compatibility.py
+sbatch scripts/compatibility.slurm
 ```
 
-Use `--suite smoke` for a single GPU. The default vLLM target is 0.30.0.
+This requests `--gres=gpu:2` using the default account and partition. For one GPU,
+use `sbatch --gres=gpu:1 scripts/compatibility.slurm --suite smoke`.
+The default vLLM target is 0.30.0; see the guide for prerequisites and job logs.
 
 Integration tests in `tests/` run against a live vLLM server. You can either let the fixture start one automatically, or point at an existing server:
 

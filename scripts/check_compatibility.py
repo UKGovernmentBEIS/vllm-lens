@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import platform
 import signal
+import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -67,6 +68,13 @@ def main() -> int:
         "--output-dir", type=Path, default=ROOT / "compatibility-results"
     )
     args = parser.parse_args()
+    if os.environ.get("SLURM_JOB_ID") or shutil.which("srun") or shutil.which("sbatch"):
+        if not (os.environ.get("SLURM_JOB_ID") and os.environ.get("SLURM_STEP_ID")):
+            parser.error(
+                "Run GPU tests in an srun step; submit scripts/compatibility.slurm"
+            )
+        if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+            parser.error("Slurm must set CUDA_VISIBLE_DEVICES for the allocated GPUs")
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     report = {
@@ -79,6 +87,16 @@ def main() -> int:
         "runner": "V1, eager, prefix caching enabled",
         "model": "Qwen/Qwen2.5-0.5B-Instruct",
         "nvidia_smi": command_output(["nvidia-smi"]),
+        "slurm": {
+            key: os.environ.get(key)
+            for key in (
+                "SLURM_JOB_ID",
+                "SLURM_STEP_ID",
+                "SLURM_JOB_NODELIST",
+                "SLURM_CPUS_PER_TASK",
+                "CUDA_VISIBLE_DEVICES",
+            )
+        },
         "packages": dict(
             sorted(
                 (dist.metadata["Name"], dist.version)
@@ -105,6 +123,7 @@ def main() -> int:
         env = os.environ.copy()
         env.pop("VLLM_LENS_DISABLE", None)
         env.pop("VLLM_LENS_LAYER_PATH", None)
+        env.pop("RAY_ADDRESS", None)
         env.update(
             {
                 "VLLM_LENS_STRICT_COMPATIBILITY": "1",
@@ -115,6 +134,7 @@ def main() -> int:
                 "VLLM_TEST_MAX_MODEL_LEN": "2048",
                 "VLLM_TEST_REUSE_SERVER": "0",
                 "PYTHONUNBUFFERED": "1",
+                "PYTHON_DOTENV_DISABLED": "1",
             }
         )
         for name, tests in SMOKE if args.suite == "smoke" else PARALLEL:
