@@ -13,7 +13,7 @@ pass; if a candidate fails, retain the last validated pin and investigate.
 
 | vLLM | Python | PyTorch | Runner | Status |
 | --- | --- | --- | --- | --- |
-| 0.30.0 | 3.12 | 2.13.0 / CUDA 13.0 | V1, eager | GPU checks run; bfloat16 HF parity fails; not validated |
+| 0.30.0 | 3.12 | 2.13.0 / CUDA 13.0 | V1, eager | FP32 parity policy adopted; complete rerun pending |
 
 This row is a **test target, not a declaration that the new suite has passed**.
 GPU compatibility tests run locally. Update a row to validated only after
@@ -81,6 +81,10 @@ site-required modules are available in the batch environment.
 
 The test dependencies include `accelerate>=1.1.0` for the Hugging Face reference
 fixtures' CUDA device mapping and `ninja` for FlashInfer's runtime kernel builds.
+`transformers==5.18.0` fixes the reference implementation across vLLM candidates;
+PyTorch follows each candidate's requirements. Exact versions are recorded in
+each run's evidence. An incompatible Transformers constraint is a setup failure,
+not permission to silently change the reference.
 The launcher and direct suite runner put the test environment's executables on
 `PATH`; no shell activation is needed. The suite runner checks `ninja` before
 starting a model. A missing build tool is a setup failure, so fix the environment
@@ -158,11 +162,19 @@ It refuses to reuse a server already listening on `VLLM_TEST_PORT` (default
 Each suite runs in a separate process to isolate existing GPU teardown behavior.
 Any failure, missing JUnit report, empty selection or skipped test fails the run.
 
+Reference parity uses **FP32 on both vLLM and Hugging Face**, with the existing
+mean absolute error limit of 0.01. This checks capture/computation correctness
+without treating different BF16 rounding sequences as integration failures.
+Native-dtype (BF16 for the test model) functional checks still cover capture,
+batch isolation, steering, hooks, HTTP and TP/PP. Casting captured BF16 values
+to FP32 after inference is not an FP32 reference comparison: both engines must
+execute in FP32.
+
 Coverage:
 
 | Suite | Checks |
 | --- | --- |
-| Smoke | Layer discovery; offline capture against Hugging Face; mixed-length batching; chunked prefill; offline generate/chat steering and hooks; async steering; HTTP completion/chat capture and interventions via base64 and binary transport; repeated-prefix isolation; persistent-hook cleanup |
+| Smoke | Layer discovery; offline and async capture against Hugging Face; mixed-length batching; chunked prefill; offline generate/chat steering and hooks; async steering; HTTP completion/chat capture and interventions via base64 and binary transport; repeated-prefix isolation; persistent-hook cleanup |
 | Parallel | TP=2 / PP=2 batched capture; PP capture/reference checks; norm-matched steering on TP=2 / PP=2 |
 
 The HTTP tests check hook/native capture equality and the numerical sign/scale
@@ -230,8 +242,10 @@ and Hugging Face use different rounding sequences.
 Separate ten-prompt diagnostics in Slurm job 137 found worst mean errors of
 **0.000681** for float32 vLLM versus float32 HF, and **0.010051** for bfloat16
 vLLM versus float32 HF. These are precision diagnostics. The acceptance tests
-still compare bfloat16 on both sides, and all correctness thresholds remain
-unchanged. A float32 reference alone does not resolve bfloat16 validation.
+compared bfloat16 on both sides in job 138. All correctness thresholds remain
+unchanged. A float32 reference alone does not resolve bfloat16 parity. The
+maintainer subsequently approved FP32/FP32 reference parity, retaining BF16
+functional checks; the complete suites must be rerun under that policy.
 
 Full logs, JUnit, package/hardware/revision/Slurm metadata and CPU results are
 retained at

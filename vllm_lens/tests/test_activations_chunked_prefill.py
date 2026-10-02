@@ -4,7 +4,7 @@ import pytest
 import torch
 from vllm import LLM, SamplingParams
 
-from .conftest import LAYER_IDX, MODEL_NAME, PROMPT
+from .conftest import LAYER_IDX, MODEL_NAME, PROMPT, REFERENCE_DTYPE
 
 LONG_PROMPT = "The quick brown fox jumps over the lazy dog. " * 20
 
@@ -13,7 +13,7 @@ LONG_PROMPT = "The quick brown fox jumps over the lazy dog. " * 20
 def chunked_llm():
     llm = LLM(
         model=MODEL_NAME,
-        dtype="auto",
+        dtype=REFERENCE_DTYPE,
         gpu_memory_utilization=0.3,
         max_num_batched_tokens=64,
         enable_chunked_prefill=True,

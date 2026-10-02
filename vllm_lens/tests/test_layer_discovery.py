@@ -11,13 +11,13 @@ import gc
 import torch
 from vllm import LLM, SamplingParams
 
-from .conftest import LAYER_IDX, MODEL_NAME, NUM_LAYERS, PROMPT
+from .conftest import LAYER_IDX, MODEL_NAME, NUM_LAYERS, PROMPT, REFERENCE_DTYPE
 
 
 def test_registry_discovery_and_capture(hf_model):
     llm = LLM(
         model=MODEL_NAME,
-        dtype="auto",
+        dtype=REFERENCE_DTYPE,
         gpu_memory_utilization=0.3,
     )
     try:

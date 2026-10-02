@@ -33,6 +33,10 @@ SMOKE = [
         "capture",
         ["vllm_lens/tests/test_activations_offline.py", "-k", "not tp2 and not pp2"],
     ),
+    (
+        "async-capture",
+        ["vllm_lens/tests/test_activations_match.py", "-k", "TestMatchesTransformers"],
+    ),
     ("chunked-prefill", ["vllm_lens/tests/test_activations_chunked_prefill.py"]),
     ("offline-interventions", ["vllm_lens/tests/test_steering_offline.py"]),
     (
@@ -98,6 +102,8 @@ def main() -> int:
         "suite": args.suite,
         "runner": "V1, eager, prefix caching enabled",
         "model": "Qwen/Qwen2.5-0.5B-Instruct",
+        "reference_dtype": "float32",
+        "functional_dtype": "auto (bfloat16 for Qwen/Qwen2.5-0.5B-Instruct)",
         "nvidia_smi": command_output(["nvidia-smi"]),
         "slurm": {
             key: os.environ.get(key)

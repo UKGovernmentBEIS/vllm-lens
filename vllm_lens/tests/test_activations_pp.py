@@ -8,13 +8,35 @@ from vllm import LLM, SamplingParams
 
 from vllm_lens import SteeringVector
 
-from .conftest import LAYER_IDX, MODEL_NAME, NUM_LAYERS, PROMPT, PROMPTS
+from .conftest import (
+    LAYER_IDX,
+    MODEL_NAME,
+    NUM_LAYERS,
+    PROMPT,
+    PROMPTS,
+    REFERENCE_DTYPE,
+)
 
 # Skip entire module if fewer than 2 GPUs available.
 pytestmark = pytest.mark.skipif(
     torch.cuda.device_count() < 2,
     reason="Pipeline parallelism tests require at least 2 GPUs",
 )
+
+
+@pytest.fixture(scope="module")
+def llm_pp2_reference():
+    """FP32 parity engine; other PP capture/steering checks retain BF16."""
+    llm = LLM(
+        model=MODEL_NAME,
+        dtype=REFERENCE_DTYPE,
+        gpu_memory_utilization=0.3,
+        pipeline_parallel_size=2,
+    )
+    yield llm
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 @pytest.fixture(scope="module")
@@ -98,7 +120,7 @@ class TestPPActivationCapture:
                 f"Prompt {i}: expected {NUM_LAYERS} layers, got {stream.shape[0]}"
             )
 
-    def test_activations_match_hf(self, llm_pp2, hf_model):
+    def test_activations_match_hf(self, llm_pp2_reference, hf_model):
         """PP=2 activations for a specific layer should match HuggingFace."""
         model, tokenizer = hf_model
         hf_acts = _get_hf_acts(model, tokenizer, PROMPT)
@@ -109,7 +131,7 @@ class TestPPActivationCapture:
             max_tokens=1,
             extra_args={"output_residual_stream": [LAYER_IDX]},
         )
-        outputs = llm_pp2.generate([PROMPT], sp)
+        outputs = llm_pp2_reference.generate([PROMPT], sp)
         vllm_acts = outputs[0].activations["residual_stream"][0, :num_tokens].float()
 
         assert vllm_acts.shape == hf_acts.shape, (
