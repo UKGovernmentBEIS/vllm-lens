@@ -4,12 +4,33 @@ import pytest
 import torch
 from vllm import LLM, SamplingParams
 
-from .conftest import LAYER_IDX, MODEL_NAME, NUM_LAYERS, PROMPT, PROMPTS
+from .conftest import (
+    LAYER_IDX,
+    MODEL_NAME,
+    NUM_LAYERS,
+    PROMPT,
+    PROMPTS,
+    REFERENCE_DTYPE,
+)
 
 # Layers straddling the PP=2 stage boundary (stage 0 = [0, NUM_LAYERS//2)),
 # so the per-request cross-rank concat in _merge_captured_states_batch is
 # actually exercised (a single layer lives on one stage only).
 _CROSS_STAGE_LAYERS = [LAYER_IDX, NUM_LAYERS - 4]
+
+
+@pytest.fixture(scope="module")
+def llm_reference():
+    """FP32 engine for HF parity; llm_model retains native-dtype coverage."""
+    llm = LLM(
+        model=MODEL_NAME,
+        dtype=REFERENCE_DTYPE,
+        gpu_memory_utilization=0.3,
+    )
+    yield llm
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 @pytest.fixture(scope="module")
@@ -86,30 +107,30 @@ def _assert_close(vllm_acts: torch.Tensor, hf_acts: torch.Tensor):
 
 
 class TestOfflineMatchesTransformers:
-    def test_single_prompt_1_token(self, llm_model, hf_model):
+    def test_single_prompt_1_token(self, llm_reference, hf_model):
         model, tokenizer = hf_model
         num_tokens = tokenizer(PROMPT, return_tensors="pt").input_ids.shape[1]
 
         hf_acts = _get_hf_acts(model, tokenizer, PROMPT)
-        streams = _get_vllm_acts(llm_model, [PROMPT], max_tokens=1)
+        streams = _get_vllm_acts(llm_reference, [PROMPT], max_tokens=1)
         vllm_acts = streams[0][0, :num_tokens].float()
 
         _assert_close(vllm_acts, hf_acts)
 
-    def test_single_prompt_10_tokens(self, llm_model, hf_model):
+    def test_single_prompt_10_tokens(self, llm_reference, hf_model):
         model, tokenizer = hf_model
         num_tokens = tokenizer(PROMPT, return_tensors="pt").input_ids.shape[1]
 
         hf_acts = _get_hf_acts(model, tokenizer, PROMPT)
-        streams = _get_vllm_acts(llm_model, [PROMPT], max_tokens=10)
+        streams = _get_vllm_acts(llm_reference, [PROMPT], max_tokens=10)
         vllm_acts = streams[0][0, :num_tokens].float()
 
         _assert_close(vllm_acts, hf_acts)
 
-    def test_batch_prompts_10_tokens(self, llm_model, hf_model):
+    def test_batch_prompts_10_tokens(self, llm_reference, hf_model):
         model, tokenizer = hf_model
 
-        streams = _get_vllm_acts(llm_model, PROMPTS, max_tokens=10)
+        streams = _get_vllm_acts(llm_reference, PROMPTS, max_tokens=10)
 
         for i, prompt in enumerate(PROMPTS):
             num_tokens = tokenizer(prompt, return_tensors="pt").input_ids.shape[1]

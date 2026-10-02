@@ -3,13 +3,10 @@ import subprocess
 from pathlib import Path
 from typing import Annotated
 
-import sifter
 import typer
 from dotenv import load_dotenv
-from isambard_container_tools._helpers.pre_download import (
-    pre_download_datasets,
-    pre_download_models,
-)
+from datasets import load_dataset
+from huggingface_hub import snapshot_download
 from utils.types import BenchmarkConfig, BenchmarkRun
 
 _HERE_resolved = Path(__file__).parent
@@ -30,12 +27,12 @@ SLURM_TEMPLATE = HERE / "ray.slurm"
 LOGS_DIR = HERE / "logs"
 
 
-def _resolve_container(container_name: str) -> str:
-    """Resolve a container name like 'vllm-lens-0.18.0' to a .sif path via sifter."""
-    last_dash = container_name.rfind("-")
-    prefix = container_name[: last_dash + 1]
-    version = container_name[last_dash + 1 :]
-    return sifter.find_latest_container(prefix=prefix, version=version)  # type: ignore[attr-defined]
+def _resolve_container(container_name: str, container_dir: Path) -> str:
+    """Use an explicitly supplied directory of Apptainer images."""
+    image = (container_dir / f"{container_name}.sif").resolve()
+    if not image.is_file():
+        raise typer.BadParameter(f"Container image does not exist: {image}")
+    return str(image)
 
 
 # ─── Per-benchmark configuration ──────────────────────────────────────────────
@@ -249,6 +246,7 @@ def submit_job(
     samples: int,
     layer: int,
     dataset: str,
+    container_dir: Path,
     dry_run: bool = False,
 ) -> str | None:
     """Build environment, write sbatch command, and submit."""
@@ -256,7 +254,7 @@ def submit_job(
     config_json = config.model_dump_json()
 
     env = os.environ.copy()
-    env["CONTAINER"] = _resolve_container(bench.container_name)
+    env["CONTAINER"] = _resolve_container(bench.container_name, container_dir)
     env["WORK_DIR"] = str(HERE)
     env["USER_SCRIPT"] = str(HERE / bench.script)
     env["BENCHMARK_CONFIG"] = config_json
@@ -295,6 +293,16 @@ def submit_job(
 
 @app.command()
 def main(
+    container_dir: Annotated[
+        Path,
+        typer.Option(
+            "--container-dir",
+            envvar="VLLM_BENCHMARK_CONTAINER_DIR",
+            exists=True,
+            file_okay=False,
+            help="Directory containing <container_name>.sif Apptainer images",
+        ),
+    ],
     benchmarks: Annotated[
         list[str] | None,
         typer.Option("--benchmarks", "-b", help="Names to run (default: all)"),
@@ -313,7 +321,6 @@ def main(
     """Submit activation-extraction benchmarks as Slurm jobs."""
     load_dotenv()
     LOGS_DIR.mkdir(exist_ok=True)
-    pre_download_datasets([{"path": dataset, "split": "train"}])
 
     selected = [
         b for b in BENCHMARKS if benchmarks is None or b.name in (benchmarks or [])
@@ -325,9 +332,14 @@ def main(
         )
         raise typer.Exit(1)
 
+    if not dry_run:
+        load_dataset(dataset, split="train")
     for bench in selected:
-        pre_download_models([bench.model])
-        job_id = submit_job(bench, samples, layer, dataset, dry_run=dry_run)
+        if not dry_run:
+            snapshot_download(bench.model)
+        job_id = submit_job(
+            bench, samples, layer, dataset, container_dir, dry_run=dry_run
+        )
         if job_id and job_id != "dry-run":
             total_gpus = bench.n_gpus * bench.n_nodes
             node_info = f" × {bench.n_nodes} nodes" if bench.n_nodes > 1 else ""

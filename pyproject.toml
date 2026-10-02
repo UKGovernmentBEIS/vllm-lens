@@ -8,7 +8,7 @@
         "cloudpickle>=3.0.0",
         "datasets>=4.0.0",
         "pydantic>=2.0",
-        "vllm>=0.16.0",
+        "vllm==0.30.0",
         "zstandard>=0.23.0",
     ]
     description="vLLM plugin for interacting with activations during inference"
@@ -26,27 +26,23 @@
     packages=["vllm_lens"]
 
 [tool.uv]
-    override-dependencies=["aiobotocore>=3.0.0", "transformers>=5.3.0"]
+    override-dependencies=["aiobotocore>=3.0.0", "transformers==5.18.0"]
     [tool.uv.sources]
-        isambard-container-tools={git="https://github.com/AI-Safety-Institute/hpc-containers.git"}
-        sifter={git="https://github.com/UKGovernmentBEIS/sifter.git"}
         torch=[
-            {index="pytorch-cu126", marker="sys_platform == 'linux' or sys_platform == 'win32'"},
+            {index="pytorch-cu130", marker="sys_platform == 'linux' or sys_platform == 'win32'"},
         ]
         torchvision=[
-            {index="pytorch-cu126", marker="sys_platform == 'linux' or sys_platform == 'win32'"},
+            {index="pytorch-cu130", marker="sys_platform == 'linux' or sys_platform == 'win32'"},
         ]
 
     [[tool.uv.index]]
         explicit=true
-        name="pytorch-cu126"
-        url="https://download.pytorch.org/whl/cu126"
+        name="pytorch-cu130"
+        url="https://download.pytorch.org/whl/cu130"
 
 [dependency-groups]
     benchmarking=[
-        "isambard-container-tools",
         "nnsight==0.6.3",
-        "sifter",
         "transformer-lens",
     ]
     dev=[
@@ -70,7 +66,7 @@
         "syrupy>=5.1.0",
         "torch>=2.9.1",
         "tqdm>=4.67.3",
-        "transformers>=5.3.0",
+        "transformers==5.18.0",
         "typeguard>=4.5.1",
         "typer>=0.24.1",
 ]

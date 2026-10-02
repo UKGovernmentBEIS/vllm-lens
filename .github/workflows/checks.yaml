@@ -6,7 +6,6 @@ on:
       - main
     paths-ignore:
       - '.devcontainer/**'
-      - '.github/**'
       - '.vscode/**'
       - '.gitignore'
       - 'README.md'
@@ -15,7 +14,6 @@ on:
       - main
     paths-ignore:
       - '.devcontainer/**'
-      - '.github/**'
       - '.vscode/**'
       - '.gitignore'
       - 'README.md'
@@ -26,6 +24,26 @@ on:
         required: false
 
 jobs:
+  cpu-tests:
+    name: CPU regression tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv venv --python 3.12
+      - name: Install CPU test dependencies
+        run: |
+          uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install -r requirements/cpu-tests.txt
+          uv pip install --no-deps -e .
+      - name: Run CPU tests without vLLM or model downloads
+        run: .venv/bin/python -m pytest tests/unit examples/tests/test_r_lens_rules.py --junitxml=cpu-results.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cpu-results
+          path: cpu-results.xml
+
   checks:
     name: Checks
     runs-on: ubuntu-latest

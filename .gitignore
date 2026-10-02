@@ -33,3 +33,8 @@ vllm_lens/_benchmarks/logs/
 .claude/settings.json
 .claude/scheduled_tasks.lock
 *.pt
+.venv-compatibility/
+.venv-cpu/
+.venv-candidate/
+compatibility-results/
+slurm-vllm-lens-compat-*.out

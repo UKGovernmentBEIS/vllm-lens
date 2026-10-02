@@ -6,7 +6,7 @@ import torch
 from syrupy.assertion import SnapshotAssertion
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 
-from .conftest import LAYER_IDX, MODEL_NAME, PROMPT, PROMPTS
+from .conftest import LAYER_IDX, MODEL_NAME, PROMPT, PROMPTS, REFERENCE_DTYPE
 
 # The activation snapshot is bit-sensitive to the GPU architecture (bf16
 # accumulation order differs across devices), so the committed values are only
@@ -17,6 +17,20 @@ _SNAPSHOT_GPU = "NVIDIA L4"
 
 def _current_gpu() -> str:
     return torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""
+
+
+@pytest.fixture(scope="module")
+async def vllm_reference():
+    engine_args = AsyncEngineArgs(
+        model=MODEL_NAME,
+        dtype=REFERENCE_DTYPE,
+        gpu_memory_utilization=0.3,
+    )
+    engine = AsyncLLMEngine.from_engine_args(engine_args)
+    yield engine
+    engine.shutdown()
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 @pytest.fixture(scope="module")
@@ -66,32 +80,36 @@ def _assert_close(vllm_acts: torch.Tensor, hf_acts: torch.Tensor):
 
 
 class TestMatchesTransformers:
-    async def test_single_prompt_1_token(self, vllm_model, hf_model):
+    async def test_single_prompt_1_token(self, vllm_reference, hf_model):
         model, tokenizer = hf_model
         num_tokens = tokenizer(PROMPT, return_tensors="pt").input_ids.shape[1]
 
         hf_acts = _get_hf_acts(model, tokenizer, PROMPT)
-        stream = await _get_vllm_acts(vllm_model, PROMPT, "single-1tok", max_tokens=1)
+        stream = await _get_vllm_acts(
+            vllm_reference, PROMPT, "single-1tok", max_tokens=1
+        )
         vllm_acts = stream[0, :num_tokens].float()
 
         _assert_close(vllm_acts, hf_acts)
 
-    async def test_single_prompt_10_tokens(self, vllm_model, hf_model):
+    async def test_single_prompt_10_tokens(self, vllm_reference, hf_model):
         model, tokenizer = hf_model
         num_tokens = tokenizer(PROMPT, return_tensors="pt").input_ids.shape[1]
 
         hf_acts = _get_hf_acts(model, tokenizer, PROMPT)
-        stream = await _get_vllm_acts(vllm_model, PROMPT, "single-10tok", max_tokens=10)
+        stream = await _get_vllm_acts(
+            vllm_reference, PROMPT, "single-10tok", max_tokens=10
+        )
         vllm_acts = stream[0, :num_tokens].float()
 
         _assert_close(vllm_acts, hf_acts)
 
-    async def test_batch_prompts_10_tokens(self, vllm_model, hf_model):
+    async def test_batch_prompts_10_tokens(self, vllm_reference, hf_model):
         model, tokenizer = hf_model
 
         vllm_streams = await asyncio.gather(
             *(
-                _get_vllm_acts(vllm_model, p, f"batch-{i}", max_tokens=10)
+                _get_vllm_acts(vllm_reference, p, f"batch-{i}", max_tokens=10)
                 for i, p in enumerate(PROMPTS)
             )
         )

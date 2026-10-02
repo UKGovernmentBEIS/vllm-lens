@@ -14,6 +14,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+# Compare implementations in FP32; functional/intervention tests retain BF16.
+REFERENCE_DTYPE = "float32"
 LAYER_IDX = 2
 NUM_LAYERS = 24
 PROMPT = "The future of AI is"
@@ -35,7 +37,7 @@ PROMPTS = [
 def hf_model():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = AutoModelForCausalLM.from_pretrained(  # type: ignore[reportCallIssue]
-        MODEL_NAME, dtype="auto", device_map="cuda"
+        MODEL_NAME, dtype=REFERENCE_DTYPE, device_map="cuda"
     ).eval()
     yield model, tokenizer
     del model, tokenizer
