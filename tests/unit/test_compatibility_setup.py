@@ -1,6 +1,7 @@
 """Exercise launcher failure handling without downloads or CUDA."""
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -222,3 +223,42 @@ def test_direct_checker_children_find_environment_tools(monkeypatch, tmp_path):
     )
     assert result.stdout.strip() == "environment-ninja"
     assert env["VIRTUAL_ENV"] == str(bin_dir.parent)
+
+
+def test_checker_rejects_inaccessible_git_metadata_before_cuda(monkeypatch, tmp_path):
+    import torch
+
+    path = Path(__file__).resolve().parents[2] / "scripts" / "check_compatibility.py"
+    spec = importlib.util.spec_from_file_location("compatibility_checker", path)
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    monkeypatch.setattr(checker.shutil, "which", lambda name: None)
+    for name in ("SLURM_JOB_ID", "SLURM_STEP_ID", "CUDA_VISIBLE_DEVICES"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        checker,
+        "command_output",
+        lambda args: "fatal: not a git repository" if args[0] == "git" else "",
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "device_count",
+        lambda: pytest.fail("invalid revision must fail before CUDA checks"),
+    )
+    output = tmp_path / "reports"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "check_compatibility.py",
+            "--expected-vllm",
+            "0.30.0",
+            "--output-dir",
+            str(output),
+        ],
+    )
+    assert checker.main() == 1
+    report = json.loads((output / "environment.json").read_text())
+    assert report["status"] == "failed"
+    assert report["results"] == []
+    assert "Git revision" in report["error"]

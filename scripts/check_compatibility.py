@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import signal
 import shutil
 import subprocess
@@ -120,6 +121,12 @@ def main() -> int:
     }
     report_path = output / "environment.json"
     try:
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", report["revision"]):
+            raise RuntimeError(
+                "Cannot record the tested Git revision. The checkout and its Git "
+                "metadata must be accessible on the compute node; use a shared "
+                "clone or schedule the job on the node holding the checkout."
+            )
         import torch
 
         actual = importlib.metadata.version("vllm")
