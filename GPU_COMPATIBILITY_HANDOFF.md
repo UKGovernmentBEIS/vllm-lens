@@ -206,3 +206,40 @@ validation is substantiated; do not merge or publish a release in this task.
 
 When done, remove this temporary handoff, commit/push its deletion, and tell the
 maintainer what passed, which version is pinned and where the evidence is stored.
+
+## Continuation results — 2026-10-02, 12:40 UTC
+
+GPU validation is now complete. Clean commit `5cbffc1` forces spawned workers
+in the compatibility runner after job 1's second pipeline engine deadlocked in
+CPU tensor allocation. Full Slurm job **5.0** passed **45 smoke + 11 parallel**
+tests, with no failures/errors/skips. All 10 report groups were inspected.
+128 CPU tests, Ruff 0.15.3 and Pyright 1.1.414 pass.
+
+Fresh evidence is in `compatibility-results/0.30.0/20261002T122444Z-myq9ko1h/`
+and `docs/compatibility-evidence/vllm-0.30.0-job-5.tar.gz`. `docs/compatibility.md`
+records the exact tested SHA/environment. No newer stable vLLM release was
+available on PyPI on 2026-10-02. Job 1's incomplete reports/stacks are retained
+in `20261002T120553Z-itnpoyz2/`. No old reports were recovered.
+
+Remaining blocker: coordinated pin/development-lock update. Prepared changes
+in `pyproject.toml` pin vLLM 0.30.0 and replace the cu126 torch/torchvision index
+with cu130, but are uncommitted until lock regeneration succeeds. `uv lock`
+fails fetching existing private benchmarking dependencies because current
+GitHub credentials cannot access `UKGovernmentBEIS/sifter` and
+`AI-Safety-Institute/hpc-containers`. Authentication for this PR repository
+works. Use session-scoped Git credential configuration for uv:
+
+```bash
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper \
+  GIT_CONFIG_VALUE_0='!gh auth git-credential' uv lock
+```
+
+A temporary resolution preview excluding benchmarking (not the final lock)
+confirmed vLLM 0.30.0 / torch 2.13.0+cu130 resolves. Do not copy that preview
+lock: it removes unrelated benchmarking dependencies. Obtain private repo
+access, regenerate the complete lock, verify development setup and review
+unrelated churn before committing the pin. The prepared final PR text is at
+`/tmp/vllm-lens-pr-41.md`. Keep the PR draft until setup is verified, then update
+it and remove this handoff as required above. No GPU rerun is required merely
+for dependency metadata/docs changes; inference code/tests are unchanged from
+the passing revision. Any implementation change does require GPU verification.

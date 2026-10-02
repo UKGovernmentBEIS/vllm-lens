@@ -13,13 +13,12 @@ pass; if a candidate fails, retain the last validated pin and investigate.
 
 | vLLM | Python | PyTorch | Runner | Status |
 | --- | --- | --- | --- | --- |
-| 0.30.0 | 3.12 | 2.13.0 / CUDA 13.0 | V1, eager | FP32 parity policy adopted; complete rerun pending |
+| 0.30.0 | 3.12.3 | 2.13.0 / CUDA 13.0 | V1, eager | Validated: 45 smoke + 11 parallel passed (Slurm 5.0) |
 
-This row is a **test target, not a declaration that the new suite has passed**.
-GPU compatibility tests run locally. Update a row to validated only after
-attaching a passing local run for the relevant repository SHA,
-including the exact Python/PyTorch/vLLM versions and GPU/driver from its
-`environment.json`. CPU CI results alone do not validate inference.
+GPU compatibility tests run locally. The validated row covers clean revision
+`5cbffc1712f6edb6e9d6218f07465849d3c7a69b` on two H100 80GB GPUs, driver
+595.58.03. Its complete reports are linked below. CPU CI results alone do not
+validate inference.
 
 The [local compatibility script](../scripts/check_compatibility.py) saves
 environment metadata, per-suite logs and JUnit reports in `--output-dir`.
@@ -27,12 +26,13 @@ Attach the reports to the PR or release and include the environment summary in
 the release notes. Keep previous validation results when testing a new stable
 vLLM release. Do not label an untested replacement supported.
 
-The package's existing `vllm>=0.16.0` dependency remains temporarily unchanged
-while the first validation is pending; it is not a tested support guarantee.
-Once 0.30.0 passes both suites, change it to `vllm==0.30.0` and update the
-development lock and dependency sources to match. The existing lock uses
-0.19.0, but that is not an additional support target. Never advance the pin
-based only on successful installation, CPU checks or a planned GPU test.
+GPU validation now permits pinning `vllm==0.30.0` and switching development
+PyTorch sources to CUDA 13.0. The coordinated pin/lock update remains pending:
+the rebuilt machine cannot fetch the existing private benchmarking repositories
+`UKGovernmentBEIS/sifter` and `AI-Safety-Institute/hpc-containers`. The current
+range and 0.19.0 lock are temporary and are not additional support guarantees.
+Keep PR #41 draft until the development setup is updated and verified. Newer
+stable releases must pass both suites before advancing the validated version.
 
 V2 model-runner mode is unsupported and rejected by the plugin. The plugin
 defaults to V1 and forces eager execution; native V2/CUDA-graph support is outside
@@ -198,8 +198,8 @@ sequentially to avoid GPU memory contention. Review failures and attach the
 reports before updating this matrix and the release notes. This is a maintainer
 release checklist; the PyPI publication workflow does not enforce GPU evidence.
 
-Until GPU validation is available, keep the target pending and the compatibility
-PR in draft. Do not mark issue #39 complete based on CPU results alone.
+Keep future candidates pending until both GPU suites pass. Do not mark a
+candidate validated based on CPU results alone.
 
 ## Local results, 2026-10-02
 
@@ -277,9 +277,59 @@ reports and run both suites at the updated revision before advancing the pin.
 The suite selections above cover residual-stream capture and interventions;
 they do not include the separate Q/K GPU parity suites added on main.
 
-**0.30.0 remains pending full validation and unpinned.** The package's existing
-vLLM range and development lock remain temporary, and issue #39 stays open.
-PyPI listed no stable release newer than 0.30.0 at the 2026-10-01 lookup.
+Those pending statements describe the pre-rebuild state. The fresh validation
+below supersedes them. PyPI still listed no stable release newer than 0.30.0
+at the 2026-10-02 lookup.
+
+## Fresh validation after the rebuild, 2026-10-02
+
+Slurm job **5.0** completed both standard suites at clean revision
+`5cbffc1712f6edb6e9d6218f07465849d3c7a69b`: **56 passed, no failures,
+errors or skips**. Every selected group has a nonempty log and JUnit report;
+both environment reports record passing status and an empty working tree.
+
+| Group | Passed |
+| --- | ---: |
+| Discovery | 17 |
+| Offline capture / FP32 HF parity | 5 |
+| Async capture / FP32 HF parity | 3 |
+| Chunked prefill | 3 |
+| Offline interventions | 6 |
+| Async interventions | 6 |
+| HTTP hooks, transports and cleanup | 5 |
+| TP/PP capture | 2 |
+| Pipeline FP32 parity, capture and steering | 7 |
+| TP/PP norm-matched steering | 2 |
+| **Total** | **56** |
+
+The rebuilt environment used Python 3.12.3, vLLM 0.30.0, PyTorch 2.13.0 /
+CUDA 13.0, Transformers 5.18.0, Accelerate 1.15.0 and Ninja 1.13.2. Slurm
+allocated two H100 80GB GPUs on aft-0 with driver 595.58.03 and device mask
+`0,1`. Engines ran V1/eager with spawned workers. Reference engines execute
+in FP32; functional engines retain native BF16. Separate Q/K GPU parity suites
+are outside this result's coverage.
+
+The first post-rebuild run, job 1 at `5db7890`, passed all 45 smoke tests and
+both parallel-capture tests, then stalled creating the second pipeline engine.
+Python stacks showed forked workers blocked at a CPU `torch.zeros` allocation
+in `gpu_input_batch.py`, consistent with inherited PyTorch thread-pool locks.
+Only job 1 was canceled. The runner now forces `spawn` for test engines and
+records that setting. Job 5 passed all seven pipeline cases with this fix;
+no correctness thresholds or suite selections were weakened.
+
+All **128 CPU regressions**, Ruff 0.15.3 lint/format, Pyright 1.1.414 and
+Slurm shell syntax checks passed for the fix. The CPU environment used CPU-only
+PyTorch 2.14.1; it did not supply the GPU compatibility evidence.
+
+Complete logs, JUnit, metadata, batch output and CPU JUnit are preserved in
+[the compact job 5 evidence archive](compatibility-evidence/vllm-0.30.0-job-5.tar.gz).
+The original run directory is
+`/home/ubuntu/vllm-lens/compatibility-results/0.30.0/20261002T122444Z-myq9ko1h/`;
+batch output is `slurm-vllm-lens-compat-5.out`. The incomplete job 1 reports
+and CPU stack traces remain under `20261002T120553Z-itnpoyz2/`. Historical jobs
+137/138/147 were not recovered from this rebuilt checkout; their recorded
+results above remain distinct from this fresh passing validation.
+
 
 ## Diagnosing integration drift
 
