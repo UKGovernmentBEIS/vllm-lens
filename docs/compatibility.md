@@ -13,7 +13,7 @@ pass; if a candidate fails, retain the last validated pin and investigate.
 
 | vLLM | Python | PyTorch | Runner | Status |
 | --- | --- | --- | --- | --- |
-| 0.30.0 | 3.12 | Selected by vLLM | V1, eager | Initial target; full compatibility run pending |
+| 0.30.0 | 3.12 | 2.13.0 / CUDA 13.0 | V1, eager | GPU checks run; bfloat16 HF parity fails; not validated |
 
 This row is a **test target, not a declaration that the new suite has passed**.
 GPU compatibility tests run locally. Update a row to validated only after
@@ -114,6 +114,18 @@ setup/test output in `slurm-vllm-lens-compat-JOB_ID.out`, and use `scancel JOB_I
 to cancel that job if needed. Environments and reports are kept in the checkout,
 so it must be on storage accessible from the compute node.
 
+Git metadata must also be accessible from the compute node. A shared worktree
+whose `.git` points to a node-local directory is insufficient; use a complete
+shared clone or constrain the job to the node holding the checkout. For the
+node-local `/home/ubuntu/vllm-lens` checkout on aft-0:
+
+```bash
+sbatch --nodelist=aft-0 scripts/compatibility.slurm
+```
+
+The suite runner rejects an unavailable Git revision and writes failed setup
+evidence before checking CUDA or starting models.
+
 Inside an existing GPU allocation, use `srun python3 scripts/run_compatibility.py`.
 On a standalone GPU machine without Slurm, `python3 scripts/run_compatibility.py`
 also works. When Slurm is detected, the launcher and test harness require a job
@@ -172,6 +184,71 @@ release checklist; the PyPI publication workflow does not enforce GPU evidence.
 
 Until GPU validation is available, keep the target pending and the compatibility
 PR in draft. Do not mark issue #39 complete based on CPU results alone.
+
+## Local results, 2026-10-02
+
+Slurm job **138.0**, on aft-0 with two H100 80GB GPUs and driver 595.58.03,
+tested the clean implementation revision
+`62bf8eba3915fd7f7129d38e5ab055f32b3c6dcf`. The environment used Python 3.12.3,
+vLLM 0.30.0, PyTorch 2.13.0 / CUDA 13.0, Transformers 5.18.0,
+Accelerate 1.15.0 and Ninja 1.13.2. All six smoke groups were run separately
+to inventory failures, followed by the complete standard parallel suite.
+The normal launcher still stops at its first failed group.
+
+| Group | Passed | Failed |
+| --- | ---: | ---: |
+| Discovery | 17 | 0 |
+| Offline capture / HF parity | 4 | 1 |
+| Chunked prefill | 3 | 0 |
+| Offline interventions | 6 | 0 |
+| Async interventions | 6 | 0 |
+| HTTP hooks, transports and cleanup | 5 | 0 |
+| TP/PP capture | 2 | 0 |
+| Pipeline capture and steering | 7 | 0 |
+| TP/PP norm-matched steering | 2 | 0 |
+| **Total** | **52** | **1** |
+
+There were no errors or skipped tests. All 101 CPU regressions also passed
+without vLLM/CUDA, with Ruff 0.15.3 lint/format and Pyright passing.
+
+Two setup dependencies were required: Ninja for FlashInfer builds and
+Accelerate for reference-model CUDA placement. GPU checks also found a real
+post-hook replacement bug: adding a bfloat16 delta to the MLP half of a fused
+residual output left values as large as 1.97 when a hook requested zero.
+Replacement now writes the requested stream directly and zeros that request's
+residual slice, preserving other requests and original tensors. The existing
+offline and HTTP checks pass with their original tolerances. CPU regressions
+cover outliers, three dtypes, chained hooks, preceding steering and isolation.
+
+The remaining failure is `test_batch_prompts_10_tokens`: bfloat16 vLLM versus
+bfloat16 Hugging Face has mean absolute error **0.010466**, above the unchanged
+**0.01** limit, for “In the beginning there was nothing but”. Native capture
+and independent hook capture are bit-identical; the same discrepancy occurs
+when the prompt runs individually. vLLM's fused residual/normalization path
+and Hugging Face use different rounding sequences.
+
+Separate ten-prompt diagnostics in Slurm job 137 found worst mean errors of
+**0.000681** for float32 vLLM versus float32 HF, and **0.010051** for bfloat16
+vLLM versus float32 HF. These are precision diagnostics. The acceptance tests
+still compare bfloat16 on both sides, and all correctness thresholds remain
+unchanged. A float32 reference alone does not resolve bfloat16 validation.
+
+Full logs, JUnit, package/hardware/revision/Slurm metadata and CPU results are
+retained at
+`/home/ubuntu/vllm-lens/compatibility-results/0.30.0/diagnostic-job-138/`.
+Precision diagnostics are under `hook-fix-job-137/`; combined job outputs are
+`slurm-vllm-lens-compat-{137,138}.out`. A compact evidence archive is
+`compatibility-results/0.30.0/evidence-62bf8eb.tar.gz`.
+
+The earlier full inventory in shared-storage job 82 had 46 passed and 7 failed;
+its six zeroing-hook failures motivated the fix. Its Git metadata was on a
+different node, so those reports could not record a revision themselves. The
+final job 138 reports record the tested SHA and a clean working tree correctly.
+
+**0.30.0 remains unvalidated and unpinned.** The package's existing vLLM range
+and development lock remain temporary; PR #41 stays draft and issue #39 stays
+open until the numerical requirement is resolved and both suites pass. PyPI
+listed no stable release newer than 0.30.0 at the 2026-10-01 lookup.
 
 ## Diagnosing integration drift
 
