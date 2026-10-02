@@ -25,6 +25,7 @@ import zstandard as zstd
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.models.utils import PPMissingLayer
 
+from vllm_lens._helpers._hook_output import _replace_hook_output
 from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
 
 if TYPE_CHECKING:
@@ -363,37 +364,6 @@ def _apply_steering(
                 target[rel] = target[rel] + v * cfg.scale
 
 
-def _apply_hook_delta(
-    output: torch.Tensor | tuple[torch.Tensor, ...],
-    modified_output: torch.Tensor | tuple[torch.Tensor, ...] | None,
-    hook_hidden: torch.Tensor,
-    start: int,
-    end: int,
-    result: torch.Tensor,
-) -> torch.Tensor | tuple[torch.Tensor, ...]:
-    """Write a post-hook's modification into the layer output.
-
-    Applies ``result - hook_hidden[start:end]`` as a delta onto
-    ``modified_output`` (cloning the original ``output`` lazily on first
-    write) and updates ``hook_hidden`` in place so later hooks in the same
-    forward pass observe the change.  Returns the (possibly newly created)
-    ``modified_output``.
-    """
-    delta = result - hook_hidden[start:end]
-    if modified_output is None:
-        if isinstance(output, tuple):
-            modified_output = (output[0].clone(), output[1])
-        else:
-            modified_output = output.clone()
-    assert modified_output is not None
-    if isinstance(modified_output, tuple):
-        modified_output[0][start:end] = modified_output[0][start:end] + delta
-    else:
-        modified_output[start:end] = modified_output[start:end] + delta
-    hook_hidden[start:end] = result
-    return modified_output
-
-
 def _hook_inner(
     extension: HiddenStatesExtension,
     layer_idx: int,
@@ -549,7 +519,7 @@ def _hook_inner(
 
                 result = hook.fn(ctx, hook_hidden[start:end])
                 if result is not None:
-                    modified_output = _apply_hook_delta(
+                    modified_output = _replace_hook_output(
                         output, modified_output, hook_hidden, start, end, result
                     )
 
