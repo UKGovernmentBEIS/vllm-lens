@@ -213,7 +213,10 @@ def test_direct_checker_children_find_environment_tools(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "executable", str(python))
     monkeypatch.setattr(sys, "prefix", str(bin_dir.parent))
     monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "fork")
     env = checker.subprocess_environment()
+    assert env["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+    assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "fork"
     result = subprocess.run(
         [str(python), "-c", "import subprocess; subprocess.run(['ninja'], check=True)"],
         env=env,

@@ -73,6 +73,9 @@ def subprocess_environment() -> dict[str, str]:
         str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", os.defpath)
     )
     env["VIRTUAL_ENV"] = sys.prefix
+    # A second engine can fork after PyTorch has started CPU thread pools.
+    # Fresh interpreters avoid inheriting their locked state in PP workers.
+    env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     return env
 
 
@@ -104,6 +107,7 @@ def main() -> int:
         "model": "Qwen/Qwen2.5-0.5B-Instruct",
         "reference_dtype": "float32",
         "functional_dtype": "auto (bfloat16 for Qwen/Qwen2.5-0.5B-Instruct)",
+        "worker_multiprocessing_method": "spawn",
         "nvidia_smi": command_output(["nvidia-smi"]),
         "slurm": {
             key: os.environ.get(key)

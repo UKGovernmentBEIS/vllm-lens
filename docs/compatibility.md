@@ -161,6 +161,9 @@ requires successful HTTP patch registration, and starts a fresh HTTP server.
 It refuses to reuse a server already listening on `VLLM_TEST_PORT` (default
 8100), which could otherwise test a different checkout or dependency set.
 Each suite runs in a separate process to isolate existing GPU teardown behavior.
+Test engines use `VLLM_WORKER_MULTIPROC_METHOD=spawn`: forking a second pipeline
+engine after PyTorch initializes CPU thread pools can deadlock during CPU tensor
+allocation. The effective worker method is recorded in `environment.json`.
 Any failure, missing JUnit report, empty selection or skipped test fails the run.
 
 Reference parity uses **FP32 on both vLLM and Hugging Face**, with the existing
