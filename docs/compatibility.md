@@ -26,13 +26,11 @@ Attach the reports to the PR or release and include the environment summary in
 the release notes. Keep previous validation results when testing a new stable
 vLLM release. Do not label an untested replacement supported.
 
-GPU validation now permits pinning `vllm==0.30.0` and switching development
-PyTorch sources to CUDA 13.0. The coordinated pin/lock update remains pending:
-the rebuilt machine cannot fetch the existing private benchmarking repositories
-`UKGovernmentBEIS/sifter` and `AI-Safety-Institute/hpc-containers`. The current
-range and 0.19.0 lock are temporary and are not additional support guarantees.
-Keep PR #41 draft until the development setup is updated and verified. Newer
-stable releases must pass both suites before advancing the validated version.
+The package pins the validated release with `vllm==0.30.0`. The development
+lock uses PyTorch 2.13.0 with CUDA 13.0 sources and Transformers 5.18.0.
+Both the default development setup and optional benchmarking group install
+from public dependencies; benchmark image paths are supplied explicitly.
+Newer stable releases must pass both suites before advancing this pin.
 
 V2 model-runner mode is unsupported and rejected by the plugin. The plugin
 defaults to V1 and forces eager execution; native V2/CUDA-graph support is outside
@@ -330,6 +328,15 @@ and CPU stack traces remain under `20261002T120553Z-itnpoyz2/`. Historical jobs
 137/138/147 were not recovered from this rebuilt checkout; their recorded
 results above remain distinct from this fresh passing validation.
 
+
+The final public dependency setup was verified with `uv lock --check`,
+`uv sync --locked` and `uv sync --locked --group benchmarking`. The Isambard
+benchmark helpers introduced in `bb37942` were removed from the shared project
+and lock; their private imports were replaced with public Hugging Face download
+APIs and an explicit Apptainer image directory. Missing-image and dry-run checks
+passed without downloads or job submissions. Final CPU regressions (128),
+Ruff lint/format and Pyright passed. These packaging/benchmark changes do not
+change the inference implementation validated in job 5.
 
 ## Diagnosing integration drift
 
