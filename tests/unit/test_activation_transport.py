@@ -233,3 +233,25 @@ def test_endpoint_sets_no_store_and_nosniff() -> None:
     assert resp.status_code == 200
     assert resp.headers["cache-control"] == "no-store, private"
     assert resp.headers["x-content-type-options"] == "nosniff"
+
+
+def test_binary_transport_passes_json_entries_through() -> None:
+    """Q/K capture adds non-tensor ``qk_layers`` / ``qk_meta`` entries; the
+    binary path must carry them as ``{"__json__": ...}`` like base64 does."""
+    store = ActivationStore()
+    acts = {
+        "attn_q": torch.randn(1, 4, 2, 8, dtype=torch.bfloat16),
+        "attn_k": torch.randn(1, 4, 1, 8, dtype=torch.bfloat16),
+        "qk_layers": [15],
+        "qk_meta": [{"scale": 0.125, "sliding_window": [-1, -1]}],
+    }
+    desc = serialize_activations_binary(acts, store)
+    assert desc["qk_layers"] == {"__json__": [15]}
+    assert "handle" in desc["attn_q"] and "data" not in desc["attn_q"]
+    out = decode_activations(
+        {"activations": desc},
+        fetch_bytes=lambda h: store.get(h)[0],  # type: ignore[index]
+    )
+    assert out["qk_layers"] == [15] and out["qk_meta"] == acts["qk_meta"]
+    assert torch.equal(out["attn_q"], acts["attn_q"])
+    assert torch.equal(out["attn_k"], acts["attn_k"])

@@ -42,7 +42,8 @@ quantization mode, attention backend, hardware platform or distributed layout.
 
 ## CPU checks on every PR
 
-Serialization, binary transport and registration diagnostics live in
+Serialization, binary transport, attention reconstruction, engine configuration
+and registration diagnostics live in
 `tests/unit/`, outside the GPU fixtures in `vllm_lens/tests/conftest.py`.
 The R-lens rule tests also run without vLLM, model downloads or a CUDA runtime:
 
@@ -259,10 +260,23 @@ its six zeroing-hook failures motivated the fix. Its Git metadata was on a
 different node, so those reports could not record a revision themselves. The
 final job 138 reports record the tested SHA and a clean working tree correctly.
 
-**0.30.0 remains unvalidated and unpinned.** The package's existing vLLM range
-and development lock remain temporary; PR #41 stays draft and issue #39 stays
-open until the numerical requirement is resolved and both suites pass. PyPI
-listed no stable release newer than 0.30.0 at the 2026-10-01 lookup.
+The BF16 reference discrepancy is accepted under the maintainer's FP32/FP32
+parity policy; it is no longer a compatibility blocker. The ten-prompt FP32
+diagnostics passed, but they do not cover the full updated suite. Slurm job 147
+was submitted for that full rerun at `168de9a`; its completion evidence is
+unavailable following the cluster outage on 2026-10-02. Do not describe it as
+passing or still running without recovering the job reports.
+
+PR #41 has since incorporated main's Q/K capture and FP32 Triton precision
+default (`a71e386`). Previous GPU evidence predates this merge. Review can
+proceed with that limitation; when the cluster returns, recover job 147's
+reports and run both suites at the updated revision before advancing the pin.
+The suite selections above cover residual-stream capture and interventions;
+they do not include the separate Q/K GPU parity suites added on main.
+
+**0.30.0 remains pending full validation and unpinned.** The package's existing
+vLLM range and development lock remain temporary, and issue #39 stays open.
+PyPI listed no stable release newer than 0.30.0 at the 2026-10-01 lookup.
 
 ## Diagnosing integration drift
 

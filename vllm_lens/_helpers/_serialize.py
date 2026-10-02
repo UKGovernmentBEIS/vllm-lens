@@ -103,17 +103,31 @@ def tensor_from_bytes(raw: bytes, meta: dict[str, Any]) -> torch.Tensor:
 
 
 def serialize_activations(tensor_dict: dict[str, Any]) -> dict[str, Any]:
-    """Convert a flat dict of torch tensors to a JSON-serializable form.
+    """Convert a flat activations dict to a JSON-serializable form.
+
+    Tensors keep the existing wire format (see :func:`serialize_tensor`);
+    JSON-safe non-tensor values (e.g. ``qk_layers`` / ``qk_meta`` from
+    attention Q/K capture) are wrapped as ``{"__json__": value}``.
 
     Input::
 
-        {"residual_stream": Tensor(n_layers, total_pos, d)}
+        {"residual_stream": Tensor(n_layers, total_pos, d), "qk_layers": [2]}
 
     Output::
 
-        {"residual_stream": {"data": "<b64>", "dtype": "...", "shape": [...]}}
+        {"residual_stream": {"data": "<b64>", ...}, "qk_layers": {"__json__": [2]}}
     """
-    return {name: serialize_tensor(t) for name, t in tensor_dict.items()}
+    return {
+        name: serialize_tensor(t) if isinstance(t, torch.Tensor) else {"__json__": t}
+        for name, t in tensor_dict.items()
+    }
+
+
+def decode_activation_entry(encoded: Any) -> Any:
+    """Decode one value of a serialized activations dict."""
+    if isinstance(encoded, dict) and "__json__" in encoded:
+        return encoded["__json__"]
+    return deserialize_tensor(encoded)
 
 
 def serialize_tensor_binary(
@@ -136,14 +150,15 @@ def serialize_activations_binary(
 ) -> dict[str, Any]:
     """Binary-transport counterpart of :func:`serialize_activations`.
 
-    All tensors of one response are stored in a single atomic
+    Non-tensor values are wrapped as ``{"__json__": value}`` exactly as in
+    the base64 path.  All tensors of one response are stored in a single atomic
     :meth:`ActivationStore.put_many`, so a later tensor's insert can never
     evict an earlier one's handle before the client has fetched it.
     """
-    names = list(tensor_dict)
+    names = [n for n, t in tensor_dict.items() if isinstance(t, torch.Tensor)]
     encoded = [_encode_tensor(tensor_dict[n]) for n in names]
     handles = store.put_many(encoded)
-    return {
+    out: dict[str, Any] = {
         name: {
             "handle": handle,
             "nbytes": len(compressed),
@@ -152,6 +167,11 @@ def serialize_activations_binary(
         }
         for name, handle, (compressed, meta) in zip(names, handles, encoded)
     }
+    # Non-tensor entries (qk_layers / qk_meta) ride in the JSON as usual.
+    for name, t in tensor_dict.items():
+        if not isinstance(t, torch.Tensor):
+            out[name] = {"__json__": t}
+    return out
 
 
 def decode_activations(
@@ -163,7 +183,9 @@ def decode_activations(
 
     Takes the raw JSON response dict from ``/v1/completions`` or
     ``/v1/chat/completions`` and converts any activation tensors back to
-    ``torch.Tensor``. Two transports are supported per entry:
+    ``torch.Tensor``; non-tensor ``{"__json__": ...}`` entries (e.g. ``qk_layers``
+    / ``qk_meta`` from attention Q/K capture) pass through as-is.  Two
+    transports are supported per tensor entry:
 
     - **base64** (default): the entry carries ``data``; decoded in-process.
     - **binary** (``transport="binary"``): the entry carries a ``handle`` and no
@@ -180,7 +202,9 @@ def decode_activations(
 
     out: dict[str, Any] = {}
     for name, encoded in raw.items():
-        if "data" in encoded:
+        if isinstance(encoded, dict) and "__json__" in encoded:
+            out[name] = encoded["__json__"]
+        elif "data" in encoded:
             out[name] = deserialize_tensor(encoded)
         elif "handle" in encoded:
             if fetch_bytes is None:

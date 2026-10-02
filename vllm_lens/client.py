@@ -36,7 +36,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import requests
-import torch
 
 from vllm_lens._helpers._serialize import (
     decode_activations,
@@ -52,8 +51,8 @@ class GenerateOutput:
     text: str
     """Generated text."""
 
-    activations: dict[str, torch.Tensor] | None = None
-    """Captured residual stream activations, if requested."""
+    activations: dict[str, Any] | None = None
+    """Captured activations (residual stream and/or attention Q/K), if requested."""
 
     hook_results: dict[str, dict[str, Any]] | None = None
     """Per-request hook results (ctx.saved dicts), if hooks were passed."""
@@ -102,12 +101,15 @@ class VLLMLensClient:
         capture_layers: list[int] | None,
         steering_vectors: list[SteeringVector] | None,
         activations_transport: str | None = None,
+        capture_qk: list[int] | bool | None = None,
     ) -> dict[str, str]:
         xargs: dict[str, str] = {}
         if capture_layers is not None:
             xargs["output_residual_stream"] = json.dumps(capture_layers)
         if activations_transport is not None:
             xargs["activations_transport"] = activations_transport
+        if capture_qk is not None:
+            xargs["output_qk"] = json.dumps(capture_qk)
         if hooks is not None:
             xargs["apply_hooks"] = json.dumps([h.model_dump() for h in hooks])
         if steering_vectors is not None:
@@ -164,6 +166,7 @@ class VLLMLensClient:
         temperature: float = 0.0,
         hooks: list[Hook] | None = None,
         capture_layers: list[int] | None = None,
+        capture_qk: list[int] | bool | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
         logprobs: int | None = None,
@@ -178,6 +181,10 @@ class VLLMLensClient:
         handle fetched from ``GET /v1/activations/{handle}`` (no base64); the
         default inlines them as base64 in the JSON response. Decoding is
         transparent either way.
+
+        ``capture_qk`` captures post-RoPE attention Q/K for the given
+        layers (or all layers with ``True``); reconstruct patterns with
+        :func:`vllm_lens.attention.attention_patterns`.
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -192,7 +199,7 @@ class VLLMLensClient:
             body["echo"] = True
 
         xargs = self._build_xargs(
-            hooks, capture_layers, steering_vectors, activations_transport
+            hooks, capture_layers, steering_vectors, activations_transport, capture_qk
         )
         if xargs:
             body["vllm_xargs"] = xargs
@@ -210,6 +217,7 @@ class VLLMLensClient:
         temperature: float = 0.0,
         hooks: list[Hook] | None = None,
         capture_layers: list[int] | None = None,
+        capture_qk: list[int] | bool | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
         **kwargs: Any,
@@ -234,7 +242,7 @@ class VLLMLensClient:
         }
 
         xargs = self._build_xargs(
-            hooks, capture_layers, steering_vectors, activations_transport
+            hooks, capture_layers, steering_vectors, activations_transport, capture_qk
         )
         if xargs:
             body["vllm_xargs"] = xargs
