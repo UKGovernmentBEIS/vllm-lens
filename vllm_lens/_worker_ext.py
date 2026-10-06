@@ -544,52 +544,60 @@ def _hook_inner(
 
     # --- Phase 3: capture activations (rank 0 only) -----------------
     if getattr(extension, "_should_capture", True):
-        capture_src = modified_output if modified_output is not None else output
-        hidden_states: Float[torch.Tensor, "total_tokens hidden_dim"]  # type: ignore[reportUndefinedVariable]
-        if isinstance(capture_src, tuple):
-            if capture_src[1] is not None:
-                hidden_states = capture_src[0] + capture_src[1]
-            else:
-                hidden_states = capture_src[0]
-        else:
-            hidden_states = capture_src
-
+        capturing: list[int] = []
         for i in range(num_reqs):
-            req_id = req_ids[i]
-            req_state = runner.requests.get(req_id)
-            if req_state is None or req_state.sampling_params is None:
-                continue
-            extra = req_state.sampling_params.extra_args
+            req_state = runner.requests.get(req_ids[i])
+            extra = (
+                req_state.sampling_params.extra_args
+                if req_state and req_state.sampling_params
+                else None
+            )
             if not extra:
                 continue
-
-            output_residual_stream = extra.get("output_residual_stream")
-            if output_residual_stream is None:
+            layers = extra.get("output_residual_stream")
+            if layers is None:
                 continue
-            # vllm_xargs passes values as strings; parse JSON lists.
-            if isinstance(output_residual_stream, str):
+            if isinstance(layers, str):
                 try:
-                    output_residual_stream = json.loads(output_residual_stream)
+                    layers = json.loads(layers)
                 except (json.JSONDecodeError, ValueError):
-                    pass  # treat as truthy (capture all layers)
-            if (
-                isinstance(output_residual_stream, list)
-                and layer_idx not in output_residual_stream
-            ):
+                    pass
+            if isinstance(layers, list) and layer_idx not in layers:
                 continue
+            capturing.append(i)
 
-            start = query_start_loc[i].item()
-            end = query_start_loc[i + 1].item()
-            activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
-                start:end
-            ].cpu()
+        if capturing:
+            capture_src = modified_output if modified_output is not None else output
+            if isinstance(capture_src, tuple):
+                hidden_states = (
+                    capture_src[0] + capture_src[1]
+                    if capture_src[1] is not None
+                    else capture_src[0]
+                )
+            else:
+                hidden_states = capture_src
 
-            if req_id not in extension._captured_states:
-                extension._captured_states[req_id] = {}
-            layer_states = extension._captured_states[req_id]
-            if layer_idx not in layer_states:
-                layer_states[layer_idx] = []
-            layer_states[layer_idx].append(activation)
+            # Keep the upstream boundary reads; batch only the activation copy.
+            spans = [
+                (int(query_start_loc[i].item()), int(query_start_loc[i + 1].item()))
+                for i in capturing
+            ]
+            if all(prev[1] == nxt[0] for prev, nxt in zip(spans, spans[1:])):
+                rows = hidden_states[spans[0][0] : spans[-1][1]]
+            else:
+                rows = torch.cat([hidden_states[start:end] for start, end in spans])
+            host_rows = rows.cpu()
+
+            offset = 0
+            for i, (start, end) in zip(capturing, spans):
+                n_tokens = end - start
+                activation = host_rows[offset : offset + n_tokens]
+                offset += n_tokens
+                if len(spans) > 1:
+                    # Each request owns its storage after the shared transfer.
+                    activation = activation.clone()
+                layers = extension._captured_states.setdefault(req_ids[i], {})
+                layers.setdefault(layer_idx, []).append(activation)
 
     return modified_output
 
