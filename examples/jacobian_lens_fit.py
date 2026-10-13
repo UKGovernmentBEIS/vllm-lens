@@ -51,6 +51,14 @@ lens as-is; ``provenance["rules"]`` records which backward was used. The lrp
 fit is somewhat slower per prompt (patched norms bypass fused kernels).
 Dense models only for now — MoE checkpoints are rejected from the HF
 config before any weights load.
+
+``--router router.pt`` (from ``jpp_lens.py fit-router``) additionally fits one
+**expert Jacobian per activation cluster** for the J++ lens: every kept
+position is routed to its layer's nearest cluster and its gradient rows are
+accumulated per cluster, so the backward passes are the same as a plain fit.
+The output then carries ``experts`` (``[K, d, d]`` per layer) and
+``expert_counts`` beside the usual pooled ``J``; ``jpp_lens.py fit-weights``
+turns the experts into the combined lens.
 """
 
 # Patch ring_flash_attn compat before torch imports (prime-rl requirement).
@@ -141,6 +149,18 @@ def _parse_args():
         "residual-stream RMSNorms, identity+half rules on the gated MLP — "
         "forward pass unchanged, backward made per-element linear through "
         "the nonlinearities (dense models only).",
+    )
+    ap.add_argument(
+        "--router",
+        default=None,
+        help="router .pt from jpp_lens.py fit-router: also fit one expert Jacobian "
+        "per activation cluster (J++ lens). --layers defaults to the router's.",
+    )
+    ap.add_argument(
+        "--min-kept-positions",
+        type=int,
+        default=50,
+        help="an expert that kept fewer positions falls back to the pooled J_l.",
     )
     args = ap.parse_args()
     args.ep = args.ep if args.ep == "auto" else int(args.ep)
@@ -264,10 +284,22 @@ def fit(args):
             f"across {n_layers} layers"
         )
     target_layer = n_layers - 1
+    router = None
+    if args.router:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import jpp_lens
+
+        router = torch.load(args.router, map_location="cpu", weights_only=True)
     if args.layers is not None:
         source_layers = sorted({int(x) for x in args.layers.split(",")})
+    elif router is not None:
+        source_layers = sorted(router["layers"])
     else:
         source_layers = list(range(n_layers - 1))
+    if router is not None:
+        missing = sorted(set(source_layers) - set(router["layers"]))
+        assert not missing, f"router {args.router} has no clusters for layers {missing}"
+        n_experts = router["k"]
     assert all(0 <= s < target_layer for s in source_layers), (
         f"source layers must be in [0, {target_layer}); got {source_layers}"
     )
@@ -335,6 +367,14 @@ def fit(args):
     logger.info(f"loaded {len(corpus)} prompts from {prompts_path}")
 
     jac_sum = {lyr: torch.zeros(d_model, d_model) for lyr in source_layers}
+    if router is not None:
+        # Per-cluster gradient-row sums (position-weighted) and position counts.
+        exp_sum = {
+            lyr: torch.zeros(n_experts, d_model, d_model) for lyr in source_layers
+        }
+        exp_cnt = {
+            lyr: torch.zeros(n_experts, dtype=torch.long) for lyr in source_layers
+        }
     n_done = 0
     skip_first = args.skip_first
 
@@ -374,6 +414,14 @@ def fit(args):
             srcs = [acts[lyr] for lyr in source_layers]
             for s in srcs:
                 s.retain_grad()
+            if router is not None:
+                # Route each kept position from its own layer's activation (the
+                # dim_batch copies are identical, so read replica 0): [K, P] one-hot.
+                members = {}
+                for lyr, s in zip(source_layers, srcs):
+                    who = jpp_lens.assign(router, lyr, s[0, valid].detach())
+                    members[lyr] = torch.nn.functional.one_hot(who, n_experts).T.float()
+                    exp_cnt[lyr] += members[lyr].sum(1).long().cpu()
             starts = list(range(0, d_model, args.dim_batch))
             for bi, start in enumerate(starts):
                 n = min(args.dim_batch, d_model - start)
@@ -388,8 +436,11 @@ def fit(args):
                     inputs=srcs,
                 )
                 for lyr, s in zip(source_layers, srcs):
-                    rows = s.grad[:n][:, valid, :].float().mean(dim=1)  # [n, d_model]
-                    jac_sum[lyr][start : start + n] += rows.detach().cpu()
+                    rows = s.grad[:n][:, valid, :].float().detach()  # [n, P, d_model]
+                    jac_sum[lyr][start : start + n] += rows.mean(dim=1).cpu()
+                    if router is not None:
+                        per_expert = torch.einsum("kp,npd->knd", members[lyr], rows)
+                        exp_sum[lyr][:, start : start + n] += per_expert.cpu()
             n_done += 1
             logger.info(f"  fit prompt {pi + 1}/{len(corpus)} (seq_len={seq_len})")
     finally:
@@ -414,16 +465,37 @@ def fit(args):
             "dim_batch": args.dim_batch,
             "rules": args.rules,  # 'gradient' = J-lens, 'lrp' = R-lens
         }
+        payload = {
+            "J": jacobians,
+            "source_layers": sorted(jacobians),
+            "d_model": int(d_model),
+            "provenance": provenance,
+        }
+        if router is not None:
+            payload["experts"], payload["expert_counts"] = {}, {}
+            for lyr in source_layers:
+                experts, fallback = jpp_lens.experts_from_sums(
+                    exp_sum[lyr],
+                    exp_cnt[lyr],
+                    jac_sum[lyr] / n_done,
+                    min_kept=args.min_kept_positions,
+                )
+                if fallback.any():
+                    logger.warning(
+                        f"layer {lyr}: experts {fallback.nonzero().flatten().tolist()} kept "
+                        f"< {args.min_kept_positions} positions (counts "
+                        f"{exp_cnt[lyr].tolist()}); using the pooled J_l for them"
+                    )
+                payload["experts"][int(lyr)] = experts.to(torch.float16)
+                payload["expert_counts"][int(lyr)] = exp_cnt[lyr]
+            provenance["router"] = {
+                "path": args.router,
+                "k": n_experts,
+                "proj_dim": router["proj_dim"],
+                "min_kept_positions": args.min_kept_positions,
+            }
         os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
-        torch.save(
-            {
-                "J": jacobians,
-                "source_layers": sorted(jacobians),
-                "d_model": int(d_model),
-                "provenance": provenance,
-            },
-            args.out,
-        )
+        torch.save(payload, args.out)
         logger.success(
             f"fit done over {n_done} prompts -> {args.out} "
             f"({len(jacobians)} layers, d_model={d_model}); provenance={provenance}"

@@ -49,10 +49,14 @@ import torch
 
 
 def load_lens(path: str) -> tuple[dict[int, torch.Tensor], list[int]]:
+    """``{layer: J_l}`` from a lens file: ours / the released J- and R-lenses
+    (key ``J``), or the released J++ lenses (``parameters.jacobians``, e.g.
+    ``koayon/jpp-lenses``)."""
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
-    if "J" not in ckpt:
+    raw = ckpt.get("J") or ckpt.get("parameters", {}).get("jacobians")
+    if raw is None:
         raise ValueError(f"{path} is not a Jacobian-lens file (keys {sorted(ckpt)!r})")
-    jacobians = {int(k): v.float() for k, v in ckpt["J"].items()}
+    jacobians = {int(k): v.float() for k, v in raw.items()}
     return jacobians, sorted(jacobians)
 
 
@@ -136,9 +140,13 @@ def run_jlens(
     k=6,
     use_jacobian=True,
     norm_weight=None,
+    exclude_ids=None,
 ):
     """Read out the top-k J-lens tokens at each (layer, position) via a hook on
     the live vLLM worker. Returns (prompt_tokens, {layer: (ids[seq,k], probs)}).
+
+    ``exclude_ids`` drops vocab ids from the ranking (J++ readout filtering:
+    ``jpp_lens.non_semantic_token_ids``).
 
     Correct under tensor/pipeline/expert parallelism: the final norm and lm_head
     live only on the *last* PP stage (``PPMissingLayer`` elsewhere), so we
@@ -159,6 +167,7 @@ def run_jlens(
     rms_eps, vocab_size = _norm_params(client.model)
     if norm_weight is None:
         norm_weight = _probe_norm_name(client, prompt)
+    excluded = torch.tensor(exclude_ids, dtype=torch.long) if exclude_ids else None
 
     def project_hook(ctx, h):
         lm_w = ctx.get_parameter("lm_head.weight")  # [vocab_padded, d], TP-gathered
@@ -173,6 +182,8 @@ def run_jlens(
             logits = normed @ lm_w.float().T
             if vocab_size is not None:
                 logits = logits[..., :vocab_size]  # drop ParallelLMHead padding
+            if excluded is not None:
+                logits[..., excluded.to(logits.device)] = float("-inf")
             probs, idx = logits.softmax(-1).topk(k, dim=-1)
         ctx.saved[f"ids_{ctx.layer_idx}"] = idx.cpu()
         ctx.saved[f"probs_{ctx.layer_idx}"] = probs.float().cpu()
@@ -313,6 +324,11 @@ def main():
         help="dotted name of the final-norm weight (default: auto-detect from "
         "the served model's structure)",
     )
+    r.add_argument(
+        "--readout-filter",
+        action="store_true",
+        help="J++ readout filtering: rank only tokens containing a letter or digit",
+    )
 
     args = ap.parse_args()
 
@@ -340,6 +356,13 @@ def main():
         jacobians = {lyr: jacobians[lyr] for lyr in layers if lyr in jacobians}
 
     tok = AutoTokenizer.from_pretrained(client.model)
+    exclude_ids = None
+    if args.readout_filter:
+        from jpp_lens import non_semantic_token_ids
+
+        exclude_ids = non_semantic_token_ids(
+            tok, _norm_params(client.model)[1] or len(tok)
+        )
     tokens, results = run_jlens(
         client,
         args.prompt,
@@ -348,6 +371,7 @@ def main():
         k=args.k,
         use_jacobian=not args.baseline,
         norm_weight=args.norm_weight,
+        exclude_ids=exclude_ids,
     )
     print(f"Prompt: {args.prompt!r}")
     print_grid(tokens, results, layers, tok)

@@ -32,20 +32,27 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import torch
+
 from vllm_lens import Hook
 from vllm_lens.client import VLLMLensClient
 
 from jacobian_lens import _norm_params, load_lens
+from jpp_lens import non_semantic_token_ids
 
 
-def _build_hook(jacobians, layers, rms_eps, vocab_size, k, model_name) -> Hook:
+def _build_hook(
+    jacobians, layers, rms_eps, vocab_size, k, model_name, exclude_ids=None
+) -> Hook:
     """A self-contained readout hook (registered on the server, run per request).
 
     Cloudpickle serializes it by value (defined in ``__main__``), so it must not
     reference the ``jacobian_lens`` module: it resolves the final-norm name and
     decodes the top-k ids to strings on the worker itself. Per forward pass it
     stores ``t_{layer}_{pass}`` (top-k strings) and ``p_{layer}_{pass}`` (probs).
+    ``exclude_ids`` are dropped from the ranking (J++ readout filtering).
     """
+    excluded = torch.tensor(exclude_ids, dtype=torch.long) if exclude_ids else None
 
     def jspace_hook(ctx, h):
         import torch
@@ -103,6 +110,8 @@ def _build_hook(jacobians, layers, rms_eps, vocab_size, k, model_name) -> Hook:
             logits = (x * norm_w.float()) @ lm_w.float().T
             if vocab_size is not None:
                 logits = logits[..., :vocab_size]
+            if excluded is not None:
+                logits[..., excluded.to(logits.device)] = float("-inf")
             probs, idx = logits.softmax(-1).topk(k, dim=-1)
 
         rows = idx.cpu().tolist()
@@ -163,6 +172,11 @@ def main():
         help="URL the PAGE calls at runtime (default: same as --base-url). Set to "
         "your forwarded port, e.g. http://localhost:8123, or '' for same origin.",
     )
+    ap.add_argument(
+        "--readout-filter",
+        action="store_true",
+        help="J++ readout filtering: rank only tokens containing a letter or digit",
+    )
     args = ap.parse_args()
 
     jacobians, _fitted = load_lens(args.lens)
@@ -180,7 +194,15 @@ def main():
     # Register the readout hook on the server once (uploads the lens a single
     # time). It then applies to every request; the page reads results back via
     # /v1/hooks/collect. clear with client.clear_hooks() when done.
-    hook = _build_hook(jacobians, layers, rms_eps, vocab_size, args.k, client.model)
+    exclude_ids = None
+    if args.readout_filter:
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(client.model)
+        exclude_ids = non_semantic_token_ids(tok, vocab_size or len(tok))
+    hook = _build_hook(
+        jacobians, layers, rms_eps, vocab_size, args.k, client.model, exclude_ids
+    )
     print(
         f"registering J-lens hook (layers {layers}, top-{args.k}) on {args.base_url} ..."
     )
