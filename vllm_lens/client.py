@@ -37,6 +37,7 @@ from typing import Any
 
 import requests
 
+from vllm_lens._helpers._positions import POSITIONS_KEY
 from vllm_lens._helpers._serialize import (
     decode_activations,
     deserialize_hook_results,
@@ -52,7 +53,8 @@ class GenerateOutput:
     """Generated text."""
 
     activations: dict[str, Any] | None = None
-    """Captured activations (residual stream and/or attention Q/K), if requested."""
+    """Captured activations (residual stream, its position metadata under a
+    position selector, and/or attention Q/K), if requested."""
 
     hook_results: dict[str, dict[str, Any]] | None = None
     """Per-request hook results (ctx.saved dicts), if hooks were passed."""
@@ -102,10 +104,17 @@ class VLLMLensClient:
         steering_vectors: list[SteeringVector] | None,
         activations_transport: str | None = None,
         capture_qk: list[int] | bool | None = None,
+        capture_positions: str | list[int] | None = None,
     ) -> dict[str, str]:
         xargs: dict[str, str] = {}
         if capture_layers is not None:
             xargs["output_residual_stream"] = json.dumps(capture_layers)
+        if capture_positions is not None:
+            xargs[POSITIONS_KEY] = (
+                capture_positions
+                if isinstance(capture_positions, str)
+                else json.dumps(list(capture_positions))
+            )
         if activations_transport is not None:
             xargs["activations_transport"] = activations_transport
         if capture_qk is not None:
@@ -167,6 +176,7 @@ class VLLMLensClient:
         hooks: list[Hook] | None = None,
         capture_layers: list[int] | None = None,
         capture_qk: list[int] | bool | None = None,
+        capture_positions: str | list[int] | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
         logprobs: int | None = None,
@@ -185,6 +195,11 @@ class VLLMLensClient:
         ``capture_qk`` captures post-RoPE attention Q/K for the given
         layers (or all layers with ``True``); reconstruct patterns with
         :func:`vllm_lens.attention.attention_patterns`.
+
+        ``capture_positions`` narrows the residual-stream capture to
+        ``"last_prompt_token"`` or to a list of absolute token positions;
+        the response then carries ``residual_stream_positions`` with the
+        position of each captured row. Omit it to capture every position.
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -199,7 +214,12 @@ class VLLMLensClient:
             body["echo"] = True
 
         xargs = self._build_xargs(
-            hooks, capture_layers, steering_vectors, activations_transport, capture_qk
+            hooks,
+            capture_layers,
+            steering_vectors,
+            activations_transport,
+            capture_qk,
+            capture_positions,
         )
         if xargs:
             body["vllm_xargs"] = xargs
@@ -218,6 +238,7 @@ class VLLMLensClient:
         hooks: list[Hook] | None = None,
         capture_layers: list[int] | None = None,
         capture_qk: list[int] | bool | None = None,
+        capture_positions: str | list[int] | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
         **kwargs: Any,
@@ -225,7 +246,7 @@ class VLLMLensClient:
         """Generate a chat completion from a list of messages.
 
         Uses ``/v1/chat/completions``. See :meth:`generate` for
-        ``activations_transport``.
+        ``activations_transport`` and ``capture_positions``.
 
         Example::
 
@@ -242,7 +263,12 @@ class VLLMLensClient:
         }
 
         xargs = self._build_xargs(
-            hooks, capture_layers, steering_vectors, activations_transport, capture_qk
+            hooks,
+            capture_layers,
+            steering_vectors,
+            activations_transport,
+            capture_qk,
+            capture_positions,
         )
         if xargs:
             body["vllm_xargs"] = xargs

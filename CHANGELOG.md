@@ -1,5 +1,7 @@
 ## Unreleased
 
+- Activations: Added an optional position selector for residual-stream capture, `output_residual_stream_positions` in `extra_args` / `vllm_xargs` (client `capture_positions=`): `"last_prompt_token"` or a list of absolute token positions. Rows are selected on the worker before the copy to CPU, so a last-token payload no longer grows with prompt length, and the response carries `residual_stream_positions` with the position of each captured row. The last prompt token is the end of the full prompt under chunked prefill; rows are ascending with duplicates collapsed, never-computed positions are absent, and invalid selectors are rejected at submission. All-position capture without a selector is unchanged. (#40)
+
 ## v1.3.0 (2 October 2026)
 
 - Compatibility: Pin vLLM to the GPU-validated **0.30.0** release, with V1/eager execution. Add CPU regression CI and reproducible Slurm smoke/TP/PP suites; FP32 reference parity retains the 0.01 threshold and BF16 functional checks remain. See `docs/compatibility.md` for exact environments and coverage. (#39, #41)

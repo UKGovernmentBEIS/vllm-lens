@@ -26,6 +26,15 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_lens._helpers._hook_output import _replace_hook_output
+from vllm_lens._helpers._positions import (
+    LAST_PROMPT_TOKEN,
+    POSITIONS_KEY,
+    POSITIONS_META_KEY,
+    order_positions,
+    parse_capture_positions,
+    positions_in_slice,
+    select_rows,
+)
 from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
 
 if TYPE_CHECKING:
@@ -364,6 +373,25 @@ def _apply_steering(
                 target[rel] = target[rel] + v * cfg.scale
 
 
+def _capture_selector(extra: dict[str, Any]) -> str | list[int] | None:
+    """Position selector for one request, or ``None`` for all positions.
+
+    The entry points store the parsed form, so this is a dict lookup on the
+    hot path; the raw wire forms are still accepted for callers that bypass
+    them.
+    """
+    selector = extra.get(POSITIONS_KEY)
+    if selector is None or selector == LAST_PROMPT_TOKEN:
+        return selector
+    if (
+        isinstance(selector, list)
+        and all(isinstance(p, int) for p in selector)
+        and all(a < b for a, b in zip(selector, selector[1:]))
+    ):
+        return selector  # already sorted and unique
+    return parse_capture_positions(selector)
+
+
 def _hook_inner(
     extension: HiddenStatesExtension,
     layer_idx: int,
@@ -580,9 +608,27 @@ def _hook_inner(
 
             start = query_start_loc[i].item()
             end = query_start_loc[i + 1].item()
-            activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
-                start:end
-            ].cpu()
+            selector = _capture_selector(extra)
+            if selector is None:
+                activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
+                    start:end
+                ].cpu()
+            else:
+                # This slice holds absolute positions
+                # [num_computed_tokens, num_computed_tokens + n_tokens): a
+                # prefill chunk advances it per chunk, decode per token. Rows
+                # are picked on device, so only the selected ones reach CPU.
+                abs_start = int(req_state.num_computed_tokens)
+                positions = positions_in_slice(
+                    selector, abs_start, end - start, int(req_state.num_prompt_tokens)
+                )
+                activation = select_rows(
+                    hidden_states, start, abs_start, positions
+                ).cpu()
+                captured_positions = extension._captured_positions.setdefault(
+                    req_id, {}
+                )
+                captured_positions.setdefault(layer_idx, []).extend(positions)
 
             if req_id not in extension._captured_states:
                 extension._captured_states[req_id] = {}
@@ -925,6 +971,11 @@ class HiddenStatesExtension:
     ] = {}
     _hooks_installed: bool = False
 
+    # Absolute positions of the rows captured under a position selector, in
+    # capture order (empty for all-position requests):
+    # internal_req_id → { layer_idx → [position, ...] }
+    _captured_positions: dict[str, dict[int, list[int]]] = {}
+
     # Per-request steering configs:
     # key (external_req_id or _steering_id) → list of SteeringVector
     _steering_data: dict[str, list[SteeringVector]] = {}
@@ -977,6 +1028,7 @@ class HiddenStatesExtension:
         # Do NOT reset _persistent_hooks — they may have been set via
         # set_persistent_hooks() before the first generate call.
         self._captured_states = {}
+        self._captured_positions = {}
         self._steering_data = {}
         self._hook_data = {}
         if not isinstance(self.__dict__.get("_persistent_hooks"), list):
@@ -1051,6 +1103,7 @@ class HiddenStatesExtension:
         for req_id in list(self._captured_states):
             if req_id.startswith(prefix):
                 del self._captured_states[req_id]
+                self._captured_positions.pop(req_id, None)
                 logger.debug("Cleared leaked activations for %s", req_id)
 
     def _build_payload(
@@ -1061,8 +1114,14 @@ class HiddenStatesExtension:
         Pops the entry from ``_captured_states`` so successive calls do not
         re-emit the same data. Shared by :meth:`get_captured_states` and
         :meth:`get_captured_states_batch`.
+
+        Under a position selector the payload also carries
+        ``residual_stream_positions``: rows are reordered to ascending
+        position with duplicates collapsed, and the list gives the position
+        of each remaining row.
         """
         layer_dict = self._captured_states.pop(internal_req_id)
+        positions_by_layer = self._captured_positions.pop(internal_req_id, None)
         sorted_indices = sorted(layer_dict.keys())
         per_layer: list[Float[torch.Tensor, "total_pos hidden_dim"]] = [  # type: ignore[reportUndefinedVariable]
             torch.cat(layer_dict[idx], dim=0) for idx in sorted_indices
@@ -1072,7 +1131,21 @@ class HiddenStatesExtension:
         )
         if stacked.is_cuda:
             stacked = stacked.cpu()
-        return {"activations": {"residual_stream": stacked}}
+        activations: dict[str, Any] = {"residual_stream": stacked}
+        if positions_by_layer is not None:
+            positions = positions_by_layer.get(sorted_indices[0], [])
+            if any(
+                positions_by_layer.get(idx, []) != positions for idx in sorted_indices
+            ):
+                raise RuntimeError(
+                    "vllm-lens captured different positions per layer for "
+                    f"request {internal_req_id!r}: {positions_by_layer}"
+                )
+            ordered, rows = order_positions(positions)
+            if rows != list(range(len(positions))):
+                activations["residual_stream"] = stacked[:, rows]
+            activations[POSITIONS_META_KEY] = ordered
+        return {"activations": activations}
 
     def get_captured_states(self, external_req_id: str) -> bytes | None:
         """Retrieve captured activations for a specific request.

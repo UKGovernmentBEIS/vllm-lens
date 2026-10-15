@@ -113,6 +113,44 @@ print(out.activations["residual_stream"].shape)
 
 Layers are stacked in ascending order along dim 0. Capture runs on TP rank 0 only (residual streams are identical across TP ranks after all-reduce).
 
+#### Selecting positions
+
+By default every processed position is captured. Probing and activation-dataset workflows usually need one row per layer, so an optional `output_residual_stream_positions` selector restricts the capture to the last prompt token or to explicit absolute positions. The rows are picked on the worker before the copy to CPU, so a last-token payload no longer grows with prompt length:
+
+```python
+# Last prompt token only
+sp = SamplingParams(
+    max_tokens=1,
+    extra_args={
+        "output_residual_stream": [15, 20],
+        "output_residual_stream_positions": "last_prompt_token",
+    },
+)
+out = llm.generate(["Hello world"], sp)
+acts = out[0].activations
+acts["residual_stream"].shape       # (2, 1, hidden_dim)
+acts["residual_stream_positions"]   # [n_prompt - 1]
+
+# Explicit absolute positions, prompt and generated tokens alike
+sp = SamplingParams(
+    max_tokens=8,
+    extra_args={
+        "output_residual_stream": [15],
+        "output_residual_stream_positions": [0, 3, 12],
+    },
+)
+```
+
+Over HTTP, pass the same value in `vllm_xargs` or use the client's `capture_positions`:
+
+```python
+out = client.generate("Hello world", capture_layers=[15, 20], capture_positions="last_prompt_token")
+out.activations["residual_stream"].shape      # (2, 1, hidden_dim)
+out.activations["residual_stream_positions"]  # [n_prompt - 1]
+```
+
+Positions index the tokenized model input: prompt tokens (including any special tokens added by the tokenizer or chat template) occupy `0 .. n_prompt - 1`, and `n_prompt + k` is the state computed when generated token `k` is fed back for the next step. The final generated token is never processed, so it has no row (the same rule gives all-position capture `n_prompt + n_gen - 1` rows). `"last_prompt_token"` is position `n_prompt - 1`, the end of the full prompt: under chunked prefill it is captured in the final chunk only, never at a chunk boundary, and never from a generated token. Rows come back in ascending position order with duplicates collapsed, and `residual_stream_positions` lists the position of each row. Positions that are never computed are absent rather than an error, so a selector that matches nothing yields an empty `(n_layers, 0, hidden_dim)` tensor. Negative positions, unknown selector strings and a selector without `output_residual_stream` are rejected when the request is submitted. The selector applies to the residual stream only; `output_qk` still captures every position.
+
 #### Binary transport for large captures
 
 By default activations come back base64-encoded inside the JSON response, which adds ~33% overhead on top of the zstd compression and materializes the whole blob in one piece on both ends. For large all-layer captures, pass `activations_transport="binary"` to fetch the raw bytes out-of-band instead:
@@ -371,6 +409,8 @@ residual_stream = output.metadata["activations"]["residual_stream"]
 ```
 
 Attention Q/K capture works the same way — pass `"output_qk": [layer, ...]` in `extra_args` and reconstruct with `vllm_lens.attention.attention_patterns(output.metadata["activations"], layer=layer)`.
+
+To keep only the last prompt token (one row per layer), add `"output_residual_stream_positions": "last_prompt_token"` next to `output_residual_stream`; the captured positions arrive in `output.metadata["activations"]["residual_stream_positions"]`.
 
 #### Steering with an Activation Oracle
 

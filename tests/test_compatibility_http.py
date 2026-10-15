@@ -92,3 +92,45 @@ def test_persistent_hook_cleanup(client):
     client.clear_hooks()
     client.generate(PROMPT, max_tokens=1)
     assert not client.collect_hook_results()
+
+
+@pytest.mark.parametrize("endpoint", ["generate", "chat"])
+@pytest.mark.parametrize("transport", ["base64", "binary"])
+def test_capture_positions(client, endpoint, transport):
+    def generate(**kwargs):
+        prompt = (
+            PROMPT if endpoint == "generate" else [{"role": "user", "content": PROMPT}]
+        )
+        return getattr(client, endpoint)(
+            prompt,
+            max_tokens=4,
+            temperature=0.0,
+            capture_layers=[LAYER],
+            activations_transport=transport,
+            **kwargs,
+        )
+
+    baseline = generate()
+    reference = baseline.activations["residual_stream"][0]
+    n_prompt = baseline.raw["usage"]["prompt_tokens"]
+    n_rows = reference.shape[0]  # prompt tokens plus the generated ones fed back
+    assert n_rows >= n_prompt
+
+    last = generate(capture_positions="last_prompt_token").activations
+    assert last["residual_stream"].shape == (1, 1, reference.shape[-1])
+    assert last["residual_stream_positions"] == [n_prompt - 1]
+    torch.testing.assert_close(
+        last["residual_stream"][0, 0], reference[n_prompt - 1], rtol=0.02, atol=0.02
+    )
+
+    positions = [0, n_prompt - 1, n_prompt + 1, 10_000]
+    expected = [pos for pos in positions if pos < n_rows]
+    explicit = generate(capture_positions=positions).activations
+    assert explicit["residual_stream_positions"] == expected
+    torch.testing.assert_close(
+        explicit["residual_stream"][0], reference[expected], rtol=0.02, atol=0.02
+    )
+
+    # Rejected when the request is submitted, so the server returns an error.
+    with pytest.raises(RuntimeError):
+        generate(capture_positions=[-1])
