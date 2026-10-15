@@ -24,6 +24,10 @@ import cloudpickle
 import torch
 import zstandard as zstd
 
+from vllm_lens._helpers._positions import (
+    POSITIONS_META_KEY,
+    normalize_capture_positions,
+)
 from vllm_lens._helpers._serialize import (
     serialize_activations,
     serialize_activations_binary,
@@ -123,8 +127,24 @@ def _merge_captured_states(
         return None
     if len(parts) == 1:
         return parts[0]["activations"]
-    merged = torch.cat([p["activations"]["residual_stream"] for p in parts], dim=0)
-    return {"residual_stream": merged}
+    return _merge_residual_parts([p["activations"] for p in parts])
+
+
+def _merge_residual_parts(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Concatenate per-rank residual streams along the layer dim (PP > 1).
+
+    Every rank selects the same positions for a request, so the
+    ``residual_stream_positions`` metadata (present only under a position
+    selector) is taken from the first rank that carries it.
+    """
+    merged: dict[str, Any] = {
+        "residual_stream": torch.cat([p["residual_stream"] for p in parts], dim=0)
+    }
+    for p in parts:
+        if POSITIONS_META_KEY in p:
+            merged[POSITIONS_META_KEY] = p[POSITIONS_META_KEY]
+            break
+    return merged
 
 
 def _merge_captured_states_batch(
@@ -160,11 +180,7 @@ def _merge_captured_states_batch(
         if len(per_rank) == 1:
             out[req_id] = per_rank[0]["activations"]
         else:
-            merged = torch.cat(
-                [p["activations"]["residual_stream"] for p in per_rank],
-                dim=0,
-            )
-            out[req_id] = {"residual_stream": merged}
+            out[req_id] = _merge_residual_parts([p["activations"] for p in per_rank])
     return out
 
 
@@ -303,7 +319,15 @@ def _trim_activations(
     residual stream shape is always deterministic.
     """
     rs = activations.get("residual_stream")
-    if rs is not None and rs.shape[1] > expected_len:
+    positions = activations.get(POSITIONS_META_KEY)
+    if rs is not None and positions is not None:
+        # Position-selected rows are sparse, so trim by position rather than
+        # by count: a row from the surplus pass sits at or past expected_len.
+        keep = [row for row, pos in enumerate(positions) if pos < expected_len]
+        if len(keep) < len(positions):
+            activations["residual_stream"] = rs[:, keep, :]
+            activations[POSITIONS_META_KEY] = [positions[row] for row in keep]
+    elif rs is not None and rs.shape[1] > expected_len:
         activations["residual_stream"] = rs[:, :expected_len, :]
     for key in ("attn_q", "attn_k"):
         t = activations.get(key)
@@ -411,6 +435,9 @@ async def _patched_generate(
 
     extra = effective_params.extra_args or {}
     wants_activations = extra.get("output_residual_stream") is not None
+    # Validate the position selector (issue #40) before the request is
+    # scheduled and store its parsed form for the workers.
+    normalize_capture_positions(extra)
     # Response-transport negotiation (issue #31): "binary" parks activation
     # bytes in the process-local store and returns a handle instead of base64.
     # Popped so it doesn't ride along to the workers with the SamplingParams.
@@ -540,6 +567,9 @@ def _prepare_offline_params(
         params_list = [sampling_params]
     else:
         params_list = []
+
+    for sp in params_list:
+        normalize_capture_positions(sp.extra_args)
 
     wants_activations = any(
         (sp.extra_args or {}).get("output_residual_stream") is not None

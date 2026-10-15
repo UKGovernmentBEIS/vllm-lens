@@ -89,3 +89,40 @@ class TestChunkedPrefillMatchesTransformers:
             hf_acts = _get_hf_acts(model, tokenizer, prompt)
             vllm_acts = streams[i][0, :num_tokens].float()
             _assert_close(vllm_acts, hf_acts)
+
+
+class TestChunkedPrefillPositionSelection:
+    """The last prompt token is the end of the full prompt, not of a chunk."""
+
+    def _capture(self, llm: LLM, selector, max_tokens: int = 1) -> dict:
+        sp = SamplingParams(
+            temperature=0.0,
+            max_tokens=max_tokens,
+            extra_args={
+                "output_residual_stream": [LAYER_IDX],
+                "output_residual_stream_positions": selector,
+            },
+        )
+        return llm.generate([LONG_PROMPT], sp)[0].activations  # type: ignore[reportAttributeAccessIssue]
+
+    def test_last_prompt_token_matches_hf_final_position(self, chunked_llm, hf_model):
+        model, tokenizer = hf_model
+        hf_acts = _get_hf_acts(model, tokenizer, LONG_PROMPT)
+        num_tokens = hf_acts.shape[0]
+        assert num_tokens > 64, "Prompt must span several chunks"
+
+        acts = self._capture(chunked_llm, "last_prompt_token")
+        assert acts["residual_stream"].shape[1] == 1
+        assert acts["residual_stream_positions"] == [num_tokens - 1]
+        _assert_close(acts["residual_stream"][0].float(), hf_acts[-1:])
+
+    def test_explicit_positions_across_chunks(self, chunked_llm, hf_model):
+        model, tokenizer = hf_model
+        hf_acts = _get_hf_acts(model, tokenizer, LONG_PROMPT)
+        num_tokens = hf_acts.shape[0]
+        # One position inside each of the first two chunks plus the prompt end.
+        positions = [3, 63, 64, num_tokens - 1]
+
+        acts = self._capture(chunked_llm, positions)
+        assert acts["residual_stream_positions"] == positions
+        _assert_close(acts["residual_stream"][0].float(), hf_acts[positions])
