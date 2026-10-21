@@ -237,3 +237,48 @@ class TestOfflineSteeringEntryPoints:
         n_gen = len(output.outputs[0].token_ids)
         assert rs.shape[0] == 1  # one captured layer
         assert rs.shape[1] == n_prompt + n_gen - 1
+
+
+class TestPositionalSteeringAcrossSteps:
+    def test_decode_position_is_steered_exactly(self, llm_model):
+        """A 3D vector at a decode position steers that token and nothing before.
+
+        Regression: the absolute position of each step's first token was read
+        from the per-layer metadata *dict* (always ``None``), so every slice was
+        treated as starting at position 0 — decode positions were never steered
+        (and position 0 was re-steered on every decode step).
+        """
+
+        def params(extra_args: dict) -> SamplingParams:
+            return SamplingParams(
+                temperature=0.0, max_tokens=3, ignore_eos=True, extra_args=extra_args
+            )
+
+        base = llm_model.generate(
+            [PROMPT], params({"output_residual_stream": [LAYER_IDX]})
+        )[0]
+        rs_base = base.activations["residual_stream"][0].float()  # type: ignore[reportAttributeAccessIssue]
+        target = len(base.prompt_token_ids or []) + 1  # second decode step
+        v = torch.randn(rs_base.shape[-1], generator=torch.Generator().manual_seed(0))
+        sv = SteeringVector(
+            activations=v.view(1, 1, -1),
+            layer_indices=[LAYER_IDX],
+            scale=10.0,
+            position_indices=[target],
+        )
+        steered = llm_model.generate(
+            [PROMPT],
+            params(
+                {
+                    "output_residual_stream": [LAYER_IDX],
+                    "apply_steering_vectors": [sv],
+                }
+            ),
+        )[0]
+        rs = steered.activations["residual_stream"][0].float()  # type: ignore[reportAttributeAccessIssue]
+
+        assert torch.equal(rs[:target], rs_base[:target])
+        delta = rs[target] - rs_base[target]
+        cos = torch.nn.functional.cosine_similarity(delta, v, dim=0).item()
+        ratio = (delta.norm() / (10.0 * v.norm())).item()
+        assert cos > 0.99 and abs(ratio - 1) < 0.05, (cos, ratio)

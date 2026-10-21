@@ -185,13 +185,14 @@ client.generate("I think the best dessert is", steering_vectors=[sv])
 
 Hooks let you run arbitrary Python functions on hidden states at specific layers during inference. They can capture data (via `ctx.saved`) and/or modify hidden states (by returning a tensor).
 
-**Interface.** A hook is `Hook(fn, layer_indices, pre=False)`:
+**Interface.** A hook is `Hook(fn, layer_indices, pre=False, site="layer")`:
 
 | Field | Meaning |
 | --- | --- |
 | `fn(ctx, hidden_states) -> Tensor \| None` | Called once per hooked layer, per request. `hidden_states` is that request's slice, shape `(seq_len, hidden_dim)`. Return a tensor to **replace** it, or `None` to leave it unchanged. |
 | `layer_indices: list[int]` | Which layers to run on. |
 | `pre: bool` | If `True`, run as a *pre-hook* — before the layer forward pass, on its input — instead of after. |
+| `site: "layer" \| "mlp_act"` | `"layer"` (default) hooks the decoder layer (residual stream). `"mlp_act"` hooks the per-neuron MLP activation instead — see [MLP-neuron hooks](#mlp-neuron-hooks). Not combinable with `pre=True`. |
 
 The `ctx` (a `HookContext`) passed to `fn` exposes:
 
@@ -201,6 +202,8 @@ The `ctx` (a `HookContext`) passed to `fn` exposes:
 | `ctx.layer_idx: int` | The layer index currently firing. |
 | `ctx.seq_len: int` | Number of tokens in this request's slice. |
 | `ctx.model` | The underlying model (for architecture-specific access). |
+| `ctx.position_offset: int` | Absolute position, within the request, of the first token in this slice — `0` for the first prefill chunk; later chunks and decode steps are offset. |
+| `ctx.neuron_offset: int` | `site="mlp_act"` only: global neuron index of column 0 of the rank-local slice; `0` without tensor parallelism. |
 | `ctx.get_parameter(name) -> Tensor` | Fetch a full model parameter, gathered across TP/PP ranks — e.g. `ctx.get_parameter("lm_head.weight")`. With pipeline parallelism, `prefetch_params` the name first (see below). |
 
 `fn` runs on **every** tensor-parallel rank, so it must be deterministic across ranks (seed any randomness). Note that `ctx.saved` is merged across ranks at collection, and **list** values from different ranks are concatenated — so with TP > 1, a hook that saves plain lists sees every entry duplicated `tp_size`×. Save tensors, or guard the writes to one rank (e.g. `get_tp_group().rank_in_group == 0`, as [`jacobian_lens_chat.py`](examples/jacobian_lens_chat.py) does — but keep `ctx.get_parameter` calls on all ranks: the TP gather is a collective). For HTTP transport `fn` is serialized with cloudpickle — i.e. **arbitrary code execution** on the server, so only use with trusted clients.
@@ -234,6 +237,24 @@ def corrupt_embeddings(ctx, h):
 
 hook = Hook(fn=corrupt_embeddings, layer_indices=[0], pre=True)
 ```
+
+#### MLP-neuron hooks
+
+`Hook(..., site="mlp_act")` runs `fn(ctx, acts)` on the hooked layer's per-neuron MLP activation — `silu(gate) * up`, the input to `down_proj` — with `acts` of shape `(seq_len, intermediate_size)`. Return a tensor to replace it before `down_proj` consumes it (zero / mean-ablate / clamp neurons), or `None` to only observe. The module is resolved as `layer.get_submodule(VLLM_LENS_MLP_ACT_PATH)` (default `mlp.act_fn`, which is right for vLLM's gated MLPs such as Qwen2/Qwen3/Llama); MoE layers are unsupported and registering an `mlp_act` hook on them raises `LayerDiscoveryError`. These hooks are installed lazily on first use, so layer hooks are unaffected.
+
+```python
+def ablate_and_record(ctx, acts):
+    ctx.saved.setdefault("n123", []).append(acts[:, 123].cpu())
+    acts = acts.clone()
+    acts[:, 123] = 0  # zero neuron 123
+    return acts
+
+hook = Hook(fn=ablate_and_record, layer_indices=[2], site="mlp_act")
+out = llm.generate(["Hello world"], SamplingParams(extra_args={"apply_hooks": [hook]}))
+out[0].hook_results["0"]["n123"]  # pre-ablation activations, one entry per forward step
+```
+
+Under tensor parallelism the intermediate dimension is column-sharded: `acts` is the rank-local slice, and column `j` is global neuron `ctx.neuron_offset + j`. Hooks receive local slices (there is no cross-rank gather), so index neurons via `neuron_offset`. Each rank saves a different slice, and at collection same-key lists are concatenated across ranks while other values overwrite one another, so key saved values by `ctx.neuron_offset` (e.g. `ctx.saved[f"cols_{ctx.neuron_offset}"]`). Adding `α` to neuron `n` equals adding `α · W_down[:, n]` to the residual, which a [steering vector](#steering-vectors) already does.
 
 ### Persistent hooks (Garçon-style)
 

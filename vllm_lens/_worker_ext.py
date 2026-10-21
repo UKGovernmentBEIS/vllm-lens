@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import pickle
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any
 
 import cloudpickle
@@ -29,7 +29,7 @@ from vllm_lens._helpers._hook_output import _replace_hook_output
 from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
 
 if TYPE_CHECKING:
-    from jaxtyping import Float, Int
+    from jaxtyping import Float
     from vllm.config import ParallelConfig
 
 logger = logging.getLogger(__name__)
@@ -55,6 +55,8 @@ _ZSTD_COMPRESSOR = zstd.ZstdCompressor(level=1)
 
 
 _LAYER_PATH_ENV = "VLLM_LENS_LAYER_PATH"
+_MLP_ACT_PATH_ENV = "VLLM_LENS_MLP_ACT_PATH"
+_DEFAULT_MLP_ACT_PATH = "mlp.act_fn"
 
 
 class LayerDiscoveryError(RuntimeError):
@@ -222,6 +224,44 @@ def _discover_layer_modules(worker: Any) -> dict[int, torch.nn.Module]:
     return layer_map
 
 
+def _discover_mlp_act_modules(
+    layer_map: dict[int, torch.nn.Module],
+) -> dict[int, torch.nn.Module]:
+    """Map global layer index → the module whose output is the MLP activation.
+
+    The path (``VLLM_LENS_MLP_ACT_PATH``, default ``"mlp.act_fn"``) is a
+    ``get_submodule`` path relative to each decoder layer.  For vLLM's gated
+    MLPs (``Qwen2MoeMLP`` and friends) ``act_fn`` is ``SiluAndMul``, whose
+    output is ``silu(gate) * up`` — exactly the per-neuron input to
+    ``down_proj``.  Every discovered layer must resolve; MoE blocks have no
+    such module and are unsupported.
+    """
+    path = os.environ.get(_MLP_ACT_PATH_ENV, "").strip() or _DEFAULT_MLP_ACT_PATH
+    modules: dict[int, torch.nn.Module] = {}
+    missing: list[int] = []
+    for layer_idx, layer in sorted(layer_map.items()):
+        try:
+            modules[layer_idx] = layer.get_submodule(path)
+        except AttributeError:
+            missing.append(layer_idx)
+    if missing:
+        first = layer_map[missing[0]]
+        children = [name for name, _ in first.named_children()]
+        raise LayerDiscoveryError(
+            f"site='mlp_act': {path!r} does not exist on decoder layer(s) "
+            f"{missing} (layer {missing[0]} is {type(first).__name__} with "
+            f"children {children}). Set {_MLP_ACT_PATH_ENV} to the get_submodule "
+            f"path, relative to the decoder layer, of the module whose output is "
+            f"the per-neuron MLP activation. MoE layers are unsupported."
+        )
+    logger.info(
+        "vllm-lens: resolved MLP activation module %r on %d layer(s)",
+        path,
+        len(modules),
+    )
+    return modules
+
+
 def _get_total_num_layers(worker: Any) -> int:
     """Total decoder layers across all PP ranks (from the HF config)."""
     return int(worker.model_config.get_total_num_hidden_layers())
@@ -364,202 +404,252 @@ def _apply_steering(
                 target[rel] = target[rel] + v * cfg.scale
 
 
+class _BatchLayout:
+    """Where each scheduled request sits in one forward step's flattened batch.
+
+    Everything is resolved lazily, so a layer at which no request needs its
+    slice costs no per-request lookups and no device→host sync.
+    """
+
+    def __init__(
+        self, runner: Any, num_reqs: int, query_start_loc: torch.Tensor
+    ) -> None:
+        self._runner = runner
+        self.req_ids: list[str] = runner.input_batch.req_ids[:num_reqs]
+        self._query_start_loc_dev = query_start_loc
+        self._query_start_loc: list[int] | None = None
+
+    def extra_args(self, i: int) -> dict[str, Any] | None:
+        """``SamplingParams.extra_args`` of request ``i``."""
+        req_state = self._runner.requests.get(self.req_ids[i])
+        if req_state is None or req_state.sampling_params is None:
+            return None
+        return req_state.sampling_params.extra_args
+
+    def span(self, i: int) -> tuple[int, int, int]:
+        """``(start, end, abs_start)`` for request ``i``.
+
+        ``[start, end)`` is its token range in the flattened batch.
+        ``abs_start`` is the absolute position of its first token: vLLM
+        computes positions as ``num_computed_tokens + offset in step``, so
+        this is exact across chunked prefill and decode on every backend.
+        """
+        if self._query_start_loc is None:
+            n = len(self.req_ids)
+            self._query_start_loc = [
+                int(x) for x in self._query_start_loc_dev[: n + 1].tolist()
+            ]
+        qsl = self._query_start_loc
+        abs_start = int(self._runner.input_batch.num_computed_tokens_cpu[i])
+        return qsl[i], qsl[i + 1], abs_start
+
+
+def _batch_layout(extension: HiddenStatesExtension) -> _BatchLayout | None:
+    """Layout of the current forward step, or ``None`` if there is nothing to
+    hook (no forward context, no requests, or no attention metadata)."""
+    if not is_forward_context_available():
+        return None
+    runner = extension.model_runner
+    num_reqs = runner.input_batch.num_reqs
+    if num_reqs == 0:
+        return None
+    attn_metadata = get_forward_context().attn_metadata
+    if isinstance(attn_metadata, list):
+        attn_metadata = attn_metadata[0] if attn_metadata else None
+    if attn_metadata is None:
+        return None
+    # Hybrid models (e.g. Qwen3-Next with GatedDeltaNet) have multiple
+    # attention metadata entries — some (like GDNAttentionMetadata) lack
+    # query_start_loc.  Find one that has it.
+    query_start_loc = next(
+        (
+            getattr(meta, "query_start_loc")
+            for meta in attn_metadata.values()
+            if hasattr(meta, "query_start_loc")
+        ),
+        None,
+    )
+    if query_start_loc is None:
+        if not extension._layout_warned:
+            extension._layout_warned = True
+            logger.warning(
+                "No attention metadata with query_start_loc found (keys: %s); "
+                "vllm-lens hooks, steering and capture skip such forward passes.",
+                list(attn_metadata.keys()),
+            )
+        return None
+    return _BatchLayout(runner, num_reqs, query_start_loc)
+
+
+def _residual_stream(
+    output: torch.Tensor | tuple[torch.Tensor, ...],
+) -> Float[torch.Tensor, "total_tokens hidden_dim"]:  # type: ignore[reportUndefinedVariable]
+    """The residual stream of a decoder layer's output.
+
+    Fused-residual layers return ``(hidden_states, residual)``; the stream is
+    their sum.
+    """
+    if isinstance(output, tuple):
+        return output[0] + output[1] if output[1] is not None else output[0]
+    return output
+
+
+def _is_pre_hook(hook: Hook) -> bool:
+    return hook.site == "layer" and hook.pre
+
+
+def _is_post_hook(hook: Hook) -> bool:
+    return hook.site == "layer" and not hook.pre
+
+
+def _is_mlp_act_hook(hook: Hook) -> bool:
+    return hook.site == "mlp_act"
+
+
+def _has_mlp_act_hooks(hooks: list[Hook]) -> bool:
+    return any(_is_mlp_act_hook(hook) for hook in hooks)
+
+
+def _iter_hooks(
+    extension: HiddenStatesExtension,
+    layout: _BatchLayout,
+    layer_idx: int,
+    select: Callable[[Hook], bool],
+    neuron_offset: int = 0,
+) -> Iterator[tuple[int, int, Hook, HookContext]]:
+    """Yield ``(start, end, hook, ctx)`` for every selected hook active at
+    ``layer_idx``, per request in batch order, with ``ctx`` updated.
+
+    Persistent hooks come before a request's per-request hooks, so the
+    latter see the persistent-modified state.  Per-request and persistent
+    contexts live in separate stores (per-request ones are cleaned up after
+    each request; persistent ones accumulate), keyed by the hook's position
+    in its list.  A position holds one hook, and each hook runs at one site
+    (pre, post or mlp_act), so sites never share a context and result keys
+    ("0", "1", ...) stay stable however a request mixes them.
+    """
+    persistent = [
+        (pos, hook)
+        for pos, hook in enumerate(extension._persistent_hooks)
+        if select(hook) and hook.has_layer(layer_idx)
+    ]
+    if not persistent and not extension._hook_data:
+        return
+    model = extension.model_runner.model
+    for i, req_id in enumerate(layout.req_ids):
+        per_req = [
+            (pos, hook)
+            for pos, hook in enumerate(
+                _find_hook_configs_no_persistent(
+                    extension, req_id, layout.extra_args(i)
+                )
+            )
+            if select(hook) and hook.has_layer(layer_idx)
+        ]
+        if not persistent and not per_req:
+            continue
+        start, end, abs_start = layout.span(i)
+        for active, store in (
+            (persistent, extension._persistent_hook_contexts),
+            (per_req, extension._hook_contexts),
+        ):
+            for pos, hook in active:
+                ctxs = store.setdefault(req_id, {})
+                ctx = ctxs.get(pos)
+                if ctx is None:
+                    ctx = ctxs[pos] = HookContext()
+                ctx.layer_idx = layer_idx
+                ctx.seq_len = end - start
+                ctx.position_offset = abs_start
+                ctx.neuron_offset = neuron_offset
+                ctx.model = model
+                ctx._prefetched = extension._prefetched_params
+                yield start, end, hook, ctx
+
+
+def _run_slice_hooks(
+    extension: HiddenStatesExtension,
+    layer_idx: int,
+    tensor: torch.Tensor,
+    select: Callable[[Hook], bool],
+    neuron_offset: int = 0,
+) -> torch.Tensor | None:
+    """Run hooks that read and replace per-request slices of ``tensor``.
+
+    Used for pre-hooks (decoder-layer input) and mlp_act hooks (MLP
+    activation).  ``tensor`` is cloned on the first replacement; returns
+    the modified copy, or ``None`` if no hook replaced anything.
+    """
+    layout = _batch_layout(extension)
+    if layout is None:
+        return None
+    working = tensor
+    for start, end, hook, ctx in _iter_hooks(
+        extension, layout, layer_idx, select, neuron_offset
+    ):
+        result = hook.fn(ctx, working[start:end])
+        if result is not None:
+            if working is tensor:
+                working = tensor.clone()
+            working[start:end] = result
+    return None if working is tensor else working
+
+
 def _hook_inner(
     extension: HiddenStatesExtension,
     layer_idx: int,
     output: torch.Tensor | tuple[torch.Tensor, ...],
 ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
     """Core hook logic, separated so _make_hook can wrap it in try/except."""
-    if not is_forward_context_available():
+    layout = _batch_layout(extension)
+    if layout is None:
         return None
 
-    runner = extension.model_runner
-    num_reqs = runner.input_batch.num_reqs
-    if num_reqs == 0:
-        return None
-
-    req_ids = runner.input_batch.req_ids
-
-    ctx = get_forward_context()
-    attn_metadata = ctx.attn_metadata
-    if attn_metadata is None:
-        return None
-    if isinstance(attn_metadata, list):
-        attn_metadata = attn_metadata[0]
-        if attn_metadata is None:
-            return None
-    # Hybrid models (e.g. Qwen3-Next with GatedDeltaNet) have multiple
-    # attention metadata entries — some (like GDNAttentionMetadata) lack
-    # query_start_loc.  Find one that has it.
-    query_start_loc: Int[torch.Tensor, "num_reqs_plus1"] | None = None  # type: ignore[reportUndefinedVariable]
-    for _meta in attn_metadata.values():
-        if hasattr(_meta, "query_start_loc"):
-            query_start_loc = getattr(_meta, "query_start_loc")
-            break
-    if query_start_loc is None:
-        logger.warning(
-            "No attention metadata with query_start_loc found "
-            "(keys: %s). Skipping hook for this step.",
-            list(attn_metadata.keys()),
-        )
-        return None
-
-    # --- Phase 1: detect steering requests --------------------------
-    per_req_steering: list[list[SteeringVector]] = []
-    needs_steering = False
-    for i in range(num_reqs):
-        req_id = req_ids[i]
-        req_state = runner.requests.get(req_id)
-        extra = (
-            req_state.sampling_params.extra_args
-            if req_state and req_state.sampling_params
-            else None
-        )
-        configs = _find_steering_configs(extension, req_id, extra)
-        per_req_steering.append(configs)
-        if configs:
-            needs_steering = True
-
-    # --- Phase 2: apply steering ------------------------------------
+    # --- Phase 1: apply steering ------------------------------------
+    per_req_steering = [
+        _find_steering_configs(extension, req_id, layout.extra_args(i))
+        for i, req_id in enumerate(layout.req_ids)
+    ]
     modified_output: torch.Tensor | tuple[torch.Tensor, ...] | None = None
-    if needs_steering:
+    if any(per_req_steering):
         if isinstance(output, tuple):
             modified_output = (output[0].clone(), output[1])
             target = modified_output[0]
             # Fused-residual layers: true residual stream is output[0]+output[1].
             # norm_match must reference the full stream, not the MLP-delta half.
-            norm_ref = output[0] + output[1] if output[1] is not None else output[0]
+            norm_ref = _residual_stream(output)
         else:
             modified_output = output.clone()
             target = modified_output
             norm_ref = target
 
-        # Retrieve seq_lens for absolute position calculation.
-        # seq_lens may be a tensor or a list depending on vLLM version.
-        seq_lens: Any = getattr(attn_metadata, "seq_lens", None)
-
-        for i in range(num_reqs):
-            if not per_req_steering[i]:
+        for i, configs in enumerate(per_req_steering):
+            if not configs:
                 continue
-            start = int(query_start_loc[i].item())
-            end = int(query_start_loc[i + 1].item())
-            n_query = end - start
-            # Absolute position of the first token in this forward pass
-            if seq_lens is not None:
-                sl = seq_lens[i]
-                sl_val = sl.item() if isinstance(sl, torch.Tensor) else int(sl)
-                abs_start = int(sl_val - n_query)
-            else:
-                abs_start = 0  # fallback: treat as prefill from position 0
-            _apply_steering(
-                per_req_steering[i], layer_idx, target, start, end, abs_start, norm_ref
-            )
+            start, end, abs_start = layout.span(i)
+            _apply_steering(configs, layer_idx, target, start, end, abs_start, norm_ref)
 
-    # --- Phase 2.5: run generic (post) hooks -------------------------
-    # Per-request and persistent hooks are stored in separate context
-    # dicts (per-request contexts are cleaned up after each request;
-    # persistent ones accumulate).  Within each dict, contexts are keyed
-    # by the hook's position in its category list — so a pre-hook and a
-    # post-hook at different positions never share a HookContext, and the
-    # returned result index ("0", "1", ...) is stable regardless of how
-    # many pre/post hooks a request mixes.  Pre-hooks are handled in
-    # _pre_hook_inner using the same position keys.
-    per_req_hooks: list[list[Hook]] = []
-    needs_hooks = False
-    persistent_hooks = extension._persistent_hooks
-    for i in range(num_reqs):
-        req_id = req_ids[i]
-        req_state = runner.requests.get(req_id)
-        extra = (
-            req_state.sampling_params.extra_args
-            if req_state and req_state.sampling_params
-            else None
-        )
-        hooks = _find_hook_configs_no_persistent(extension, req_id, extra)
-        per_req_hooks.append(hooks)
-        if hooks or persistent_hooks:
-            needs_hooks = True
-
-    if needs_hooks:
-        # Compute hidden_states (summed if tuple) same as Phase 3 does.
-        hook_src = modified_output if modified_output is not None else output
-        if isinstance(hook_src, tuple):
-            hook_hidden = (
-                hook_src[0] + hook_src[1] if hook_src[1] is not None else hook_src[0]
-            )
-        else:
-            hook_hidden = hook_src
-        # Clone to avoid aliasing — hooks read/write this independently.
-        hook_hidden = hook_hidden.clone()
-
-        def _run_post_category(
-            hooks: list[Hook],
-            store: dict[str, dict[int, HookContext]],
-            req_id: str,
-            start: int,
-            end: int,
-        ) -> None:
-            """Run the post-hooks in one category list at this layer.
-
-            Contexts live in ``store[req_id][position]``, created lazily.
-            """
-            nonlocal modified_output
-            for pos, hook in enumerate(hooks):
-                if hook.pre or not hook.has_layer(layer_idx):
-                    continue
-                ctxs = store.setdefault(req_id, {})
-                ctx = ctxs.get(pos)
-                if ctx is None:
-                    ctx = HookContext()
-                    ctxs[pos] = ctx
-                ctx.layer_idx = layer_idx
-                ctx.seq_len = end - start
-                ctx.model = runner.model
-                ctx._prefetched = extension._prefetched_params
-
-                result = hook.fn(ctx, hook_hidden[start:end])
-                if result is not None:
-                    modified_output = _replace_hook_output(
-                        output, modified_output, hook_hidden, start, end, result
-                    )
-
-        for i in range(num_reqs):
-            if not (persistent_hooks or per_req_hooks[i]):
-                continue
-            req_id = req_ids[i]
-            start = int(query_start_loc[i].item())
-            end = int(query_start_loc[i + 1].item())
-            # Persistent hooks fire first (base layer); per-request hooks
-            # see the persistent-modified state.
-            _run_post_category(
-                persistent_hooks,
-                extension._persistent_hook_contexts,
-                req_id,
-                start,
-                end,
-            )
-            _run_post_category(
-                per_req_hooks[i], extension._hook_contexts, req_id, start, end
+    # --- Phase 2: run generic post-hooks (see _iter_hooks) ----------
+    hook_hidden: torch.Tensor | None = None
+    for start, end, hook, ctx in _iter_hooks(
+        extension, layout, layer_idx, _is_post_hook
+    ):
+        if hook_hidden is None:
+            # Clone to avoid aliasing — hooks read/write this independently.
+            hook_hidden = _residual_stream(
+                modified_output if modified_output is not None else output
+            ).clone()
+        result = hook.fn(ctx, hook_hidden[start:end])
+        if result is not None:
+            modified_output = _replace_hook_output(
+                output, modified_output, hook_hidden, start, end, result
             )
 
     # --- Phase 3: capture activations (rank 0 only) -----------------
     if getattr(extension, "_should_capture", True):
-        capture_src = modified_output if modified_output is not None else output
-        hidden_states: Float[torch.Tensor, "total_tokens hidden_dim"]  # type: ignore[reportUndefinedVariable]
-        if isinstance(capture_src, tuple):
-            if capture_src[1] is not None:
-                hidden_states = capture_src[0] + capture_src[1]
-            else:
-                hidden_states = capture_src[0]
-        else:
-            hidden_states = capture_src
-
-        for i in range(num_reqs):
-            req_id = req_ids[i]
-            req_state = runner.requests.get(req_id)
-            if req_state is None or req_state.sampling_params is None:
-                continue
-            extra = req_state.sampling_params.extra_args
+        hidden_states: Float[torch.Tensor, "total_tokens hidden_dim"] | None = None  # type: ignore[reportUndefinedVariable]
+        for i, req_id in enumerate(layout.req_ids):
+            extra = layout.extra_args(i)
             if not extra:
                 continue
 
@@ -578,8 +668,11 @@ def _hook_inner(
             ):
                 continue
 
-            start = query_start_loc[i].item()
-            end = query_start_loc[i + 1].item()
+            if hidden_states is None:
+                hidden_states = _residual_stream(
+                    modified_output if modified_output is not None else output
+                )
+            start, end, _ = layout.span(i)
             activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
                 start:end
             ].cpu()
@@ -604,88 +697,25 @@ def _pre_hook_inner(
     Only runs generic hooks — steering and activation capture are
     post-hook operations and are not affected.
     """
-    if not is_forward_context_available():
-        return None
+    return _run_slice_hooks(extension, layer_idx, input_tensor, _is_pre_hook)
 
-    runner = extension.model_runner
-    num_reqs = runner.input_batch.num_reqs
-    if num_reqs == 0:
-        return None
 
-    req_ids = runner.input_batch.req_ids
-    ctx = get_forward_context()
-    attn_metadata = ctx.attn_metadata
-    if attn_metadata is None:
-        return None
-    if isinstance(attn_metadata, list):
-        attn_metadata = attn_metadata[0]
-        if attn_metadata is None:
-            return None
-    query_start_loc: torch.Tensor | None = None
-    for _meta in attn_metadata.values():
-        if hasattr(_meta, "query_start_loc"):
-            query_start_loc = getattr(_meta, "query_start_loc")
-            break
-    if query_start_loc is None:
-        return None
+def _mlp_act_hook_inner(
+    extension: HiddenStatesExtension,
+    layer_idx: int,
+    output: torch.Tensor,
+) -> torch.Tensor | None:
+    """Run ``site="mlp_act"`` hooks on a layer's MLP activation output.
 
-    # Pre-hooks share the same context stores as post-hooks, keyed by the
-    # hook's position in its category list.  A hook at a given position is
-    # either pre or post (never both), so pre and post never collide on the
-    # same key — this is what lets a request mix pre- and post-hooks safely.
-    persistent_hooks = extension._persistent_hooks
-    modified = False
-    working = input_tensor
-
-    def _run_pre_category(
-        hooks: list[Hook],
-        store: dict[str, dict[int, HookContext]],
-        req_id: str,
-        start: int,
-        end: int,
-    ) -> None:
-        """Run the pre-hooks in one category list at this layer."""
-        nonlocal working, modified
-        for pos, hook in enumerate(hooks):
-            if not hook.pre or not hook.has_layer(layer_idx):
-                continue
-            ctxs = store.setdefault(req_id, {})
-            hctx = ctxs.get(pos)
-            if hctx is None:
-                hctx = HookContext()
-                ctxs[pos] = hctx
-            hctx.layer_idx = layer_idx
-            hctx.seq_len = end - start
-            hctx.model = runner.model
-            hctx._prefetched = extension._prefetched_params
-
-            result = hook.fn(hctx, working[start:end])
-            if result is not None:
-                if not modified:
-                    working = input_tensor.clone()
-                    modified = True
-                working[start:end] = result
-
-    for i in range(num_reqs):
-        req_id = req_ids[i]
-        req_state = runner.requests.get(req_id)
-        extra = (
-            req_state.sampling_params.extra_args
-            if req_state and req_state.sampling_params
-            else None
-        )
-        per_req = _find_hook_configs_no_persistent(extension, req_id, extra)
-        if not any(h.pre for h in persistent_hooks) and not any(h.pre for h in per_req):
-            continue
-
-        start = int(query_start_loc[i].item())
-        end = int(query_start_loc[i + 1].item())
-        _run_pre_category(
-            persistent_hooks, extension._persistent_hook_contexts, req_id, start, end
-        )
-        _run_pre_category(per_req, extension._hook_contexts, req_id, start, end)
-
-    return working if modified else None
+    ``output`` is ``(total_tokens, intermediate_local)``: under tensor
+    parallelism each rank holds a contiguous column shard, so hooks run on
+    every rank and ``ctx.neuron_offset`` maps local columns to global
+    neuron indices.
+    """
+    neuron_offset = extension._tp_rank * output.shape[-1]
+    return _run_slice_hooks(
+        extension, layer_idx, output, _is_mlp_act_hook, neuron_offset
+    )
 
 
 def _make_hook(extension: HiddenStatesExtension, layer_idx: int) -> Callable:
@@ -735,6 +765,29 @@ def _make_pre_hook(extension: HiddenStatesExtension, layer_idx: int) -> Callable
         except Exception:
             logger.warning(
                 "vllm-lens pre-hook error on layer %d, skipping",
+                layer_idx,
+                exc_info=True,
+            )
+            return None
+
+    return hook
+
+
+def _make_mlp_act_hook(extension: HiddenStatesExtension, layer_idx: int) -> Callable:
+    """Create a forward hook closure for a layer's MLP activation module."""
+
+    def hook(
+        _module: torch.nn.Module,
+        _input: object,
+        output: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Forward hook: run mlp_act hooks; return the modified activations
+        (consumed by ``down_proj``) or ``None`` to leave them untouched."""
+        try:
+            return _mlp_act_hook_inner(extension, layer_idx, output)
+        except Exception:
+            logger.warning(
+                "vllm-lens mlp_act hook error on layer %d, skipping",
                 layer_idx,
                 exc_info=True,
             )
@@ -959,6 +1012,15 @@ class HiddenStatesExtension:
     # layer index (scale, sliding window, soft-cap, ... — see install_qk_hooks).
     _qk_layer_meta: dict[int, dict[str, Any]] = {}
 
+    # Decoder layers discovered by install_hooks (global index → module), and
+    # lazy site="mlp_act" install state (the TP rank sets neuron_offset).
+    _layer_map: dict[int, torch.nn.Module] = {}
+    _mlp_act_hooks_installed: bool = False
+    _tp_rank: int = 0
+
+    # Whether the missing-query_start_loc warning has been logged.
+    _layout_warned: bool = False
+
     def install_hooks(self) -> None:
         """Register a forward hook on every decoder layer. Idempotent.
 
@@ -988,13 +1050,35 @@ class HiddenStatesExtension:
         # TP ranks after all-reduce, so the data is identical.
         tp_size = self.parallel_config.tensor_parallel_size
         self._should_capture = tp_size <= 1 or self.rank % tp_size == 0
+        self._mlp_act_hooks_installed = False
 
         # Hooks must be installed on ALL ranks so steering vectors are
         # applied everywhere (not just rank 0).
         layer_map = _discover_layer_modules(self)
+        self._layer_map = layer_map
         for layer_idx, layer in sorted(layer_map.items()):
             layer.register_forward_pre_hook(_make_pre_hook(self, layer_idx))
             layer.register_forward_hook(_make_hook(self, layer_idx))
+
+    def install_mlp_act_hooks(self) -> None:
+        """Register a forward hook on every layer's MLP activation. Idempotent.
+
+        Installed lazily, the first time a ``site="mlp_act"`` hook is
+        registered, so models without a resolvable activation module (MoE)
+        keep working for layer hooks.  Runs on **every** TP rank because the
+        intermediate dimension is column-sharded.
+        """
+        if self._mlp_act_hooks_installed:
+            return
+        self.install_hooks()
+        modules = _discover_mlp_act_modules(self._layer_map)
+
+        from vllm.distributed import parallel_state as ps
+
+        self._tp_rank = int(ps.get_tensor_model_parallel_rank())
+        for layer_idx, module in sorted(modules.items()):
+            module.register_forward_hook(_make_mlp_act_hook(self, layer_idx))
+        self._mlp_act_hooks_installed = True
 
     # ------------------------------------------------------------------
     # Steering data management (called via collective_rpc)
@@ -1401,6 +1485,8 @@ class HiddenStatesExtension:
                     raise ValueError(
                         f"layer_index {idx} out of range [0, {num_layers})"
                     )
+        if _has_mlp_act_hooks(hooks):
+            self.install_mlp_act_hooks()
         self._hook_data[key] = hooks
 
     def get_hook_results(self, external_req_id: str) -> bytes | None:
@@ -1455,6 +1541,8 @@ class HiddenStatesExtension:
                     raise ValueError(
                         f"layer_index {idx} out of range [0, {num_layers})"
                     )
+        if _has_mlp_act_hooks(hooks):
+            self.install_mlp_act_hooks()
         self._persistent_hooks.extend(hooks)
 
     def get_all_hook_results(self) -> bytes | None:

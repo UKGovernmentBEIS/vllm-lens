@@ -4,6 +4,8 @@ import pytest
 import torch
 from vllm import LLM, SamplingParams
 
+from vllm_lens import Hook
+
 from .conftest import LAYER_IDX, MODEL_NAME, PROMPT, REFERENCE_DTYPE
 
 LONG_PROMPT = "The quick brown fox jumps over the lazy dog. " * 20
@@ -89,3 +91,26 @@ class TestChunkedPrefillMatchesTransformers:
             hf_acts = _get_hf_acts(model, tokenizer, prompt)
             vllm_acts = streams[i][0, :num_tokens].float()
             _assert_close(vllm_acts, hf_acts)
+
+    def test_hook_position_offset_spans_chunks(self, chunked_llm):
+        """``ctx.position_offset`` continues across prefill chunks and decode."""
+
+        def record(ctx, h):
+            ctx.saved.setdefault("spans", []).append((ctx.position_offset, ctx.seq_len))
+
+        sp = SamplingParams(
+            temperature=0.0,
+            max_tokens=2,
+            ignore_eos=True,
+            extra_args={"apply_hooks": [Hook(fn=record, layer_indices=[LAYER_IDX])]},
+        )
+        out = chunked_llm.generate([LONG_PROMPT], sp)[0]
+        spans = out.hook_results["0"]["spans"]  # type: ignore[reportAttributeAccessIssue]
+        num_tokens = len(out.prompt_token_ids or [])
+        assert num_tokens > 64
+        assert len(spans) >= 3, spans  # at least two prefill chunks + one decode
+        pos = 0
+        for offset, n in spans:
+            assert offset == pos, spans
+            pos += n
+        assert pos >= num_tokens + 1, spans

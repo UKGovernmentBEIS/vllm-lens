@@ -1,5 +1,9 @@
 ## Unreleased
 
+- Hooks: Added `Hook(site="mlp_act")` — hooks that read and modify per-neuron MLP activations (`silu(gate) * up`, the input to `down_proj`) per request, for neuron capture and zero / mean / clamp ablation. The activation module is `mlp.act_fn` by default, overridable via `VLLM_LENS_MLP_ACT_PATH`; installed lazily on first use; MoE layers are unsupported. Behaviour is unchanged unless an `mlp_act` hook is registered.
+- Hooks: `HookContext` gains `position_offset` (absolute position of the slice's first token, for every hook) and `neuron_offset` (global index of the rank-local `mlp_act` slice under TP).
+- Steering: Fixed position-specific (3D) steering after the first prefill chunk. The absolute position of each forward step's first token was always taken as 0, so `position_indices` beyond the first chunk were never steered, and position 0 was re-steered on every decode step. Positions now come from vLLM's own per-request computed-token count.
+
 ## v1.3.0 (2 October 2026)
 
 - Compatibility: Pin vLLM to the GPU-validated **0.30.0** release, with V1/eager execution. Add CPU regression CI and reproducible Slurm smoke/TP/PP suites; FP32 reference parity retains the 0.01 threshold and BF16 functional checks remain. See `docs/compatibility.md` for exact environments and coverage. (#39, #41)

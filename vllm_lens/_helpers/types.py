@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import cloudpickle
 import torch
@@ -111,15 +111,31 @@ class HookContext:
 
     Created per (hook, request) pair.  ``saved`` persists across layers
     for the same hook, so hooks can accumulate data as each layer fires.
-    ``layer_idx`` and ``seq_len`` are updated by the dispatcher before
-    each call.
+    ``layer_idx``, ``seq_len``, ``position_offset`` and ``neuron_offset``
+    are updated by the dispatcher before each call.
+
+    ``position_offset`` is the absolute position, within the request, of the
+    slice's first token: 0 on the first prefill chunk, then offset for later
+    chunks and decode steps.  ``neuron_offset`` is only non-zero for
+    ``site="mlp_act"`` hooks under tensor parallelism, where the activation
+    slice is rank-local: column ``j`` is global neuron ``neuron_offset + j``.
     """
 
-    __slots__ = ("layer_idx", "seq_len", "saved", "model", "_prefetched")
+    __slots__ = (
+        "layer_idx",
+        "seq_len",
+        "position_offset",
+        "neuron_offset",
+        "saved",
+        "model",
+        "_prefetched",
+    )
 
     def __init__(self) -> None:
         self.layer_idx: int = 0
         self.seq_len: int = 0
+        self.position_offset: int = 0
+        self.neuron_offset: int = 0
         self.saved: dict[str, Any] = {}
         self.model: Any = None
         self._prefetched: dict[str, torch.Tensor] = {}
@@ -211,6 +227,16 @@ class Hook(BaseModel):
     and can modify them before the layer processes them.  Useful for
     corrupting embeddings or patching inputs to specific layers."""
 
+    site: Literal["layer", "mlp_act"] = "layer"
+    """Where the hook runs.  ``"layer"`` (default) hooks the decoder layer's
+    input/output (the residual stream).  ``"mlp_act"`` hooks the layer's
+    per-neuron MLP activation (``silu(gate) * up``, the input to
+    ``down_proj``): ``fn`` receives shape ``(seq_len, intermediate_local)``,
+    the rank-local column shard under tensor parallelism (see
+    ``HookContext.neuron_offset``).  The module is resolved via
+    ``VLLM_LENS_MLP_ACT_PATH`` (default ``"mlp.act_fn"``); MoE layers are
+    unsupported.  Cannot be combined with ``pre=True``."""
+
     @field_validator("fn", mode="before")
     @classmethod
     def _deserialize_fn(cls, v: Any) -> Callable:
@@ -233,6 +259,11 @@ class Hook(BaseModel):
         """Validate layer_indices is non-empty and cache as a set."""
         if not self.layer_indices:
             raise ValueError("layer_indices must be non-empty")
+        if self.pre and self.site == "mlp_act":
+            raise ValueError(
+                "pre=True is not supported for site='mlp_act'; an mlp_act hook "
+                "already runs before down_proj consumes the activations."
+            )
         # Cache as frozenset for O(1) membership tests on the hot path.
         object.__setattr__(self, "_layer_set", frozenset(self.layer_indices))
         return self
