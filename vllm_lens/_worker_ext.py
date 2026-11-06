@@ -716,21 +716,25 @@ def _make_pre_hook(extension: HiddenStatesExtension, layer_idx: int) -> Callable
     """Create a forward pre-hook closure for a specific layer index.
 
     vLLM decoder layers have signature
-    ``forward(positions, hidden_states, residual)`` — the hidden states
-    are at ``args[1]``, not ``args[0]``.
+    ``forward(positions, hidden_states, residual)`` with positional,
+    keyword, or mixed arguments. Pre-hooks operate on hidden_states;
+    the optional residual and all other arguments are left untouched.
     """
 
     def hook(
         _module: torch.nn.Module,
-        args: tuple[torch.Tensor, ...],
-    ) -> tuple[torch.Tensor, ...] | None:
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
         """Forward pre-hook: run user pre-hooks on the layer input."""
         try:
-            # hidden_states is args[1] (args[0] is positions).
-            hidden = args[1]
+            # Positional hidden_states follows positions; Qwen uses kwargs.
+            hidden = kwargs["hidden_states"] if "hidden_states" in kwargs else args[1]
             result = _pre_hook_inner(extension, layer_idx, hidden)
             if result is not None:
-                return args[:1] + (result,) + args[2:]
+                if "hidden_states" in kwargs:
+                    return args, {**kwargs, "hidden_states": result}
+                return args[:1] + (result,) + args[2:], kwargs
             return None
         except Exception:
             logger.warning(
@@ -993,7 +997,9 @@ class HiddenStatesExtension:
         # applied everywhere (not just rank 0).
         layer_map = _discover_layer_modules(self)
         for layer_idx, layer in sorted(layer_map.items()):
-            layer.register_forward_pre_hook(_make_pre_hook(self, layer_idx))
+            layer.register_forward_pre_hook(
+                _make_pre_hook(self, layer_idx), with_kwargs=True
+            )
             layer.register_forward_hook(_make_hook(self, layer_idx))
 
     # ------------------------------------------------------------------
