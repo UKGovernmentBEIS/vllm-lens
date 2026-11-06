@@ -1,5 +1,7 @@
 ## Unreleased
 
+- Hooks: Support decoder-layer pre-hooks with positional, keyword, or mixed inputs, including Qwen-style calls, while preserving residual and other arguments. (#52)
+
 ## v1.3.0 (2 October 2026)
 
 - Compatibility: Pin vLLM to the GPU-validated **0.30.0** release, with V1/eager execution. Add CPU regression CI and reproducible Slurm smoke/TP/PP suites; FP32 reference parity retains the 0.01 threshold and BF16 functional checks remain. See `docs/compatibility.md` for exact environments and coverage. (#39, #41)
