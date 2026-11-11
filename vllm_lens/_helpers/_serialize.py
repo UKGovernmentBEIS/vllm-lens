@@ -225,20 +225,36 @@ def decode_activations(
 _JSON_SAFE_TYPES = (str, int, float, bool, type(None))
 
 
+def _has_only_str_keys(v: Any) -> bool:
+    """True if every dict nested in ``v`` has str keys (JSON stringifies others)."""
+    # Iterative, so nesting that json.dumps accepts cannot hit the recursion limit.
+    stack = [v]
+    while stack:
+        x = stack.pop()
+        if isinstance(x, dict):
+            if not all(isinstance(k, str) for k in x):
+                return False
+            stack.extend(x.values())
+        elif isinstance(x, (list, tuple)):
+            stack.extend(x)
+    return True
+
+
 def _serialize_value(v: Any) -> Any:
     """Serialize a single value from ``ctx.saved`` for JSON transport."""
     if isinstance(v, torch.Tensor):
         return {"__type__": "tensor", **serialize_tensor(v)}
-    if isinstance(v, _JSON_SAFE_TYPES):
-        return v
-    if isinstance(v, (list, dict)):
-        # Recurse for containers — fall through to cloudpickle if nested
-        # values aren't JSON-safe.
+    if isinstance(v, (*_JSON_SAFE_TYPES, list, dict)):
+        # Pass through only what strict JSON carries unchanged: the HTTP
+        # responses reject NaN/inf, and non-str dict keys come back as str.
+        # Anything else falls through to cloudpickle.
         try:
-            json.dumps(v)
-            return v
+            json.dumps(v, allow_nan=False)
         except (TypeError, ValueError):
             pass
+        else:
+            if _has_only_str_keys(v):
+                return v
     return {
         "__type__": "cloudpickle",
         "data": base64.b64encode(cloudpickle.dumps(v)).decode("ascii"),
