@@ -108,7 +108,7 @@ class VLLMLensClient:
             xargs["output_residual_stream"] = json.dumps(capture_layers)
         if activations_transport is not None:
             xargs["activations_transport"] = activations_transport
-        if capture_qk is not None:
+        if capture_qk is not None and capture_qk is not False:
             xargs["output_qk"] = json.dumps(capture_qk)
         if hooks is not None:
             xargs["apply_hooks"] = json.dumps([h.model_dump() for h in hooks])
@@ -183,7 +183,8 @@ class VLLMLensClient:
         transparent either way.
 
         ``capture_qk`` captures post-RoPE attention Q/K for the given
-        layers (or all layers with ``True``); reconstruct patterns with
+        layers (or all layers with ``True``; ``False`` or ``None`` captures
+        nothing); reconstruct patterns with
         :func:`vllm_lens.attention.attention_patterns`.
         """
         body: dict[str, Any] = {
