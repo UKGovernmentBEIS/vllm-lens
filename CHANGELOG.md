@@ -1,5 +1,7 @@
 ## Unreleased
 
+- Client: `capture_qk=False` no longer requests Q/K capture. It was sent to the server as `output_qk="false"`, which captured Q/K on every layer, the same as `capture_qk=True`.
+
 ## v1.3.0 (2 October 2026)
 
 - Compatibility: Pin vLLM to the GPU-validated **0.30.0** release, with V1/eager execution. Add CPU regression CI and reproducible Slurm smoke/TP/PP suites; FP32 reference parity retains the 0.01 threshold and BF16 functional checks remain. See `docs/compatibility.md` for exact environments and coverage. (#39, #41)
