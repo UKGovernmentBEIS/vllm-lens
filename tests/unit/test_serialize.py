@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import base64
+import json
+import math
 
 import pytest
 import torch
 
 from vllm_lens._helpers._serialize import (
     decode_activations,
+    deserialize_hook_results,
     deserialize_tensor,
     serialize_activations,
+    serialize_hook_results,
     serialize_tensor,
 )
 
@@ -119,3 +123,25 @@ def test_round_trip_qk_activations() -> None:
     assert torch.equal(recovered["attn_k"], activations["attn_k"])
     assert recovered["qk_layers"] == [2, 7]
     assert recovered["qk_meta"] == activations["qk_meta"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {3: 1.5, 4: 2.5},
+        float("nan"),
+        [0.1, float("inf")],
+        {"loss": float("-inf")},
+    ],
+)
+def test_hook_results_round_trip_strict_json(value: object) -> None:
+    """Hook values strict JSON would reject or change come back unchanged."""
+    serialized = serialize_hook_results({"0": {"v": value}})
+    # The HTTP responses encode with allow_nan=False (e.g. starlette JSONResponse).
+    wire = json.dumps(serialized, allow_nan=False)
+    recovered = deserialize_hook_results(json.loads(wire))["0"]["v"]
+
+    if isinstance(value, float) and math.isnan(value):
+        assert math.isnan(recovered)
+    else:
+        assert recovered == value
